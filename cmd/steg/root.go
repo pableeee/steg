@@ -118,13 +118,18 @@ func runDecode() error {
 		return err
 	}
 
+	cimg, ok := img.(steg.ChangeableImage)
+	if !ok {
+		return fmt.Errorf("image its not changeable: %w", err)
+	}
+
 	out, err := os.Create(decoderFlags.outputFile)
 	if err != nil {
 		return fmt.Errorf("unable to create output file: %w", err)
 	}
 	defer out.Close()
 
-	b, err := steg.Decode(img, nil)
+	b, err := steg.Decode(cimg, nil)
 	if err != nil {
 		return err
 	}

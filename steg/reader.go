@@ -4,24 +4,22 @@ import (
 	"encoding/binary"
 	"fmt"
 	"image"
-	"math"
 )
 
 type reader struct {
 	img    image.Image
-	cursor int
+	cursor Cursor
 }
 
 func (t *reader) readByte() (byte, error) {
 	var nBits = 8
 	var res uint8
 	for i := 0; i < nBits; i++ {
-		x := int(math.Mod(float64(t.cursor), float64(t.img.Bounds().Max.X)))
-		y := int(math.Floor((float64(t.cursor) / float64(t.img.Bounds().Max.X))))
-		t.cursor++
-		r, _, _, _ := t.img.At(x, y).RGBA()
 
-		bit := r & justLast
+		bit, err := t.cursor.ReadBit()
+		if err != nil {
+			return byte(0), err
+		}
 		res |= uint8(bit << (nBits - i - 1))
 
 	}

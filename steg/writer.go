@@ -2,20 +2,18 @@ package steg
 
 import (
 	"encoding/binary"
-	"image/color"
 	"io"
-	"math"
 )
 
 type writer struct {
 	img    ChangeableImage
-	cursor int
+	cursor Cursor
 }
 
 func newWriter(img ChangeableImage) *writer {
 	return &writer{
 		img:    img,
-		cursor: 0,
+		cursor: &onlyRedCursor{img: img, cursor: 0},
 	}
 }
 
@@ -32,19 +30,10 @@ func byteToBits(b byte) []int {
 func (w *writer) writeByte(p byte) error {
 	bits := byteToBits(p)
 	for _, bit := range bits {
-		x := int(math.Mod(float64(w.cursor), float64(w.img.Bounds().Max.X)))
-		y := int(math.Floor((float64(w.cursor) / float64(w.img.Bounds().Max.X))))
-		w.cursor++
-		c := w.img.At(x, y)
-		r, g, b, a := c.RGBA()
-
-		if bit == 1 {
-			r = r | justLast
-		} else {
-			r = r & offLast
+		_, err := w.cursor.WriteBit(uint8(bit))
+		if err != nil {
+			return err
 		}
-
-		w.img.Set(x, y, color.RGBA{uint8(r), uint8(g), uint8(b), uint8(a)})
 	}
 
 	return nil
@@ -55,7 +44,10 @@ func (w *writer) Write(payload io.Reader) error {
 	buf := make([]byte, 1)
 
 	// skip the first 4 bytes to later allow encoding the message length at the beggining.
-	w.cursor = 4 * 8 // cursor moves by bit
+	err := w.cursor.Seek(4 * 8) // cursor moves by bit
+	if err != nil {
+		return err
+	}
 
 	for n, err := payload.Read(buf); n == 1 && err == nil; payloadLength++ {
 		if err = w.writeByte(buf[0]); err != nil {
@@ -68,7 +60,10 @@ func (w *writer) Write(payload io.Reader) error {
 	binary.LittleEndian.PutUint32(bs, payloadLength)
 
 	// run the cursor to the begging to write the payload lenght.
-	w.cursor = 0
+	if err := w.cursor.Seek(0); err != nil {
+		return err
+	}
+
 	for _, b := range bs {
 		if err := w.writeByte(b); err != nil {
 			return err
