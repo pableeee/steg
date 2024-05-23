@@ -3,11 +3,9 @@ package steg
 import (
 	"encoding/binary"
 	"fmt"
-	"image"
 )
 
 type reader struct {
-	img    image.Image
 	cursor Cursor
 }
 

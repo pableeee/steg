@@ -6,15 +6,7 @@ import (
 )
 
 type writer struct {
-	img    ChangeableImage
 	cursor Cursor
-}
-
-func newWriter(img ChangeableImage) *writer {
-	return &writer{
-		img:    img,
-		cursor: &onlyRedCursor{img: img, cursor: 0},
-	}
 }
 
 func byteToBits(b byte) []int {

@@ -18,7 +18,7 @@ type ChangeableImage interface {
 }
 
 func Decode(img ChangeableImage, key []byte) ([]byte, error) {
-	r := reader{img: img, cursor: &onlyRedCursor{
+	r := reader{cursor: &onlyRedCursor{
 		img: img,
 	}}
 	payload, err := r.Read()
@@ -27,7 +27,7 @@ func Decode(img ChangeableImage, key []byte) ([]byte, error) {
 }
 
 func Encode(m ChangeableImage, _ []byte, r io.Reader) error {
-	w := writer{img: m, cursor: &onlyRedCursor{
+	w := writer{cursor: &onlyRedCursor{
 		img: m,
 	}}
 
