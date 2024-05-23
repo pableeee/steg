@@ -3,10 +3,12 @@ package steg
 import (
 	"encoding/binary"
 	"fmt"
+
+	"github.com/pableeee/steg/cursors"
 )
 
 type reader struct {
-	cursor Cursor
+	cursor cursors.Cursor
 }
 
 func (t *reader) readByte() (byte, error) {

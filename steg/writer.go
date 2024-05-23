@@ -3,10 +3,12 @@ package steg
 import (
 	"encoding/binary"
 	"io"
+
+	"github.com/pableeee/steg/cursors"
 )
 
 type writer struct {
-	cursor Cursor
+	cursor cursors.Cursor
 }
 
 func byteToBits(b byte) []int {
