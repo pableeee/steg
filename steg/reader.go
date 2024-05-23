@@ -4,11 +4,13 @@ import (
 	"encoding/binary"
 	"fmt"
 
+	cph "github.com/pableeee/steg/cipher"
 	"github.com/pableeee/steg/cursors"
 )
 
 type reader struct {
 	cursor cursors.Cursor
+	cipher cph.StreamCipherBlock
 }
 
 func (t *reader) readByte() (byte, error) {
@@ -20,6 +22,12 @@ func (t *reader) readByte() (byte, error) {
 		if err != nil {
 			return byte(0), err
 		}
+
+		bit, err = t.cipher.DecryptBit(bit)
+		if err != nil {
+			return byte(0), err
+		}
+
 		res |= uint8(bit << (nBits - i - 1))
 
 	}
@@ -37,7 +45,6 @@ func (t *reader) Read() ([]byte, error) {
 		payloadSize[i] = b
 	}
 
-	// binary.LittleEndian.PutUint32(bs, uint32(len(payload)))
 	payload := make([]byte, binary.LittleEndian.Uint32(payloadSize))
 	for i := 0; i < len(payload); i++ {
 		b, err := t.readByte()

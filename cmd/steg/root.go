@@ -29,7 +29,8 @@ var (
 	encoderFlags = struct {
 		inputImage,
 		inputMessage,
-		outputImage string
+		outputImage,
+		key string
 	}{}
 
 	decodeCmd = &cobra.Command{
@@ -43,7 +44,8 @@ var (
 
 	decoderFlags = struct {
 		inputFile,
-		outputFile string
+		outputFile,
+		key string
 	}{}
 )
 
@@ -57,12 +59,17 @@ func init() {
 	encodeCmd.Flags().StringVar(
 		&encoderFlags.outputImage, "output_image", "", "Image containing the coded message.",
 	)
-
+	encodeCmd.Flags().StringVar(
+		&encoderFlags.key, "key", "YELLOW SUBMARINE", "passphrase to cipher the contents.",
+	)
 	decodeCmd.Flags().StringVar(
 		&decoderFlags.inputFile, "input_image", "", "Image containing the coded message.",
 	)
 	decodeCmd.Flags().StringVar(
 		&decoderFlags.outputFile, "output_file", "", "Path for the output file containing the coded data.",
+	)
+	decodeCmd.Flags().StringVar(
+		&decoderFlags.key, "key", "YELLOW SUBMARINE", "passphrase to extract the contents.",
 	)
 	rootCmd.AddCommand(encodeCmd)
 	rootCmd.AddCommand(decodeCmd)
@@ -95,7 +102,7 @@ func runEncode() error {
 	}
 	defer out.Close()
 
-	if err = steg.Encode(cimg, nil, bufio.NewReader(fmsg)); err != nil {
+	if err = steg.Encode(cimg, []byte(encoderFlags.key), bufio.NewReader(fmsg)); err != nil {
 		return err
 	}
 
@@ -129,7 +136,7 @@ func runDecode() error {
 	}
 	defer out.Close()
 
-	b, err := steg.Decode(cimg, nil)
+	b, err := steg.Decode(cimg, []byte(decoderFlags.key))
 	if err != nil {
 		return err
 	}
