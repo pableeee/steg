@@ -14,7 +14,6 @@ type ChangeableImage interface {
 }
 
 type Cursor interface {
-	Tell() (x, y int, cl BitColor)
 	Seek(n uint) error
 	WriteBit(bit uint8) (uint, error)
 	ReadBit() (uint8, error)

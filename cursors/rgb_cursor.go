@@ -74,7 +74,7 @@ func (c *RGBCursor) validateBounds(n uint) bool {
 	return true
 }
 
-func (c *RGBCursor) Tell() (x, y int, cl BitColor) {
+func (c *RGBCursor) tell() (x, y int, cl BitColor) {
 
 	planeCursor := c.cursor / c.bitCount
 	colorCursor := c.cursor % c.bitCount
@@ -110,7 +110,7 @@ func (c *RGBCursor) WriteBit(bit uint8) (uint, error) {
 		}
 	}
 
-	x, y, colorBit := c.Tell()
+	x, y, colorBit := c.tell()
 
 	r, g, b, a := c.img.At(x, y).RGBA()
 	switch colorBit {
@@ -133,7 +133,7 @@ func (c *RGBCursor) ReadBit() (uint8, error) {
 	if !c.validateBounds(c.cursor) {
 		return 0, fmt.Errorf("out of bounds")
 	}
-	x, y, colorBit := c.Tell()
+	x, y, colorBit := c.tell()
 	r, g, b, _ := c.img.At(x, y).RGBA()
 	c.cursor++
 	val := r
