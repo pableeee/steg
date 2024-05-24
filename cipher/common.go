@@ -9,14 +9,20 @@ import (
 )
 
 // thanks to: https://github.com/go-web/tokenizer/blob/master/pkcs7.go
-// n is the block size. The size of the result is x times n, where x
-// is at least 1.
+// pkcs7Pad pads the input byte slice to a multiple of the block size using PKCS#7 padding.
+//
+// It returns an error if the block size is invalid or the input byte slice is nil or empty.
+//
+// blocksize: Size of the blocks to pad to.
+// b: The byte slice to pad.
+//
+// Returns the padded byte slice or an error.
 func pkcs7Pad(b []byte, blocksize int) ([]byte, error) {
 	if blocksize <= 0 {
 		return nil, fmt.Errorf("invalid blocksize")
 	}
 
-	if b == nil || len(b) == 0 {
+	if len(b) == 0 {
 		return nil, fmt.Errorf("invalid byte array")
 	}
 
@@ -33,6 +39,8 @@ func pkcs7Pad(b []byte, blocksize int) ([]byte, error) {
 	return pb, nil
 }
 
+// StreamCipherBlock represents a block cipher in stream mode that supports
+// seeking and bitwise encryption and decryption.
 type StreamCipherBlock interface {
 	Seek(n uint) error
 	EncryptBit(bit uint8) (uint8, error)
@@ -53,17 +61,24 @@ type streamCipherImpl struct {
 	blockSize uint32
 }
 
+// NewCipher creates a new StreamCipherBlock with the given nonce and passphrase.
+//
+// nonce: A unique nonce for the cipher.
+// pass: The passphrase used to generate the AES key.
+//
+// Returns a StreamCipherBlock instance.
 func NewCipher(nonce uint32, pass []byte) StreamCipherBlock {
 	s := &streamCipherImpl{nonce: nonce, blockSize: 16}
 	pass, _ = pkcs7Pad(pass, int(s.blockSize))
 	cb, _ := aes.NewCipher(pass)
 	s.block = cb
-	s.getCipherBlock()
+	s.refreshCipherBlock()
 
 	return s
 }
 
-func (s *streamCipherImpl) getCipherBlock() {
+// refreshCipherBlock generates a new cipher block using the current nonce and counter values.
+func (s *streamCipherImpl) refreshCipherBlock() {
 	counterBytes := make([]byte, 8)
 	binary.LittleEndian.PutUint32(counterBytes, s.counter)
 	nonceBytes := make([]byte, 8)
@@ -76,45 +91,50 @@ func (s *streamCipherImpl) getCipherBlock() {
 	s.maxIndex = (s.counter + 1) * s.blockSize * 8
 }
 
+// Seek sets the current position for the next encryption/decryption operation.
+//
+// n: The position to seek to.
+//
+// Returns an error if the position is out of range.
 func (s *streamCipherImpl) Seek(n uint) error {
 	if n > uint(s.maxIndex) || n < uint(s.mixIndex) {
 		s.counter = uint32(n / uint(s.blockSize*8))
-
-		s.getCipherBlock()
-
+		s.refreshCipherBlock()
 	}
 	s.index = uint32(n)
 
 	return nil
 }
 
+// EncryptBit encrypts a single bit using the current position of the cipher.
+//
+// bichi: The bit to encrypt.
+//
+// Returns the encrypted bit and an error if any.
 func (s *streamCipherImpl) EncryptBit(bichi uint8) (uint8, error) {
-	if uint(s.index) > uint(s.maxIndex) || uint(s.index) < uint(s.mixIndex) {
-		s.counter = uint32(uint(s.index) / uint(s.blockSize*8))
-
-		s.getCipherBlock()
-	}
-
-	idx := (s.index / 8) % s.blockSize
-	b := s.currentBlock[idx]
-	bit := b >> (s.index % 8) & 1
-	res := bichi ^ bit
-	s.index++
-
-	return res, nil
+	return s.processBit(bichi)
 }
-func (s *streamCipherImpl) DecryptBit(bichi uint8) (uint8, error) {
-	if uint(s.index) > uint(s.maxIndex) || uint(s.index) < uint(s.mixIndex) {
-		s.counter = uint32(uint(s.index) / uint(s.blockSize*8))
 
-		s.getCipherBlock()
+// DecryptBit decrypts a single bit using the current position of the cipher.
+//
+// bichi: The bit to decrypt.
+//
+// Returns the decrypted bit and an error if any.
+func (s *streamCipherImpl) DecryptBit(bichi uint8) (uint8, error) {
+	return s.processBit(bichi)
+}
+
+// processBit processes a single bit for encryption or decryption.
+func (s *streamCipherImpl) processBit(bichi uint8) (uint8, error) {
+	if s.index >= s.maxIndex || s.index < s.mixIndex {
+		s.counter = uint32(s.index / (s.blockSize * 8))
+		s.refreshCipherBlock()
 	}
 
 	idx := (s.index / 8) % s.blockSize
 	b := s.currentBlock[idx]
-	bit := b >> (s.index % 8) & 1
+	bit := (b >> (s.index % 8)) & 1
 	res := bichi ^ bit
 	s.index++
-
 	return res, nil
 }
