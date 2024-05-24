@@ -50,26 +50,27 @@ var (
 )
 
 func init() {
-	encodeCmd.Flags().StringVar(
-		&encoderFlags.inputImage, "input_image", "", "Input image used as medium.",
+	encodeCmd.Flags().StringVarP(
+		&encoderFlags.inputImage, "input_image", "i", "", "Input image used as medium.",
 	)
-	encodeCmd.Flags().StringVar(
-		&encoderFlags.inputMessage, "input_message", "", "Message the will be encoded into the output image.",
+	encodeCmd.Flags().StringVarP(
+		&encoderFlags.inputMessage, "input_file", "f", "", "Message the will be encoded into the output image.",
 	)
-	encodeCmd.Flags().StringVar(
-		&encoderFlags.outputImage, "output_image", "", "Image containing the coded message.",
+	encodeCmd.Flags().StringVarP(
+		&encoderFlags.outputImage, "output_image", "o", "", "Image containing the coded message.",
 	)
-	encodeCmd.Flags().StringVar(
-		&encoderFlags.key, "key", "YELLOW SUBMARINE", "passphrase to cipher the contents.",
+	encodeCmd.Flags().StringVarP(
+		&encoderFlags.key, "password", "p", "YELLOW SUBMARINE", "passphrase to cipher the contents.",
 	)
-	decodeCmd.Flags().StringVar(
-		&decoderFlags.inputFile, "input_image", "", "Image containing the coded message.",
+
+	decodeCmd.Flags().StringVarP(
+		&decoderFlags.inputFile, "input_image", "i", "", "Image containing the coded message.",
 	)
-	decodeCmd.Flags().StringVar(
-		&decoderFlags.outputFile, "output_file", "", "Path for the output file containing the coded data.",
+	decodeCmd.Flags().StringVarP(
+		&decoderFlags.outputFile, "output_file", "o", "", "Path for the output file containing the coded data.",
 	)
-	decodeCmd.Flags().StringVar(
-		&decoderFlags.key, "key", "YELLOW SUBMARINE", "passphrase to extract the contents.",
+	decodeCmd.Flags().StringVarP(
+		&decoderFlags.key, "password", "p", "YELLOW SUBMARINE", "passphrase to extract the contents.",
 	)
 	rootCmd.AddCommand(encodeCmd)
 	rootCmd.AddCommand(decodeCmd)

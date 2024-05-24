@@ -2,6 +2,7 @@ package rng
 
 import (
 	"fmt"
+	"image"
 	"image/color"
 	"math/rand"
 
@@ -11,17 +12,13 @@ import (
 const offLast = 0xfffe
 const justLast = 0x0001
 
-type Point struct {
-	X, Y int
-}
-
-func generateSequence(width, height int, rng *rand.Rand) []Point {
+func generateSequence(width, height int, rng *rand.Rand) []image.Point {
 	totalPixels := width * height
-	positions := make([]Point, totalPixels)
+	positions := make([]image.Point, totalPixels)
 
 	// Initialize the positions with sequential values
 	for i := 0; i < totalPixels; i++ {
-		positions[i] = Point{X: i % width, Y: i / width}
+		positions[i] = image.Point{X: i % width, Y: i / width}
 	}
 
 	// Shuffle the positions to create a pseudo-random sequence
@@ -39,7 +36,7 @@ type RNGCursor struct {
 	bitMask  cursors.BitColor
 	bitCount uint
 	useBits  []cursors.BitColor
-	points   []Point
+	points   []image.Point
 	rng      *rand.Rand
 }
 
