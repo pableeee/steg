@@ -2,6 +2,7 @@ package steg
 
 import (
 	"encoding/binary"
+	"hash"
 	"io"
 
 	cph "github.com/pableeee/steg/cipher"
@@ -9,8 +10,9 @@ import (
 )
 
 type writer struct {
-	cursor cursors.Cursor
-	cipher cph.StreamCipherBlock
+	cursor   cursors.Cursor
+	cipher   cph.StreamCipherBlock
+	hashFunc hash.Hash
 }
 
 func byteToBits(b byte) []int {
@@ -63,10 +65,18 @@ func (w *writer) Write(payload io.Reader) error {
 	}
 
 	for n, err := payload.Read(buf); n == 1 && err == nil; payloadLength++ {
+		w.hashFunc.Write(buf)
 		if err = w.writeByte(buf[0]); err != nil {
 			return err
 		}
 		n, err = payload.Read(buf)
+	}
+
+	fileHash := w.hashFunc.Sum(nil)
+	for _, b := range fileHash {
+		if err := w.writeByte(b); err != nil {
+			return err
+		}
 	}
 
 	bs := make([]byte, 4)

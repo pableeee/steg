@@ -3,14 +3,16 @@ package steg
 import (
 	"encoding/binary"
 	"fmt"
+	"hash"
 
 	cph "github.com/pableeee/steg/cipher"
 	"github.com/pableeee/steg/cursors"
 )
 
 type reader struct {
-	cursor cursors.Cursor
-	cipher cph.StreamCipherBlock
+	cursor   cursors.Cursor
+	cipher   cph.StreamCipherBlock
+	hashFunc hash.Hash
 }
 
 func (t *reader) readByte() (byte, error) {
@@ -51,7 +53,20 @@ func (t *reader) Read() ([]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("unable to read payload %w", err)
 		}
+		t.hashFunc.Write([]byte{b})
 		payload[i] = b
+	}
+
+	checksum := t.hashFunc.Sum(nil)
+	for _, check := range checksum {
+		b, err := t.readByte()
+		if err != nil {
+			return nil, fmt.Errorf("unable to read payload %w", err)
+		}
+
+		if check != b {
+			return nil, fmt.Errorf("checksum failed")
+		}
 	}
 
 	return payload, nil

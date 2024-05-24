@@ -30,7 +30,8 @@ func Decode(img ChangeableImage, pass []byte) ([]byte, error) {
 			rng.UseBlueBit(),
 			rng.WithSeed(int64(seed)),
 		),
-		cipher: cipher.NewCipher(0, pass),
+		cipher:   cipher.NewCipher(0, pass),
+		hashFunc: md5.New(),
 	}
 	payload, err := r.Read()
 
@@ -51,7 +52,8 @@ func Encode(m ChangeableImage, pass []byte, r io.Reader) error {
 			rng.UseBlueBit(),
 			rng.WithSeed(int64(seed)),
 		),
-		cipher: cipher.NewCipher(0, pass),
+		cipher:   cipher.NewCipher(0, pass),
+		hashFunc: md5.New(),
 	}
 
 	return w.Write(r)
