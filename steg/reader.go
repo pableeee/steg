@@ -5,13 +5,11 @@ import (
 	"fmt"
 	"hash"
 
-	cph "github.com/pableeee/steg/cipher"
 	"github.com/pableeee/steg/cursors"
 )
 
 type reader struct {
 	cursor   cursors.Cursor
-	cipher   cph.StreamCipherBlock
 	hashFunc hash.Hash
 }
 
@@ -21,11 +19,6 @@ func (t *reader) readByte() (byte, error) {
 	for i := 0; i < nBits; i++ {
 
 		bit, err := t.cursor.ReadBit()
-		if err != nil {
-			return byte(0), err
-		}
-
-		bit, err = t.cipher.DecryptBit(bit)
 		if err != nil {
 			return byte(0), err
 		}

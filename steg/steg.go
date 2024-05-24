@@ -7,6 +7,7 @@ import (
 	"io"
 
 	"github.com/pableeee/steg/cipher"
+	"github.com/pableeee/steg/cursors"
 	"github.com/pableeee/steg/cursors/rng"
 )
 
@@ -22,16 +23,17 @@ func Decode(img ChangeableImage, pass []byte) ([]byte, error) {
 		return nil, err
 	}
 
+	cursor := rng.NewRNGCursor(img,
+		rng.UseGreenBit(),
+		rng.UseRedBit(),
+		rng.UseBlueBit(),
+		rng.WithSeed(int64(seed)),
+	)
+
+	cursor = cursors.CipherMiddleware(cursor, cipher.NewCipher(0, pass))
 	r := reader{
-		cursor: rng.NewRNGCursor(
-			img,
-			rng.UseGreenBit(),
-			rng.UseRedBit(),
-			rng.UseBlueBit(),
-			rng.WithSeed(int64(seed)),
-		),
-		cipher:   cipher.NewCipher(0, pass),
 		hashFunc: md5.New(),
+		cursor:   cursor,
 	}
 	payload, err := r.Read()
 
@@ -44,16 +46,19 @@ func Encode(m ChangeableImage, pass []byte, r io.Reader) error {
 	if err != nil {
 		return err
 	}
+
+	cursor := rng.NewRNGCursor(m,
+		rng.UseGreenBit(),
+		rng.UseRedBit(),
+		rng.UseBlueBit(),
+		rng.WithSeed(int64(seed)),
+	)
+
+	cursor = cursors.CipherMiddleware(cursor, cipher.NewCipher(0, pass))
+
 	w := writer{
-		cursor: rng.NewRNGCursor(
-			m,
-			rng.UseGreenBit(),
-			rng.UseRedBit(),
-			rng.UseBlueBit(),
-			rng.WithSeed(int64(seed)),
-		),
-		cipher:   cipher.NewCipher(0, pass),
 		hashFunc: md5.New(),
+		cursor:   cursor,
 	}
 
 	return w.Write(r)
