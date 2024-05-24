@@ -61,6 +61,10 @@ type streamCipherImpl struct {
 	blockSize uint32
 }
 
+type Block interface {
+	std_cipher.Block
+}
+
 // NewCipher creates a new StreamCipherBlock with the given nonce and passphrase.
 //
 // nonce: A unique nonce for the cipher.
