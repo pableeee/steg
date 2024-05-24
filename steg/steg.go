@@ -1,12 +1,13 @@
 package steg
 
 import (
+	"crypto/md5"
 	"image"
 	"image/color"
 	"io"
 
 	"github.com/pableeee/steg/cipher"
-	"github.com/pableeee/steg/cursors"
+	"github.com/pableeee/steg/cursors/rng"
 )
 
 type ChangeableImage interface {
@@ -15,12 +16,19 @@ type ChangeableImage interface {
 }
 
 func Decode(img ChangeableImage, pass []byte) ([]byte, error) {
+	h := md5.New()
+	seed, err := h.Write(pass)
+	if err != nil {
+		return nil, err
+	}
+
 	r := reader{
-		cursor: cursors.NewOnlyRedCursor(
+		cursor: rng.NewRNGCursor(
 			img,
-			cursors.UseGreenBit(),
-			cursors.UseRedBit(),
-			cursors.UseBlueBit(),
+			rng.UseGreenBit(),
+			rng.UseRedBit(),
+			rng.UseBlueBit(),
+			rng.WithSeed(int64(seed)),
 		),
 		cipher: cipher.NewCipher(0, pass),
 	}
@@ -30,12 +38,18 @@ func Decode(img ChangeableImage, pass []byte) ([]byte, error) {
 }
 
 func Encode(m ChangeableImage, pass []byte, r io.Reader) error {
+	h := md5.New()
+	seed, err := h.Write(pass)
+	if err != nil {
+		return err
+	}
 	w := writer{
-		cursor: cursors.NewOnlyRedCursor(
+		cursor: rng.NewRNGCursor(
 			m,
-			cursors.UseGreenBit(),
-			cursors.UseRedBit(),
-			cursors.UseBlueBit(),
+			rng.UseGreenBit(),
+			rng.UseRedBit(),
+			rng.UseBlueBit(),
+			rng.WithSeed(int64(seed)),
 		),
 		cipher: cipher.NewCipher(0, pass),
 	}

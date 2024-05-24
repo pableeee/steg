@@ -1,59 +1,51 @@
-package cursors
+package rgb
 
 import (
 	"fmt"
 	"image/color"
 	"math"
+
+	"github.com/pableeee/steg/cursors"
 )
 
-type BitColor uint
-
-const (
-	NONE  BitColor = iota
-	R_Bit BitColor = 0x1
-	G_Bit BitColor = 0x2
-	B_Bit BitColor = 0x4
-)
-
-var (
-	Colors = []BitColor{R_Bit, G_Bit, B_Bit}
-)
+const offLast = 0xfffe
+const justLast = 0x0001
 
 type RGBCursor struct {
-	img      ChangeableImage
+	img      cursors.ChangeableImage
 	cursor   uint
-	bitMask  BitColor
+	bitMask  cursors.BitColor
 	bitCount uint
-	useBits  []BitColor
+	useBits  []cursors.BitColor
 }
 
 type Option func(*RGBCursor)
 
 func UseRedBit() Option {
 	return func(c *RGBCursor) {
-		c.bitMask |= R_Bit
+		c.bitMask |= cursors.R_Bit
 	}
 }
 
 func UseGreenBit() Option {
 	return func(c *RGBCursor) {
-		c.bitMask |= G_Bit
+		c.bitMask |= cursors.G_Bit
 	}
 }
 
 func UseBlueBit() Option {
 	return func(c *RGBCursor) {
-		c.bitMask |= B_Bit
+		c.bitMask |= cursors.B_Bit
 	}
 }
 
-func NewOnlyRedCursor(img ChangeableImage, options ...Option) Cursor {
-	c := &RGBCursor{img: img, bitMask: R_Bit}
+func NewRGBCursor(img cursors.ChangeableImage, options ...Option) cursors.Cursor {
+	c := &RGBCursor{img: img, bitMask: cursors.R_Bit}
 	for _, opt := range options {
 		opt(c)
 	}
 
-	for _, color := range Colors {
+	for _, color := range cursors.Colors {
 		if c.bitMask&color == color {
 			c.bitCount++
 			c.useBits = append(c.useBits, color)
@@ -63,7 +55,7 @@ func NewOnlyRedCursor(img ChangeableImage, options ...Option) Cursor {
 	return c
 }
 
-var _ Cursor = (*RGBCursor)(nil)
+var _ cursors.Cursor = (*RGBCursor)(nil)
 
 func (c *RGBCursor) validateBounds(n uint) bool {
 	max := uint(c.img.Bounds().Max.X) * uint(c.img.Bounds().Max.Y) * c.bitCount
@@ -74,7 +66,7 @@ func (c *RGBCursor) validateBounds(n uint) bool {
 	return true
 }
 
-func (c *RGBCursor) tell() (x, y int, cl BitColor) {
+func (c *RGBCursor) tell() (x, y int, cl cursors.BitColor) {
 
 	planeCursor := c.cursor / c.bitCount
 	colorCursor := c.cursor % c.bitCount
@@ -114,11 +106,11 @@ func (c *RGBCursor) WriteBit(bit uint8) (uint, error) {
 
 	r, g, b, a := c.img.At(x, y).RGBA()
 	switch colorBit {
-	case R_Bit:
+	case cursors.R_Bit:
 		fn(&r)
-	case G_Bit:
+	case cursors.G_Bit:
 		fn(&g)
-	case B_Bit:
+	case cursors.B_Bit:
 		fn(&b)
 	}
 
@@ -139,11 +131,11 @@ func (c *RGBCursor) ReadBit() (uint8, error) {
 	val := r
 
 	switch colorBit {
-	case R_Bit:
+	case cursors.R_Bit:
 		val = r
-	case G_Bit:
+	case cursors.G_Bit:
 		val = g
-	case B_Bit:
+	case cursors.B_Bit:
 		val = b
 	}
 
