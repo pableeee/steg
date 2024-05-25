@@ -21,12 +21,6 @@ type RGBCursor struct {
 
 type Option func(*RGBCursor)
 
-func UseRedBit() Option {
-	return func(c *RGBCursor) {
-		c.bitMask |= cursors.R_Bit
-	}
-}
-
 func UseGreenBit() Option {
 	return func(c *RGBCursor) {
 		c.bitMask |= cursors.G_Bit
@@ -39,7 +33,8 @@ func UseBlueBit() Option {
 	}
 }
 
-func NewRGBCursor(img cursors.ChangeableImage, options ...Option) cursors.Cursor {
+// NewRGBCursor by default it uses R_bit to write, but you can also add G & B bits.
+func NewRGBCursor(img cursors.ChangeableImage, options ...Option) *RGBCursor {
 	c := &RGBCursor{img: img, bitMask: cursors.R_Bit}
 	for _, opt := range options {
 		opt(c)
@@ -59,7 +54,7 @@ var _ cursors.Cursor = (*RGBCursor)(nil)
 
 func (c *RGBCursor) validateBounds(n uint) bool {
 	max := uint(c.img.Bounds().Max.X) * uint(c.img.Bounds().Max.Y) * c.bitCount
-	if n > max {
+	if n >= max {
 		return false
 	}
 
