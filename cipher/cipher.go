@@ -65,17 +65,37 @@ type Block interface {
 	std_cipher.Block
 }
 
+type Options struct {
+	block     std_cipher.Block
+	blockSize int
+}
+
+type Option func(*Options)
+
+func WithBlock(b std_cipher.Block) Option {
+	return func(o *Options) {
+		o.block = b
+	}
+}
+
 // NewCipher creates a new StreamCipherBlock with the given nonce and passphrase.
 //
 // nonce: A unique nonce for the cipher.
 // pass: The passphrase used to generate the AES key.
 //
 // Returns a StreamCipherBlock instance.
-func NewCipher(nonce uint32, pass []byte) StreamCipherBlock {
-	s := &streamCipherImpl{nonce: nonce, blockSize: 16}
-	pass, _ = pkcs7Pad(pass, int(s.blockSize))
+func NewCipher(nonce uint32, pass []byte, options ...Option) *streamCipherImpl {
+	opts := Options{blockSize: 16}
+	pass, _ = pkcs7Pad(pass, opts.blockSize)
 	cb, _ := aes.NewCipher(pass)
-	s.block = cb
+	opts.block = cb
+
+	for _, opt := range options {
+		opt(&opts)
+	}
+
+	s := &streamCipherImpl{nonce: nonce, blockSize: uint32(opts.blockSize), block: opts.block}
+
 	s.refreshCipherBlock()
 
 	return s
