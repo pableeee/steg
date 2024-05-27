@@ -42,12 +42,6 @@ type RNGCursor struct {
 
 type Option func(*RNGCursor)
 
-func UseRedBit() Option {
-	return func(c *RNGCursor) {
-		c.bitMask |= cursors.R_Bit
-	}
-}
-
 func UseGreenBit() Option {
 	return func(c *RNGCursor) {
 		c.bitMask |= cursors.G_Bit
@@ -66,7 +60,7 @@ func WithSeed(seed int64) Option {
 	}
 }
 
-func NewRNGCursor(img cursors.ChangeableImage, options ...Option) cursors.Cursor {
+func NewRNGCursor(img cursors.ChangeableImage, options ...Option) *RNGCursor {
 	c := &RNGCursor{img: img, bitMask: cursors.R_Bit, rng: rand.New(rand.NewSource(0))}
 	for _, opt := range options {
 		opt(c)
@@ -87,7 +81,7 @@ var _ cursors.Cursor = (*RNGCursor)(nil)
 
 func (c *RNGCursor) validateBounds(n uint) bool {
 	max := uint(c.img.Bounds().Max.X) * uint(c.img.Bounds().Max.Y) * c.bitCount
-	if n > max {
+	if n >= max {
 		return false
 	}
 
