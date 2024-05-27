@@ -5,71 +5,12 @@ import (
 	"crypto/md5"
 	"encoding/binary"
 	"fmt"
-	"hash"
-	"math/rand"
 	"testing"
 
 	"github.com/golang/mock/gomock"
 	mock_cursors "github.com/pableeee/steg/mocks/cursors"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
-
-func mockWriterCursor(
-	t *testing.T,
-	ctrl *gomock.Controller,
-	size uint32,
-	correctChecksum bool,
-	hashFn hash.Hash,
-	rnd *rand.Rand,
-) *mock_cursors.MockCursor {
-	bs := make([]byte, 4)
-	binary.LittleEndian.PutUint32(bs, size)
-	cur := mock_cursors.NewMockCursor(ctrl)
-
-	// the skips writing the payload size for last.
-	cur.EXPECT().Seek(4 * 8).Return(nil)
-
-	// mock the payload
-	for i := 0; i < int(size); i++ {
-		randNum := byte(rnd.Intn(256))
-		_, err := hashFn.Write([]byte{randNum})
-		require.NoError(t, err)
-
-		for _, b := range byteToBits(randNum) {
-			cur.EXPECT().WriteBit(gomock.Any()).
-				Return(uint(b), nil)
-		}
-	}
-
-	var cks []byte
-	if correctChecksum {
-		cks = hashFn.Sum(nil)
-	} else {
-		cks = make([]byte, 1)
-		for i := range bs {
-			bs[i] = byte(rnd.Intn(256))
-		}
-	}
-
-	// mock the checksum
-	for i := 0; i < len(cks); i++ {
-		for _, b := range byteToBits(cks[i]) {
-			cur.EXPECT().ReadBit().
-				Return(uint8(b), nil)
-		}
-	}
-
-	// mock the payload size
-	for _, bite := range bs {
-		for _, b := range byteToBits(bite) {
-			cur.EXPECT().ReadBit().
-				Return(uint8(b), nil)
-		}
-	}
-
-	return cur
-}
 
 func TestInputStreemTooShort(t *testing.T) {
 	t.Run("should fail when skiping payload len", func(t *testing.T) {
