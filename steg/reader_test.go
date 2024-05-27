@@ -14,7 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func mockedCursor(
+func mockReaderCursor(
 	t *testing.T,
 	ctrl *gomock.Controller,
 	size uint32,
@@ -71,7 +71,7 @@ func TestRead(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		hashFn := md5.New()
 		rnd := rand.New(rand.NewSource(0))
-		cur := mockedCursor(t, ctrl, uint32(4), true, hashFn, rnd)
+		cur := mockReaderCursor(t, ctrl, uint32(4), true, hashFn, rnd)
 
 		r := reader{cursor: cur, hashFunc: md5.New()}
 		_, err := r.Read()
@@ -82,7 +82,7 @@ func TestRead(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		hashFn := md5.New()
 		rnd := rand.New(rand.NewSource(0))
-		cur := mockedCursor(t, ctrl, uint32(4), false, hashFn, rnd)
+		cur := mockReaderCursor(t, ctrl, uint32(4), false, hashFn, rnd)
 
 		r := reader{cursor: cur, hashFunc: md5.New()}
 		_, err := r.Read()
