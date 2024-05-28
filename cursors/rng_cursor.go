@@ -81,11 +81,8 @@ var _ Cursor = (*RNGCursor)(nil)
 
 func (c *RNGCursor) validateBounds(n int64) bool {
 	max := int64(c.img.Bounds().Max.X) * int64(c.img.Bounds().Max.Y) * int64(c.bitCount)
-	if n >= max {
-		return false
-	}
 
-	return true
+	return n < max
 }
 
 func (c *RNGCursor) tell() (x, y int, cl BitColor) {
@@ -102,17 +99,33 @@ func (c *RNGCursor) tell() (x, y int, cl BitColor) {
 }
 
 func (c *RNGCursor) Seek(n int64, whence int) (int64, error) {
+	// Seek sets the offset for the next Read or Write to offset,
+	// interpreted according to whence:
+	// [SeekStart] means relative to the start of the file,
+	// [SeekCurrent] means relative to the current offset, and
+	// [SeekEnd] means relative to the end
 	if !c.validateBounds(n) {
 		return c.cursor, fmt.Errorf("out of bounds")
 	}
 
 	switch whence {
 	case io.SeekStart:
+		if n < 0 {
+			return c.cursor, fmt.Errorf("illegal argument")
+		}
 		c.cursor = n
 	case io.SeekCurrent:
+		if n < 0 && (n*-1) > c.cursor {
+			return c.cursor, fmt.Errorf("illegal argument")
+		}
 		c.cursor += n
 	case io.SeekEnd:
-		return 0, fmt.Errorf("not implemented")
+		max := int64(c.img.Bounds().Max.X) * int64(c.img.Bounds().Max.Y) * int64(c.bitCount)
+		if n > 0 || (n*-1) > max {
+			return c.cursor, fmt.Errorf("illegal argument")
+		}
+
+		c.cursor = max + n
 	}
 
 	return c.cursor, nil
@@ -171,5 +184,4 @@ func (c *RNGCursor) ReadBit() (uint8, error) {
 	bit := val & justLast
 
 	return uint8(bit), nil
-
 }

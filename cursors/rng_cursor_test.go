@@ -1,6 +1,7 @@
 package cursors
 
 import (
+	"fmt"
 	"image"
 	"image/color"
 	"io"
@@ -13,8 +14,89 @@ import (
 )
 
 func TestSeek(t *testing.T) {
+	t.Run("should fail seek using SeekStart using negative offset", func(t *testing.T) {
+		img := image.NewRGBA(image.Rect(0, 0, 10, 10))
+		cur := NewRNGCursor(img)
+		n, err := cur.Seek(-1, io.SeekStart)
+		assert.Error(t, err)
+		assert.Equal(t, int64(0), n)
+	})
+	t.Run("should fail seek using SeekStart on eof ", func(t *testing.T) {
+		img := image.NewRGBA(image.Rect(0, 0, 10, 10))
+		cur := NewRNGCursor(img)
+		n, err := cur.Seek(101, io.SeekStart)
+		assert.Error(t, err)
+		assert.Equal(t, int64(0), n)
+	})
+	t.Run("should succeed seek using SeekStart", func(t *testing.T) {
+		img := image.NewRGBA(image.Rect(0, 0, 10, 10))
+		cur := NewRNGCursor(img)
+		n, err := cur.Seek(7, io.SeekStart)
+		assert.NoError(t, err)
+		assert.Equal(t, int64(7), n)
+	})
+
+	t.Run("should fail seek using SeekCurrent using a negative offset", func(t *testing.T) {
+		img := image.NewRGBA(image.Rect(0, 0, 10, 10))
+		cur := NewRNGCursor(img)
+		n, err := cur.Seek(7, io.SeekCurrent)
+		assert.NoError(t, err)
+		assert.Equal(t, int64(7), n)
+
+		n, err = cur.Seek(-8, io.SeekCurrent)
+		assert.Error(t, err)
+		assert.Equal(t, int64(7), n)
+	})
+
+	t.Run("should fail seek using SeekCurrent on eof ", func(t *testing.T) {
+		img := image.NewRGBA(image.Rect(0, 0, 10, 10))
+		cur := NewRNGCursor(img)
+		n, err := cur.Seek(7, io.SeekCurrent)
+		assert.NoError(t, err)
+		assert.Equal(t, int64(7), n)
+
+		n, err = cur.Seek(101, io.SeekCurrent)
+		assert.Error(t, err)
+		assert.Equal(t, int64(7), n)
+	})
+
+	t.Run("should succeed seek using SeekCurrent", func(t *testing.T) {
+		img := image.NewRGBA(image.Rect(0, 0, 10, 10))
+		cur := NewRNGCursor(img)
+		n, err := cur.Seek(7, io.SeekCurrent)
+		assert.NoError(t, err)
+		assert.Equal(t, int64(7), n)
+
+		n, err = cur.Seek(1, io.SeekCurrent)
+		assert.NoError(t, err)
+		assert.Equal(t, int64(8), n)
+	})
+
+	t.Run("should fail seek using SeekEnd using a positive offset", func(t *testing.T) {
+		img := image.NewRGBA(image.Rect(0, 0, 10, 10))
+		cur := NewRNGCursor(img)
+		n, err := cur.Seek(7, io.SeekEnd)
+		assert.Error(t, err)
+		assert.Equal(t, int64(0), n)
+	})
+
+	t.Run("should fail seek using SeekEnd on eof", func(t *testing.T) {
+		img := image.NewRGBA(image.Rect(0, 0, 10, 10))
+		cur := NewRNGCursor(img)
+		n, err := cur.Seek(-101, io.SeekEnd)
+		assert.Error(t, err)
+		assert.Equal(t, int64(0), n)
+	})
+
+	t.Run("should succeed seek using SeekEnd", func(t *testing.T) {
+		img := image.NewRGBA(image.Rect(0, 0, 10, 10))
+		cur := NewRNGCursor(img)
+		n, err := cur.Seek(-99, io.SeekEnd)
+		assert.NoError(t, err)
+		assert.Equal(t, int64(1), n)
+	})
+
 	t.Run("should fail on a seek larger that the bits available on the cursor config", func(t *testing.T) {
-		_ = gomock.NewController(t)
 		img := image.NewRGBA(image.Rect(0, 0, 10, 10))
 		cur := NewRNGCursor(img)
 
@@ -61,15 +143,10 @@ func TestSeek(t *testing.T) {
 				assert.Equal(t, test.bits[i%len(test.bits)], c)
 			}
 		}
-
 	})
 }
 
 func TestReadBit(t *testing.T) {
-	type readResult struct {
-		color BitColor
-		bit   uint8
-	}
 	t.Run("should fail on a read after the bits available on the cursor config", func(t *testing.T) {
 		_ = gomock.NewController(t)
 		img := image.NewRGBA(image.Rect(0, 0, 10, 10))
@@ -96,12 +173,12 @@ func TestReadBit(t *testing.T) {
 			{
 				opts: []Option{},
 			},
-			// {
-			// 	opts: []Option{UseGreenBit()},
-			// },
-			// {
-			// 	opts: []Option{UseGreenBit(), UseBlueBit()},
-			// },
+			{
+				opts: []Option{UseGreenBit()},
+			},
+			{
+				opts: []Option{UseGreenBit(), UseBlueBit()},
+			},
 		}
 
 		for _, test := range testCases {
@@ -111,12 +188,15 @@ func TestReadBit(t *testing.T) {
 			cur := NewRNGCursor(img, test.opts...)
 			maxAvailable := (img.Bounds().Max.X * img.Bounds().Max.Y * int(cur.bitCount))
 
+			// fol all pixes in the image.
 			for i := 0; i < maxAvailable/int(cur.bitCount); i++ {
 				c := color.RGBA{R: uint8(i), G: uint8(i), B: uint8(i), A: uint8(i)}
 				x := i % img.Bounds().Max.X
 				y := int(i / img.Bounds().Max.X)
+				// for all selected bit colors selected for payload encoding.
 				for e := 0; e < int(cur.bitCount); e++ {
-					b := cur.useBits[e%len(cur.useBits)]
+					index := (i * int(cur.bitCount)) + e
+					b := cur.useBits[index%len(cur.useBits)]
 					switch b {
 					case R_Bit:
 						c.R = uint8(i + e)
@@ -131,7 +211,8 @@ func TestReadBit(t *testing.T) {
 
 			for i := 0; i < maxAvailable/int(cur.bitCount); i++ {
 				for e := 0; e < int(cur.bitCount); e++ {
-					currBit := cur.useBits[(i+e)%len(cur.useBits)]
+					index := (i * int(cur.bitCount)) + e
+					currBit := cur.useBits[index%len(cur.useBits)]
 					read, err := cur.ReadBit()
 					require.NoError(t, err)
 
@@ -150,7 +231,7 @@ func TestReadBit(t *testing.T) {
 
 					expected := uint8(val & 0x0001)
 
-					assert.Equal(t, uint8(expected), read)
+					assert.Equal(t, uint8(expected), read, fmt.Sprintf("testing with %+v", cur.useBits))
 				}
 			}
 		}
