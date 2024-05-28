@@ -1,4 +1,4 @@
-package rng
+package cursors
 
 import (
 	"image"
@@ -7,10 +7,9 @@ import (
 	"testing"
 
 	"github.com/golang/mock/gomock"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	"github.com/pableeee/steg/cursors"
 )
 
 func TestSeek(t *testing.T) {
@@ -35,19 +34,19 @@ func TestSeek(t *testing.T) {
 
 		testCases := []struct {
 			opts []Option
-			bits []cursors.BitColor
+			bits []BitColor
 		}{
 			{
 				opts: []Option{},
-				bits: []cursors.BitColor{cursors.R_Bit},
+				bits: []BitColor{R_Bit},
 			},
 			{
 				opts: []Option{UseGreenBit()},
-				bits: []cursors.BitColor{cursors.R_Bit, cursors.G_Bit},
+				bits: []BitColor{R_Bit, G_Bit},
 			},
 			{
 				opts: []Option{UseGreenBit(), UseBlueBit()},
-				bits: []cursors.BitColor{cursors.R_Bit, cursors.G_Bit, cursors.B_Bit},
+				bits: []BitColor{R_Bit, G_Bit, B_Bit},
 			},
 		}
 
@@ -68,7 +67,7 @@ func TestSeek(t *testing.T) {
 
 func TestReadBit(t *testing.T) {
 	type readResult struct {
-		color cursors.BitColor
+		color BitColor
 		bit   uint8
 	}
 	t.Run("should fail on a read after the bits available on the cursor config", func(t *testing.T) {
@@ -119,11 +118,11 @@ func TestReadBit(t *testing.T) {
 				for e := 0; e < int(cur.bitCount); e++ {
 					b := cur.useBits[e%len(cur.useBits)]
 					switch b {
-					case cursors.R_Bit:
+					case R_Bit:
 						c.R = uint8(i + e)
-					case cursors.G_Bit:
+					case G_Bit:
 						c.G = uint8(i + e)
-					case cursors.B_Bit:
+					case B_Bit:
 						c.B = uint8(i + e)
 					}
 				}
@@ -141,11 +140,11 @@ func TestReadBit(t *testing.T) {
 
 					var val uint32
 					switch currBit {
-					case cursors.R_Bit:
+					case R_Bit:
 						val = r
-					case cursors.G_Bit:
+					case G_Bit:
 						val = g
-					case cursors.B_Bit:
+					case B_Bit:
 						val = b
 					}
 
@@ -160,7 +159,7 @@ func TestReadBit(t *testing.T) {
 
 func TestWriteBit(t *testing.T) {
 	type writeResult struct {
-		color cursors.BitColor
+		color BitColor
 		bit   uint8
 	}
 	t.Run("should fail on a write after the bits available on the cursor config", func(t *testing.T) {
@@ -222,11 +221,11 @@ func TestWriteBit(t *testing.T) {
 					var val uint8
 					r, g, b, _ := c.RGBA()
 					switch res.color {
-					case cursors.R_Bit:
+					case R_Bit:
 						val = uint8(r)
-					case cursors.G_Bit:
+					case G_Bit:
 						val = uint8(g)
-					case cursors.B_Bit:
+					case B_Bit:
 						val = uint8(b)
 					}
 					actual := uint8(val & 0x0001)

@@ -1,4 +1,4 @@
-package rng
+package cursors
 
 import (
 	"fmt"
@@ -6,8 +6,6 @@ import (
 	"image/color"
 	"io"
 	"math/rand"
-
-	"github.com/pableeee/steg/cursors"
 )
 
 const offLast = 0xfffe
@@ -32,11 +30,11 @@ func generateSequence(width, height int, rng *rand.Rand) []image.Point {
 }
 
 type RNGCursor struct {
-	img      cursors.ChangeableImage
+	img      ChangeableImage
 	cursor   int64
-	bitMask  cursors.BitColor
+	bitMask  BitColor
 	bitCount uint
-	useBits  []cursors.BitColor
+	useBits  []BitColor
 	points   []image.Point
 	rng      *rand.Rand
 }
@@ -45,13 +43,13 @@ type Option func(*RNGCursor)
 
 func UseGreenBit() Option {
 	return func(c *RNGCursor) {
-		c.bitMask |= cursors.G_Bit
+		c.bitMask |= G_Bit
 	}
 }
 
 func UseBlueBit() Option {
 	return func(c *RNGCursor) {
-		c.bitMask |= cursors.B_Bit
+		c.bitMask |= B_Bit
 	}
 }
 
@@ -61,14 +59,14 @@ func WithSeed(seed int64) Option {
 	}
 }
 
-func NewRNGCursor(img cursors.ChangeableImage, options ...Option) *RNGCursor {
-	c := &RNGCursor{img: img, bitMask: cursors.R_Bit, rng: rand.New(rand.NewSource(0))}
+func NewRNGCursor(img ChangeableImage, options ...Option) *RNGCursor {
+	c := &RNGCursor{img: img, bitMask: R_Bit, rng: rand.New(rand.NewSource(0))}
 	for _, opt := range options {
 		opt(c)
 	}
 
 	c.points = generateSequence(img.Bounds().Max.X, img.Bounds().Max.Y, c.rng)
-	for _, color := range cursors.Colors {
+	for _, color := range Colors {
 		if c.bitMask&color == color {
 			c.bitCount++
 			c.useBits = append(c.useBits, color)
@@ -78,7 +76,7 @@ func NewRNGCursor(img cursors.ChangeableImage, options ...Option) *RNGCursor {
 	return c
 }
 
-var _ cursors.Cursor = (*RNGCursor)(nil)
+var _ Cursor = (*RNGCursor)(nil)
 
 func (c *RNGCursor) validateBounds(n int64) bool {
 	max := int64(c.img.Bounds().Max.X) * int64(c.img.Bounds().Max.Y) * int64(c.bitCount)
@@ -89,7 +87,7 @@ func (c *RNGCursor) validateBounds(n int64) bool {
 	return true
 }
 
-func (c *RNGCursor) tell() (x, y int, cl cursors.BitColor) {
+func (c *RNGCursor) tell() (x, y int, cl BitColor) {
 
 	planeCursor := c.cursor / int64(c.bitCount)
 	colorCursor := c.cursor % int64(c.bitCount)
@@ -136,11 +134,11 @@ func (c *RNGCursor) WriteBit(bit uint8) (uint, error) {
 
 	r, g, b, a := c.img.At(x, y).RGBA()
 	switch colorBit {
-	case cursors.R_Bit:
+	case R_Bit:
 		fn(&r)
-	case cursors.G_Bit:
+	case G_Bit:
 		fn(&g)
-	case cursors.B_Bit:
+	case B_Bit:
 		fn(&b)
 	}
 
@@ -161,11 +159,11 @@ func (c *RNGCursor) ReadBit() (uint8, error) {
 	val := r
 
 	switch colorBit {
-	case cursors.R_Bit:
+	case R_Bit:
 		val = r
-	case cursors.G_Bit:
+	case G_Bit:
 		val = g
-	case cursors.B_Bit:
+	case B_Bit:
 		val = b
 	}
 
