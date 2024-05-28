@@ -1,15 +1,8 @@
 package cursors
 
 import (
-	"image"
-	"image/color"
 	"io"
 )
-
-type ChangeableImage interface {
-	image.Image
-	Set(x, y int, c color.Color)
-}
 
 type Cursor interface {
 	Seek(offset int64, whence int) (int64, error)

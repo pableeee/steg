@@ -8,3 +8,7 @@ mocks:
 
 test:
 	@go test ./...
+
+
+build:
+	cd cmd/steg && go build

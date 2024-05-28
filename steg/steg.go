@@ -2,20 +2,14 @@ package steg
 
 import (
 	"crypto/md5"
-	"image"
-	"image/color"
+	"image/draw"
 	"io"
 
 	"github.com/pableeee/steg/cipher"
 	cur "github.com/pableeee/steg/cursors"
 )
 
-type ChangeableImage interface {
-	image.Image
-	Set(x, y int, c color.Color)
-}
-
-func Decode(img ChangeableImage, pass []byte) ([]byte, error) {
+func Decode(img draw.Image, pass []byte) ([]byte, error) {
 	h := md5.New()
 	seed, err := h.Write(pass)
 	if err != nil {
@@ -38,7 +32,7 @@ func Decode(img ChangeableImage, pass []byte) ([]byte, error) {
 	return payload, err
 }
 
-func Encode(m ChangeableImage, pass []byte, r io.Reader) error {
+func Encode(m draw.Image, pass []byte, r io.Reader) error {
 	h := md5.New()
 	seed, err := h.Write(pass)
 	if err != nil {

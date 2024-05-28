@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"image/draw"
 	"io"
 	"math/rand"
 )
@@ -30,7 +31,7 @@ func generateSequence(width, height int, rng *rand.Rand) []image.Point {
 }
 
 type RNGCursor struct {
-	img      ChangeableImage
+	img      draw.Image
 	cursor   int64
 	bitMask  BitColor
 	bitCount uint
@@ -59,7 +60,7 @@ func WithSeed(seed int64) Option {
 	}
 }
 
-func NewRNGCursor(img ChangeableImage, options ...Option) *RNGCursor {
+func NewRNGCursor(img draw.Image, options ...Option) *RNGCursor {
 	c := &RNGCursor{img: img, bitMask: R_Bit, rng: rand.New(rand.NewSource(0))}
 	for _, opt := range options {
 		opt(c)

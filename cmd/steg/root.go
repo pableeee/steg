@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"image"
+	"image/draw"
 	"image/png"
 	"log"
 	"os"
@@ -76,22 +78,26 @@ func init() {
 	rootCmd.AddCommand(decodeCmd)
 }
 
+func toDrawImage(src image.Image) draw.Image {
+	bounds := src.Bounds()
+	cimg := image.NewRGBA(image.Rect(0, 0, bounds.Dx(), bounds.Dy()))
+	draw.Draw(cimg, cimg.Bounds(), src, bounds.Min, draw.Src)
+
+	return cimg
+}
+
 func runEncode() error {
 	f, err := os.Open(encoderFlags.inputImage)
 	if err != nil {
 		return err
 	}
 
-	img, err := png.Decode(bufio.NewReader(f))
+	src, err := png.Decode(bufio.NewReader(f))
 	if err != nil {
 		return err
 	}
 
-	cimg, ok := img.(steg.ChangeableImage)
-	if !ok {
-		return fmt.Errorf("image its not changeable: %w", err)
-	}
-
+	cimg := toDrawImage(src)
 	fmsg, err := os.Open(encoderFlags.inputMessage)
 	if err != nil {
 		return err
@@ -121,14 +127,9 @@ func runDecode() error {
 		return err
 	}
 
-	img, err := png.Decode(bufio.NewReader(f))
+	src, err := png.Decode(bufio.NewReader(f))
 	if err != nil {
 		return err
-	}
-
-	cimg, ok := img.(steg.ChangeableImage)
-	if !ok {
-		return fmt.Errorf("image its not changeable: %w", err)
 	}
 
 	out, err := os.Create(decoderFlags.outputFile)
@@ -137,7 +138,7 @@ func runDecode() error {
 	}
 	defer out.Close()
 
-	b, err := steg.Decode(cimg, []byte(decoderFlags.key))
+	b, err := steg.Decode(toDrawImage(src), []byte(decoderFlags.key))
 	if err != nil {
 		return err
 	}
