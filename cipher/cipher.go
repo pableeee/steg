@@ -126,12 +126,18 @@ func (s *streamCipherImpl) refreshCipherBlock() {
 func (s *streamCipherImpl) Seek(n int64, whence int) (int64, error) {
 	switch whence {
 	case io.SeekStart:
-		n = n
+		if n < 0 {
+			return s.index, fmt.Errorf("illegal argument")
+		}
 	case io.SeekCurrent:
+		if n < 0 && (n*-1) > s.index {
+			return s.index, fmt.Errorf("illegal argument")
+		}
 		n = n + s.index
 	case io.SeekEnd:
 		return 0, fmt.Errorf("not implemented")
 	}
+
 	if n > s.maxIndex || n < s.mixIndex {
 		s.counter = uint32(n / int64(s.blockSize*8))
 		s.refreshCipherBlock()
