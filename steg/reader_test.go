@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/golang/mock/gomock"
+	"github.com/pableeee/steg/cursors"
 	mock_cursors "github.com/pableeee/steg/mocks/cursors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -49,7 +50,7 @@ func mockReaderCursor(
 	if correctChecksum {
 		cks = hashFn.Sum(nil)
 	} else {
-		cks = make([]byte, 1)
+		cks = make([]byte, hashFn.Size())
 		for i := range bs {
 			bs[i] = byte(rnd.Intn(256))
 		}
@@ -73,7 +74,7 @@ func TestRead(t *testing.T) {
 		rnd := rand.New(rand.NewSource(0))
 		cur := mockReaderCursor(t, ctrl, uint32(4), true, hashFn, rnd)
 
-		r := reader{cursor: cur, hashFunc: md5.New()}
+		r := reader{cursor: cursors.CursorAdapter(cur), hashFunc: md5.New()}
 		_, err := r.Read()
 		require.NoError(t, err)
 	})
@@ -84,7 +85,7 @@ func TestRead(t *testing.T) {
 		rnd := rand.New(rand.NewSource(0))
 		cur := mockReaderCursor(t, ctrl, uint32(4), false, hashFn, rnd)
 
-		r := reader{cursor: cur, hashFunc: md5.New()}
+		r := reader{cursor: cursors.CursorAdapter(cur), hashFunc: md5.New()}
 		_, err := r.Read()
 		assert.NotNil(t, err)
 	})
@@ -131,7 +132,7 @@ func TestRead(t *testing.T) {
 		cur.EXPECT().ReadBit().
 			Return(uint8(0), fmt.Errorf("eof"))
 
-		r := reader{cursor: cur, hashFunc: md5.New()}
+		r := reader{cursor: cursors.CursorAdapter(cur), hashFunc: md5.New()}
 		b, err := r.Read()
 		assert.NotNil(t, err)
 		assert.Nil(t, b)

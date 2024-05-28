@@ -16,18 +16,18 @@ func CipherMiddleware(c Cursor, block cipher.StreamCipherBlock) Cursor {
 	}
 }
 
-func (c *cipherMiddleware) Seek(n uint) error {
-	err := c.block.Seek(n)
+func (c *cipherMiddleware) Seek(n int64, whence int) (int64, error) {
+	_, err := c.block.Seek(n, whence)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
-	err = c.next.Seek(n)
+	n, err = c.next.Seek(n, whence)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
-	return nil
+	return n, nil
 }
 
 func (c *cipherMiddleware) WriteBit(bit uint8) (uint, error) {

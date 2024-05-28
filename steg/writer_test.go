@@ -5,9 +5,11 @@ import (
 	"crypto/md5"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"testing"
 
 	"github.com/golang/mock/gomock"
+	"github.com/pableeee/steg/cursors"
 	mock_cursors "github.com/pableeee/steg/mocks/cursors"
 	"github.com/stretchr/testify/assert"
 )
@@ -18,8 +20,9 @@ func TestInputStreemTooShort(t *testing.T) {
 		cur := mock_cursors.NewMockCursor(ctrl)
 
 		// the skips writing the payload size for last.
-		cur.EXPECT().Seek(gomock.Any()).Return(fmt.Errorf("out of range"))
-		w := writer{cursor: cur, hashFunc: md5.New()}
+		cur.EXPECT().Seek(gomock.Any(), gomock.Any()).
+			Return(int64(0), fmt.Errorf("out of range"))
+		w := writer{cursor: cursors.CursorAdapter(cur), hashFunc: md5.New()}
 		err := w.Write(bytes.NewReader([]byte("some payload")))
 		assert.Error(t, err)
 	})
@@ -29,13 +32,13 @@ func TestInputStreemTooShort(t *testing.T) {
 		cur := mock_cursors.NewMockCursor(ctrl)
 
 		// the skips writing the payload size for last.
-		cur.EXPECT().Seek(gomock.Any()).Return(nil)
+		cur.EXPECT().Seek(gomock.Any(), gomock.Any()).Return(int64(0), nil)
 		// writes 1 bit
 		cur.EXPECT().WriteBit(gomock.Any()).Return(uint(0), nil)
 		// stream ends
 		cur.EXPECT().WriteBit(gomock.Any()).Return(uint(0), fmt.Errorf("out of range"))
 
-		w := writer{cursor: cur, hashFunc: md5.New()}
+		w := writer{cursor: cursors.CursorAdapter(cur), hashFunc: md5.New()}
 		err := w.Write(bytes.NewReader([]byte("some payload")))
 		assert.Error(t, err)
 	})
@@ -45,7 +48,7 @@ func TestInputStreemTooShort(t *testing.T) {
 		cur := mock_cursors.NewMockCursor(ctrl)
 		payload := []byte("yellow submarine")
 		// the skips writing the payload size for last.
-		cur.EXPECT().Seek(gomock.Any()).Return(nil)
+		cur.EXPECT().Seek(gomock.Any(), gomock.Any()).Return(int64(0), nil)
 
 		for i := 0; i < len(payload)*8; i++ {
 			// writes 1 bit
@@ -57,7 +60,7 @@ func TestInputStreemTooShort(t *testing.T) {
 		// stream ends
 		cur.EXPECT().WriteBit(gomock.Any()).Return(uint(0), fmt.Errorf("out of range"))
 
-		w := writer{cursor: cur, hashFunc: md5.New()}
+		w := writer{cursor: cursors.CursorAdapter(cur), hashFunc: md5.New()}
 		err := w.Write(bytes.NewReader(payload))
 		assert.Error(t, err)
 	})
@@ -73,7 +76,7 @@ func TestWriteSuccess(t *testing.T) {
 		binary.LittleEndian.PutUint32(size, uint32(len(payload)))
 
 		// the skips writing the payload size for last.
-		cur.EXPECT().Seek(uint(4 * 8)).Return(nil)
+		cur.EXPECT().Seek(int64(4*8), io.SeekStart).Return(int64(0), nil)
 		// mocks writing the payload
 		for _, bite := range payload {
 			for _, b := range byteToBits(bite) {
@@ -86,7 +89,7 @@ func TestWriteSuccess(t *testing.T) {
 		}
 
 		// seeks to the beggining to write the payload size.
-		cur.EXPECT().Seek(uint(0)).Return(nil)
+		cur.EXPECT().Seek(int64(0), io.SeekStart).Return(int64(0), nil)
 
 		// mocks writing the payload size
 		for _, bite := range size {
@@ -95,7 +98,7 @@ func TestWriteSuccess(t *testing.T) {
 			}
 		}
 
-		w := writer{cursor: cur, hashFunc: md5.New()}
+		w := writer{cursor: cursors.CursorAdapter(cur), hashFunc: md5.New()}
 		err := w.Write(bytes.NewReader(payload))
 		assert.NoError(t, err)
 	})

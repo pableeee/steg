@@ -3,6 +3,7 @@ package rng
 import (
 	"image"
 	"image/color"
+	"io"
 	"testing"
 
 	"github.com/golang/mock/gomock"
@@ -20,11 +21,11 @@ func TestSeek(t *testing.T) {
 
 		maxAvailable := img.Bounds().Max.X * img.Bounds().Max.X * int(cur.bitCount)
 		for i := 0; i < maxAvailable; i++ {
-			err := cur.Seek(uint(i))
+			_, err := cur.Seek(int64(i), io.SeekStart)
 			require.NoError(t, err)
 		}
 
-		err := cur.Seek(uint(maxAvailable + 1))
+		_, err := cur.Seek(int64(maxAvailable+1), io.SeekStart)
 		assert.Error(t, err)
 	})
 
@@ -54,7 +55,7 @@ func TestSeek(t *testing.T) {
 			cur := NewRNGCursor(img, test.opts...)
 			maxAvailable := img.Bounds().Max.X * img.Bounds().Max.X * int(cur.bitCount)
 			for i := 0; i < maxAvailable; i++ {
-				err := cur.Seek(uint(i))
+				_, err := cur.Seek(int64(i), io.SeekStart)
 				require.NoError(t, err)
 
 				_, _, c := cur.tell()

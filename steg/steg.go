@@ -29,9 +29,10 @@ func Decode(img ChangeableImage, pass []byte) ([]byte, error) {
 		rng.WithSeed(int64(seed)),
 	)
 
+	middle := cursors.CipherMiddleware(cursor, cipher.NewCipher(0, pass))
 	r := reader{
 		hashFunc: md5.New(),
-		cursor:   cursors.CipherMiddleware(cursor, cipher.NewCipher(0, pass)),
+		cursor:   cursors.CursorAdapter(middle),
 	}
 	payload, err := r.Read()
 
@@ -51,9 +52,10 @@ func Encode(m ChangeableImage, pass []byte, r io.Reader) error {
 		rng.WithSeed(int64(seed)),
 	)
 
+	middle := cursors.CipherMiddleware(cursor, cipher.NewCipher(0, pass))
 	w := writer{
 		hashFunc: md5.New(),
-		cursor:   cursors.CipherMiddleware(cursor, cipher.NewCipher(0, pass)),
+		cursor:   cursors.CursorAdapter(middle),
 	}
 
 	return w.Write(r)

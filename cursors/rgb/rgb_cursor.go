@@ -3,6 +3,7 @@ package rgb
 import (
 	"fmt"
 	"image/color"
+	"io"
 	"math"
 
 	"github.com/pableeee/steg/cursors"
@@ -13,7 +14,7 @@ const justLast = 0x0001
 
 type RGBCursor struct {
 	img      cursors.ChangeableImage
-	cursor   uint
+	cursor   int64
 	bitMask  cursors.BitColor
 	bitCount uint
 	useBits  []cursors.BitColor
@@ -52,8 +53,8 @@ func NewRGBCursor(img cursors.ChangeableImage, options ...Option) *RGBCursor {
 
 var _ cursors.Cursor = (*RGBCursor)(nil)
 
-func (c *RGBCursor) validateBounds(n uint) bool {
-	max := uint(c.img.Bounds().Max.X) * uint(c.img.Bounds().Max.Y) * c.bitCount
+func (c *RGBCursor) validateBounds(n int64) bool {
+	max := int64(c.img.Bounds().Max.X) * int64(c.img.Bounds().Max.Y) * int64(c.bitCount)
 	if n >= max {
 		return false
 	}
@@ -63,8 +64,8 @@ func (c *RGBCursor) validateBounds(n uint) bool {
 
 func (c *RGBCursor) tell() (x, y int, cl cursors.BitColor) {
 
-	planeCursor := c.cursor / c.bitCount
-	colorCursor := c.cursor % c.bitCount
+	planeCursor := c.cursor / int64(c.bitCount)
+	colorCursor := c.cursor % int64(c.bitCount)
 
 	x = int(math.Mod(float64(planeCursor), float64(c.img.Bounds().Max.X)))
 	y = int(math.Floor((float64(planeCursor) / float64(c.img.Bounds().Max.X))))
@@ -74,19 +75,26 @@ func (c *RGBCursor) tell() (x, y int, cl cursors.BitColor) {
 	return
 }
 
-func (c *RGBCursor) Seek(n uint) error {
+func (c *RGBCursor) Seek(n int64, whence int) (int64, error) {
 	if !c.validateBounds(n) {
-		return fmt.Errorf("out of bounds")
+		return c.cursor, fmt.Errorf("out of bounds")
 	}
 
-	c.cursor = n
+	switch whence {
+	case io.SeekStart:
+		c.cursor = n
+	case io.SeekCurrent:
+		c.cursor += n
+	case io.SeekEnd:
+		return 0, fmt.Errorf("not implemented")
+	}
 
-	return nil
+	return c.cursor, nil
 }
 
 func (c *RGBCursor) WriteBit(bit uint8) (uint, error) {
 	if !c.validateBounds(c.cursor) {
-		return c.cursor, fmt.Errorf("out of bounds")
+		return uint(c.cursor), fmt.Errorf("out of bounds")
 	}
 
 	fn := func(r *uint32) {
@@ -113,7 +121,7 @@ func (c *RGBCursor) WriteBit(bit uint8) (uint, error) {
 
 	c.cursor++
 
-	return c.cursor, nil
+	return uint(c.cursor), nil
 }
 
 func (c *RGBCursor) ReadBit() (uint8, error) {

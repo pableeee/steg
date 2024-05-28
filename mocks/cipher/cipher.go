@@ -64,17 +64,18 @@ func (mr *MockStreamCipherBlockMockRecorder) EncryptBit(bit interface{}) *gomock
 }
 
 // Seek mocks base method.
-func (m *MockStreamCipherBlock) Seek(n uint) error {
+func (m *MockStreamCipherBlock) Seek(offset int64, whence int) (int64, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "Seek", n)
-	ret0, _ := ret[0].(error)
-	return ret0
+	ret := m.ctrl.Call(m, "Seek", offset, whence)
+	ret0, _ := ret[0].(int64)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
 }
 
 // Seek indicates an expected call of Seek.
-func (mr *MockStreamCipherBlockMockRecorder) Seek(n interface{}) *gomock.Call {
+func (mr *MockStreamCipherBlockMockRecorder) Seek(offset, whence interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Seek", reflect.TypeOf((*MockStreamCipherBlock)(nil).Seek), n)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Seek", reflect.TypeOf((*MockStreamCipherBlock)(nil).Seek), offset, whence)
 }
 
 // MockBlock is a mock of Block interface.

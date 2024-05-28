@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"io"
 	"math/rand"
 
 	"github.com/pableeee/steg/cursors"
@@ -32,7 +33,7 @@ func generateSequence(width, height int, rng *rand.Rand) []image.Point {
 
 type RNGCursor struct {
 	img      cursors.ChangeableImage
-	cursor   uint
+	cursor   int64
 	bitMask  cursors.BitColor
 	bitCount uint
 	useBits  []cursors.BitColor
@@ -79,8 +80,8 @@ func NewRNGCursor(img cursors.ChangeableImage, options ...Option) *RNGCursor {
 
 var _ cursors.Cursor = (*RNGCursor)(nil)
 
-func (c *RNGCursor) validateBounds(n uint) bool {
-	max := uint(c.img.Bounds().Max.X) * uint(c.img.Bounds().Max.Y) * c.bitCount
+func (c *RNGCursor) validateBounds(n int64) bool {
+	max := int64(c.img.Bounds().Max.X) * int64(c.img.Bounds().Max.Y) * int64(c.bitCount)
 	if n >= max {
 		return false
 	}
@@ -90,8 +91,8 @@ func (c *RNGCursor) validateBounds(n uint) bool {
 
 func (c *RNGCursor) tell() (x, y int, cl cursors.BitColor) {
 
-	planeCursor := c.cursor / c.bitCount
-	colorCursor := c.cursor % c.bitCount
+	planeCursor := c.cursor / int64(c.bitCount)
+	colorCursor := c.cursor % int64(c.bitCount)
 
 	x = c.points[planeCursor].X
 	y = c.points[planeCursor].Y
@@ -101,19 +102,26 @@ func (c *RNGCursor) tell() (x, y int, cl cursors.BitColor) {
 	return
 }
 
-func (c *RNGCursor) Seek(n uint) error {
+func (c *RNGCursor) Seek(n int64, whence int) (int64, error) {
 	if !c.validateBounds(n) {
-		return fmt.Errorf("out of bounds")
+		return c.cursor, fmt.Errorf("out of bounds")
 	}
 
-	c.cursor = n
+	switch whence {
+	case io.SeekStart:
+		c.cursor = n
+	case io.SeekCurrent:
+		c.cursor += n
+	case io.SeekEnd:
+		return 0, fmt.Errorf("not implemented")
+	}
 
-	return nil
+	return c.cursor, nil
 }
 
 func (c *RNGCursor) WriteBit(bit uint8) (uint, error) {
 	if !c.validateBounds(c.cursor) {
-		return c.cursor, fmt.Errorf("out of bounds")
+		return uint(c.cursor), fmt.Errorf("out of bounds")
 	}
 
 	fn := func(r *uint32) {
@@ -140,7 +148,7 @@ func (c *RNGCursor) WriteBit(bit uint8) (uint, error) {
 
 	c.cursor++
 
-	return c.cursor, nil
+	return uint(c.cursor), nil
 }
 
 func (c *RNGCursor) ReadBit() (uint8, error) {
