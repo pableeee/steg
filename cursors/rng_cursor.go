@@ -30,14 +30,25 @@ func generateSequence(width, height int, rng *rand.Rand) []image.Point {
 	return positions
 }
 
+func writeBit(r *uint32, bit, n uint8) {
+	if bit == 1 {
+		mask := uint32(1 << n)
+		*r = *r | mask
+	} else {
+		mask := uint32(0xffff & (1 << n))
+		*r = *r & mask
+	}
+}
+
 type RNGCursor struct {
-	img      draw.Image
-	cursor   int64
-	bitMask  BitColor
-	bitCount uint
-	useBits  []BitColor
-	points   []image.Point
-	rng      *rand.Rand
+	img         draw.Image
+	cursor      int64
+	bitMask     BitColor
+	bitCount    uint
+	bitPerColor uint
+	useBits     []BitColor
+	points      []image.Point
+	rng         *rand.Rand
 }
 
 type Option func(*RNGCursor)
@@ -60,8 +71,16 @@ func WithSeed(seed int64) Option {
 	}
 }
 
+func WithBitsPerColor(bits uint) Option {
+	return func(c *RNGCursor) {
+		if bits <= 8 && bits > 0 {
+			c.bitPerColor = bits
+		}
+	}
+}
+
 func NewRNGCursor(img draw.Image, options ...Option) *RNGCursor {
-	c := &RNGCursor{img: img, bitMask: R_Bit, rng: rand.New(rand.NewSource(0))}
+	c := &RNGCursor{img: img, bitMask: R_Bit, rng: rand.New(rand.NewSource(0)), bitPerColor: 1}
 	for _, opt := range options {
 		opt(c)
 	}
@@ -79,21 +98,28 @@ func NewRNGCursor(img draw.Image, options ...Option) *RNGCursor {
 
 var _ Cursor = (*RNGCursor)(nil)
 
-func (c *RNGCursor) validateBounds(n int64) bool {
-	max := int64(c.img.Bounds().Max.X) * int64(c.img.Bounds().Max.Y) * int64(c.bitCount)
-
-	return n < max
+func (c *RNGCursor) maxSize() int64 {
+	return int64(c.img.Bounds().Max.X) * int64(c.img.Bounds().Max.Y) * int64(c.bitCount) * int64(c.bitPerColor)
 }
 
-func (c *RNGCursor) tell() (x, y int, cl BitColor) {
+func (c *RNGCursor) validateBounds(n int64) bool {
+	if n > c.maxSize() {
+		return false
+	}
 
-	planeCursor := c.cursor / int64(c.bitCount)
-	colorCursor := c.cursor % int64(c.bitCount)
+	planeCursor := c.cursor / int64(c.bitCount*c.bitPerColor)
+	return planeCursor < int64(len(c.points))
+}
+
+func (c *RNGCursor) tell() (x, y int, cl BitColor, bit uint8) {
+
+	planeCursor := c.cursor / int64(c.bitCount*c.bitPerColor)
+	colorCursor := (c.cursor / int64(c.bitPerColor)) % int64(c.bitCount)
 
 	x = c.points[planeCursor].X
 	y = c.points[planeCursor].Y
-
 	cl = c.useBits[colorCursor]
+	bit = uint8(c.cursor % int64(c.bitPerColor))
 
 	return
 }
@@ -105,7 +131,7 @@ func (c *RNGCursor) Seek(n int64, whence int) (int64, error) {
 	// [SeekCurrent] means relative to the current offset, and
 	// [SeekEnd] means relative to the end
 	if !c.validateBounds(n) {
-		return c.cursor, fmt.Errorf("out of bounds")
+		return c.cursor, fmt.Errorf("out of bounds: %w", io.EOF)
 	}
 
 	switch whence {
@@ -133,27 +159,19 @@ func (c *RNGCursor) Seek(n int64, whence int) (int64, error) {
 
 func (c *RNGCursor) WriteBit(bit uint8) (uint, error) {
 	if !c.validateBounds(c.cursor) {
-		return uint(c.cursor), fmt.Errorf("out of bounds")
+		return uint(c.cursor), fmt.Errorf("out of bounds: %w", io.EOF)
 	}
 
-	fn := func(r *uint32) {
-		if bit == 1 {
-			*r = *r | justLast
-		} else {
-			*r = *r & offLast
-		}
-	}
-
-	x, y, colorBit := c.tell()
+	x, y, col, colBit := c.tell()
 
 	r, g, b, a := c.img.At(x, y).RGBA()
-	switch colorBit {
+	switch col {
 	case R_Bit:
-		fn(&r)
+		writeBit(&r, bit, colBit)
 	case G_Bit:
-		fn(&g)
+		writeBit(&g, bit, colBit)
 	case B_Bit:
-		fn(&b)
+		writeBit(&b, bit, colBit)
 	}
 
 	c.img.Set(x, y, color.RGBA{uint8(r), uint8(g), uint8(b), uint8(a)})
@@ -165,9 +183,9 @@ func (c *RNGCursor) WriteBit(bit uint8) (uint, error) {
 
 func (c *RNGCursor) ReadBit() (uint8, error) {
 	if !c.validateBounds(c.cursor) {
-		return 0, fmt.Errorf("out of bounds")
+		return 0, fmt.Errorf("out of bounds: %w", io.EOF)
 	}
-	x, y, colorBit := c.tell()
+	x, y, colorBit, _ := c.tell()
 	r, g, b, _ := c.img.At(x, y).RGBA()
 	c.cursor++
 	val := r
