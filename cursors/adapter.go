@@ -4,15 +4,15 @@ import (
 	"io"
 )
 
-func CursorAdapter(c Cursor) io.ReadWriteSeeker {
-	return &readWriteSeekerAdapter{cur: c}
-}
-
 type readWriteSeekerAdapter struct {
 	io.Reader
 	io.Seeker
 	io.Writer
 	cur Cursor
+}
+
+func CursorAdapter(c Cursor) io.ReadWriteSeeker {
+	return &readWriteSeekerAdapter{cur: c}
 }
 
 func byteToBits(b byte) []int {
