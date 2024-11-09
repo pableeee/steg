@@ -5,6 +5,7 @@ import (
 	"image"
 	"image/color"
 	"io"
+	"math/rand"
 	"testing"
 
 	"github.com/golang/mock/gomock"
@@ -114,7 +115,7 @@ func TestSeek(t *testing.T) {
 		img := image.NewRGBA(image.Rect(0, 0, 10, 10))
 		cur := NewRNGCursor(img)
 
-		maxAvailable := img.Bounds().Max.X * img.Bounds().Max.X * int(cur.bitCount)
+		maxAvailable := img.Bounds().Max.X * img.Bounds().Max.X * int(cur.colorsPerPoint)
 		for i := 0; i < maxAvailable; i++ {
 			_, err := cur.Seek(int64(i), io.SeekStart)
 			require.NoError(t, err)
@@ -148,7 +149,7 @@ func TestSeek(t *testing.T) {
 
 		for _, test := range testCases {
 			cur := NewRNGCursor(img, test.opts...)
-			maxAvailable := img.Bounds().Max.X * img.Bounds().Max.X * int(cur.bitCount)
+			maxAvailable := img.Bounds().Max.X * img.Bounds().Max.X * int(cur.colorsPerPoint)
 			for i := 0; i < maxAvailable; i++ {
 				_, err := cur.Seek(int64(i), io.SeekStart)
 				require.NoError(t, err)
@@ -185,57 +186,46 @@ func TestReadBit(t *testing.T) {
 	})
 
 	t.Run("should read sequentially the bits in the image", func(t *testing.T) {
-		for _, test := range testCases {
-			for bits := uint(1); bits < 8; bits++ {
+		for bits := uint(1); bits < 8; bits++ {
+			for _, test := range testCases {
 				img := image.NewRGBA(image.Rect(0, 0, 2, 2))
+				test.opts = append(test.opts, WithBitsPerColor(bits))
 				cur := NewRNGCursor(img, test.opts...)
-				maxAvailable := cur.maxSize()
-
+				rng := rand.New(rand.NewSource(0))
 				// fol all pixes in the image.
-				for i := 0; i < img.Bounds().Max.X*img.Bounds().Max.Y; i++ {
+				for _, p := range cur.points {
 					// create color using seq no.
-					c := color.RGBA{R: uint8(i), G: uint8(i), B: uint8(i), A: uint8(i)}
-					x := i % img.Bounds().Max.X
-					y := int(i / img.Bounds().Max.X)
-					// for all selected bit colors selected for payload encoding.
-					for e := 0; e < int(cur.bitCount); e++ {
-						index := (i * int(cur.bitCount)) + e
-						b := cur.useBits[index%len(cur.useBits)]
-						switch b {
-						case R_Bit:
-							c.R = uint8(i + e)
-						case G_Bit:
-							c.G = uint8(i + e)
-						case B_Bit:
-							c.B = uint8(i + e)
-						}
-					}
+					x := p.X
+					y := p.Y
+					c := color.RGBA{R: uint8(rng.Intn(8)), G: uint8(rng.Intn(8)), B: uint8(rng.Intn(8)), A: uint8(rng.Intn(8))}
 					img.Set(x, y, &c)
 				}
 
-				for i := 0; i < int(maxAvailable)/int(cur.bitCount); i++ {
-					for e := 0; e < int(cur.bitCount); e++ {
-						index := (i * int(cur.bitCount)) + e
-						currBit := cur.useBits[index%len(cur.useBits)]
-						read, err := cur.ReadBit()
-						require.NoError(t, err)
+				for i, p := range cur.points {
+					for e := 0; e < int(cur.colorsPerPoint); e++ {
+						for j := 0; j < int(cur.bitsPerColor); j++ {
+							index := (i * int(cur.colorsPerPoint)) + (e * int(cur.bitsPerColor)) + j
+							id := (index / (len(cur.useColors) * int(cur.bitsPerColor)))
+							currColor := cur.useColors[id]
+							read, err := cur.ReadBit()
+							require.NoError(t, err)
+							r, g, b, _ := img.
+								At(p.X, p.Y).RGBA()
 
-						r, g, b, _ := img.
-							At(cur.points[i].X, cur.points[i].Y).RGBA()
+							var val uint32
+							switch currColor {
+							case R_Bit:
+								val = r
+							case G_Bit:
+								val = g
+							case B_Bit:
+								val = b
+							}
 
-						var val uint32
-						switch currBit {
-						case R_Bit:
-							val = r
-						case G_Bit:
-							val = g
-						case B_Bit:
-							val = b
+							expected := uint8(val&1<<j) >> j
+
+							assert.Equal(t, uint8(expected), read, fmt.Sprintf("testing with colors(%+v) and bitsPerColor(%d) and index(%d)", cur.useColors, cur.bitsPerColor, index))
 						}
-
-						expected := uint8(val & 0x0001)
-
-						assert.Equal(t, uint8(expected), read, fmt.Sprintf("testing with %+v", cur.useBits))
 					}
 				}
 			}
@@ -263,9 +253,9 @@ func TestWriteBit(t *testing.T) {
 					x, y, col, bitColor := cur.tell()
 					assert.True(t, x < img.Bounds().Max.X)
 					assert.True(t, y < img.Bounds().Max.Y)
-					assert.Equal(t, bitColor, uint8(uint(i)%cur.bitPerColor))
+					assert.Equal(t, bitColor, uint8(uint(i)%cur.bitsPerColor))
 
-					assert.Equal(t, col, cur.useBits[(i/int64(cur.bitPerColor))%int64(cur.bitCount)])
+					assert.Equal(t, col, cur.useColors[(i/int64(cur.bitsPerColor))%int64(cur.colorsPerPoint)])
 
 					_, err := cur.WriteBit(1)
 					require.NoError(t, err)
@@ -302,12 +292,12 @@ func TestWriteBit(t *testing.T) {
 				}
 
 				var mask uint32
-				for i := 0; i < int(cur.bitPerColor); i++ {
+				for i := 0; i < int(cur.bitsPerColor); i++ {
 					mask |= 1 << i
 				}
 
 				r, g, b, a := color.Black.RGBA()
-				for _, col := range cur.useBits {
+				for _, col := range cur.useColors {
 					switch col {
 					case R_Bit:
 						r = mask

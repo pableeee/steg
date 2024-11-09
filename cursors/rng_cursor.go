@@ -41,14 +41,14 @@ func writeBit(r *uint32, bit, n uint8) {
 }
 
 type RNGCursor struct {
-	img         draw.Image
-	cursor      int64
-	bitMask     BitColor
-	bitCount    uint
-	bitPerColor uint
-	useBits     []BitColor
-	points      []image.Point
-	rng         *rand.Rand
+	img            draw.Image
+	cursor         int64
+	bitMask        BitColor
+	colorsPerPoint uint
+	bitsPerColor   uint
+	useColors      []BitColor
+	points         []image.Point
+	rng            *rand.Rand
 }
 
 type Option func(*RNGCursor)
@@ -74,13 +74,13 @@ func WithSeed(seed int64) Option {
 func WithBitsPerColor(bits uint) Option {
 	return func(c *RNGCursor) {
 		if bits <= 8 && bits > 0 {
-			c.bitPerColor = bits
+			c.bitsPerColor = bits
 		}
 	}
 }
 
 func NewRNGCursor(img draw.Image, options ...Option) *RNGCursor {
-	c := &RNGCursor{img: img, bitMask: R_Bit, rng: rand.New(rand.NewSource(0)), bitPerColor: 1}
+	c := &RNGCursor{img: img, bitMask: R_Bit, rng: rand.New(rand.NewSource(0)), bitsPerColor: 1}
 	for _, opt := range options {
 		opt(c)
 	}
@@ -88,8 +88,8 @@ func NewRNGCursor(img draw.Image, options ...Option) *RNGCursor {
 	c.points = generateSequence(img.Bounds().Max.X, img.Bounds().Max.Y, c.rng)
 	for _, color := range Colors {
 		if c.bitMask&color == color {
-			c.bitCount++
-			c.useBits = append(c.useBits, color)
+			c.colorsPerPoint++
+			c.useColors = append(c.useColors, color)
 		}
 	}
 
@@ -99,7 +99,7 @@ func NewRNGCursor(img draw.Image, options ...Option) *RNGCursor {
 var _ Cursor = (*RNGCursor)(nil)
 
 func (c *RNGCursor) maxSize() int64 {
-	return int64(c.img.Bounds().Max.X) * int64(c.img.Bounds().Max.Y) * int64(c.bitCount) * int64(c.bitPerColor)
+	return int64(c.img.Bounds().Max.X) * int64(c.img.Bounds().Max.Y) * int64(c.colorsPerPoint) * int64(c.bitsPerColor)
 }
 
 func (c *RNGCursor) validateBounds(n int64) bool {
@@ -107,19 +107,19 @@ func (c *RNGCursor) validateBounds(n int64) bool {
 		return false
 	}
 
-	planeCursor := c.cursor / int64(c.bitCount*c.bitPerColor)
+	planeCursor := c.cursor / int64(c.colorsPerPoint*c.bitsPerColor)
 	return planeCursor < int64(len(c.points))
 }
 
 func (c *RNGCursor) tell() (x, y int, cl BitColor, bit uint8) {
 
-	planeCursor := c.cursor / int64(c.bitCount*c.bitPerColor)
-	colorCursor := (c.cursor / int64(c.bitPerColor)) % int64(c.bitCount)
+	planeCursor := c.cursor / int64(c.colorsPerPoint*c.bitsPerColor)
+	colorCursor := (c.cursor / int64(c.bitsPerColor)) % int64(c.colorsPerPoint)
 
 	x = c.points[planeCursor].X
 	y = c.points[planeCursor].Y
-	cl = c.useBits[colorCursor]
-	bit = uint8(c.cursor % int64(c.bitPerColor))
+	cl = c.useColors[colorCursor]
+	bit = uint8(c.cursor % int64(c.bitsPerColor))
 
 	return
 }
@@ -146,7 +146,7 @@ func (c *RNGCursor) Seek(n int64, whence int) (int64, error) {
 		}
 		c.cursor += n
 	case io.SeekEnd:
-		max := int64(c.img.Bounds().Max.X) * int64(c.img.Bounds().Max.Y) * int64(c.bitCount)
+		max := int64(c.img.Bounds().Max.X) * int64(c.img.Bounds().Max.Y) * int64(c.colorsPerPoint) * (int64(c.bitsPerColor))
 		if n > 0 || (n*-1) > max {
 			return c.cursor, fmt.Errorf("illegal argument")
 		}
