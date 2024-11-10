@@ -5,6 +5,7 @@ import (
 	"image"
 	"image/color"
 	"io"
+	"reflect"
 	"testing"
 
 	"github.com/golang/mock/gomock"
@@ -12,6 +13,20 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+var testCases = []struct {
+	opts []Option
+}{
+	{
+		opts: []Option{},
+	},
+	{
+		opts: []Option{UseGreenBit()},
+	},
+	{
+		opts: []Option{UseGreenBit(), UseBlueBit()},
+	},
+}
 
 func TestSeek(t *testing.T) {
 	t.Run("should fail seek using SeekStart using negative offset", func(t *testing.T) {
@@ -314,6 +329,108 @@ func TestWriteBit(t *testing.T) {
 				}
 			}
 
+		}
+	})
+}
+
+func TestChatGPT(t *testing.T) {
+	t.Run("TestRandomnessAndSeeds", func(t *testing.T) {
+		for _, test := range testCases {
+			img := image.NewNRGBA(image.Rect(0, 0, 10, 10))
+			bitsToWrite := []uint8{1, 0, 1, 1, 0}
+
+			// Same seed
+			seed := int64(42)
+			opts := append(test.opts, WithSeed(seed))
+			cursor1 := NewRNGCursor(img, opts...)
+			cursor2 := NewRNGCursor(img, opts...)
+
+			// Write bits with cursor1
+			for _, bit := range bitsToWrite {
+				cursor1.WriteBit(bit)
+			}
+
+			// Seek cursor2 to start and read bits
+			cursor2.Seek(0, io.SeekStart)
+			bitsRead := make([]uint8, len(bitsToWrite))
+			for i := range bitsRead {
+				bit, err := cursor2.ReadBit()
+				if err != nil {
+					t.Fatalf("ReadBit failed: %v", err)
+				}
+				bitsRead[i] = bit
+			}
+
+			// Assert bits match
+			if !reflect.DeepEqual(bitsToWrite, bitsRead) {
+				t.Errorf("Bits read do not match bits written with same seed.\nExpected: %v\nGot:      %v", bitsToWrite, bitsRead)
+			}
+
+			// Different seed
+			cursor3 := NewRNGCursor(img, WithSeed(seed+1))
+			cursor3.Seek(0, io.SeekStart)
+			bitsReadDifferentSeed := make([]uint8, len(bitsToWrite))
+			for i := range bitsReadDifferentSeed {
+				bit, err := cursor3.ReadBit()
+				if err != nil {
+					t.Fatalf("ReadBit failed: %v", err)
+				}
+				bitsReadDifferentSeed[i] = bit
+			}
+
+			// Assert bits do not match
+			if reflect.DeepEqual(bitsToWrite, bitsReadDifferentSeed) {
+				t.Errorf("Bits read match bits written with different seed, expected them to differ.")
+			}
+		}
+	})
+
+	t.Run("TestSeekFunctionality", func(t *testing.T) {
+		img := image.NewNRGBA(image.Rect(0, 0, 10, 10))
+		cursor := NewRNGCursor(img)
+
+		// Write bits at different positions
+		positions := []int64{0, 5, 10}
+		bits := []uint8{1, 0, 1}
+
+		for i, pos := range positions {
+			_, err := cursor.Seek(pos, io.SeekStart)
+			if err != nil {
+				t.Fatalf("Seek failed: %v", err)
+			}
+			cursor.WriteBit(bits[i])
+		}
+
+		// Read bits back
+		for i, pos := range positions {
+			_, err := cursor.Seek(pos, io.SeekStart)
+			if err != nil {
+				t.Fatalf("Seek failed: %v", err)
+			}
+			bit, err := cursor.ReadBit()
+			if err != nil {
+				t.Fatalf("ReadBit failed: %v", err)
+			}
+			if bit != bits[i] {
+				t.Errorf("Bit mismatch at position %d: expected %d, got %d", pos, bits[i], bit)
+			}
+		}
+
+		// Invalid whence
+		_, err := cursor.Seek(0, 999)
+		if err == nil {
+			t.Error("Expected error for invalid whence, got none")
+		}
+	})
+
+	t.Run("TestInvalidBitValue", func(t *testing.T) {
+		img := image.NewNRGBA(image.Rect(0, 0, 10, 10))
+		cursor := NewRNGCursor(img)
+
+		// Attempt to write an invalid bit value
+		_, err := cursor.WriteBit(2)
+		if err == nil {
+			t.Error("Expected error when writing invalid bit value, got none")
 		}
 	})
 }
