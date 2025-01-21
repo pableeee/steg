@@ -10,12 +10,6 @@ import (
 	"github.com/pableeee/steg/steg/container"
 )
 
-// Encode embeds the data from the provided reader into the given image using the provided passphrase.
-// It:
-// 1. Derives a seed from the hash of the password.
-// 2. Creates a pseudo-random cursor over the image (RNGCursor).
-// 3. Wraps the cursor with a cipher middleware if a pass is provided.
-// 4. Uses container.WritePayload to write length, payload, and checksum.
 func Encode(m draw.Image, pass []byte, r io.Reader) error {
 	// Derive a seed from the password
 	seedVal, err := deriveSeedFromPassword(pass)

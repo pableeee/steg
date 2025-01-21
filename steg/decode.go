@@ -9,12 +9,6 @@ import (
 	"github.com/pableeee/steg/steg/container"
 )
 
-// Decode extracts the embedded data from the given image using the provided passphrase.
-// It:
-// 1. Derives a seed from the hash of the password.
-// 2. Creates a pseudo-random cursor over the image (RNGCursor).
-// 3. Wraps the cursor with a cipher middleware if a pass is provided.
-// 4. Uses container.ReadPayload to retrieve the payload and validate checksum.
 func Decode(m draw.Image, pass []byte) ([]byte, error) {
 	// Derive a seed from the password
 	seedVal, err := deriveSeedFromPassword(pass)
