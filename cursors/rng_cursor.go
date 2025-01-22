@@ -163,6 +163,14 @@ func (c *RNGCursor) WriteBit(bit uint8) (uint, error) {
 	return uint(c.cursor), nil
 }
 
+func (c *RNGCursor) Read(payload []byte) (n int, err error) {
+	return 0, nil
+}
+
+func (c *RNGCursor) Write(payload []byte) (n int, err error) {
+	return 0, nil
+}
+
 func (c *RNGCursor) ReadBit() (uint8, error) {
 	if !c.validateBounds(c.cursor) {
 		return 0, fmt.Errorf("out of bounds")

@@ -52,3 +52,11 @@ func (c *cipherMiddleware) ReadBit() (uint8, error) {
 
 	return b, err
 }
+
+func (c *cipherMiddleware) Read(payload []byte) (n int, err error) {
+	return 0, nil
+}
+
+func (c *cipherMiddleware) Write(payload []byte) (n int, err error) {
+	return 0, nil
+}
