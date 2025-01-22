@@ -31,7 +31,7 @@ func (r *readWriteSeekerAdapter) Seek(offset int64, whence int) (int64, error) {
 	// [SeekStart] means relative to the start of the file,
 	// [SeekCurrent] means relative to the current offset, and
 	// [SeekEnd] means relative to the end
-	return r.cur.Seek(offset, whence)
+	return r.cur.Seek(offset*8, whence)
 }
 
 func (r *readWriteSeekerAdapter) Read(payload []byte) (n int, err error) {

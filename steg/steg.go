@@ -2,54 +2,21 @@ package steg
 
 import (
 	"crypto/md5"
-	"image/draw"
-	"io"
-
-	"github.com/pableeee/steg/cipher"
-	cur "github.com/pableeee/steg/cursors"
 )
 
-func Decode(img draw.Image, pass []byte) ([]byte, error) {
-	h := md5.New()
-	seed, err := h.Write(pass)
-	if err != nil {
-		return nil, err
+// deriveSeedFromPassword takes a password and returns a reproducible int64 seed.
+func deriveSeedFromPassword(pass []byte) (int64, error) {
+	hashFn := md5.New()
+	if _, err := hashFn.Write(pass); err != nil {
+		return 0, err
+	}
+	seedBytes := hashFn.Sum(nil)
+
+	var seedVal int64
+	// Use the first 8 bytes (or fewer, if shorter) of the hash to form a seed.
+	for i := 0; i < 8 && i < len(seedBytes); i++ {
+		seedVal = (seedVal << 8) | int64(seedBytes[i])
 	}
 
-	cursor := cur.NewRNGCursor(img,
-		cur.UseGreenBit(),
-		cur.UseBlueBit(),
-		cur.WithSeed(int64(seed)),
-	)
-
-	middle := cur.CipherMiddleware(cursor, cipher.NewCipher(0, pass))
-	r := reader{
-		hashFunc: md5.New(),
-		cursor:   cur.CursorAdapter(middle),
-	}
-	payload, err := r.Read()
-
-	return payload, err
-}
-
-func Encode(m draw.Image, pass []byte, r io.Reader) error {
-	h := md5.New()
-	seed, err := h.Write(pass)
-	if err != nil {
-		return err
-	}
-
-	cursor := cur.NewRNGCursor(m,
-		cur.UseGreenBit(),
-		cur.UseBlueBit(),
-		cur.WithSeed(int64(seed)),
-	)
-
-	middle := cur.CipherMiddleware(cursor, cipher.NewCipher(0, pass))
-	w := writer{
-		hashFunc: md5.New(),
-		cursor:   cur.CursorAdapter(middle),
-	}
-
-	return w.Write(r)
+	return seedVal, nil
 }

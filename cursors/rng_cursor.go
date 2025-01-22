@@ -105,7 +105,7 @@ func (c *RNGCursor) Seek(n int64, whence int) (int64, error) {
 	// [SeekCurrent] means relative to the current offset, and
 	// [SeekEnd] means relative to the end
 	if !c.validateBounds(n) {
-		return c.cursor, fmt.Errorf("out of bounds")
+		return c.cursor, fmt.Errorf("out of bounds: %w", io.EOF)
 	}
 
 	switch whence {
@@ -133,7 +133,7 @@ func (c *RNGCursor) Seek(n int64, whence int) (int64, error) {
 
 func (c *RNGCursor) WriteBit(bit uint8) (uint, error) {
 	if !c.validateBounds(c.cursor) {
-		return uint(c.cursor), fmt.Errorf("out of bounds")
+		return uint(c.cursor), fmt.Errorf("out of bounds: %w", io.EOF)
 	}
 
 	fn := func(r *uint32) {
