@@ -87,7 +87,7 @@ func TestRNGCursor(t *testing.T) {
 		// Try writing 1 byte = 8 bits. Only 4 bits available, should fail halfway
 		payload := []byte{0xFF}
 		n, err := adapter.Write(payload)
-		assert.Error(t, err, "Writing beyond capacity should return an error")
+		assert.ErrorIs(t, err, io.EOF)
 		assert.Less(t, n, len(payload))
 	})
 
