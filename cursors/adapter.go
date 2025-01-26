@@ -25,6 +25,22 @@ func byteToBits(b byte) []int {
 	return bits
 }
 
+func splitSlice(slice []int, chunkSize int) [][]int {
+	if chunkSize <= 0 {
+		panic("chunkSize must be greater than 0")
+	}
+
+	var chunks [][]int
+	for i := 0; i < len(slice); i += chunkSize {
+		end := i + chunkSize
+		if end > len(slice) {
+			end = len(slice)
+		}
+		chunks = append(chunks, slice[i:end])
+	}
+	return chunks
+}
+
 func (r *readWriteSeekerAdapter) Seek(offset int64, whence int) (int64, error) {
 	// Seek sets the offset for the next Read or Write to offset,
 	// interpreted according to whence:
