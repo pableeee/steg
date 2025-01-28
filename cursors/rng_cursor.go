@@ -1,11 +1,13 @@
 package cursors
 
 import (
+	"context"
 	"fmt"
 	"image"
 	"image/color"
 	"image/draw"
 	"io"
+	"math"
 	"math/rand"
 )
 
@@ -30,14 +32,30 @@ func generateSequence(width, height int, rng *rand.Rand) []image.Point {
 	return positions
 }
 
+type bitsPayload struct {
+	x, y, n      int
+	payload      []int
+	responseChan chan response
+}
+
+type response struct {
+	err error
+	seq int
+}
+
 type RNGCursor struct {
-	img      draw.Image
-	cursor   int64
-	bitMask  BitColor
-	bitCount uint
-	useBits  []BitColor
-	points   []image.Point
-	rng      *rand.Rand
+	img         draw.Image
+	cursor      int64
+	bitMask     BitColor
+	bitDepth    uint8
+	useChannels []BitColor
+	points      []image.Point
+	rng         *rand.Rand
+
+	// concurrent read/writes
+	concurrency int
+	cancel      context.CancelFunc
+	workerChan  chan bitsPayload
 }
 
 type Option func(*RNGCursor)
@@ -54,6 +72,19 @@ func UseBlueBit() Option {
 	}
 }
 
+func WithBitDepth(depth uint8) Option {
+	return func(c *RNGCursor) {
+		c.bitDepth = depth
+	}
+}
+
+func WithConcurrency(concurrency int) Option {
+	return func(c *RNGCursor) {
+		c.concurrency = concurrency
+		c.workerChan = make(chan bitsPayload, concurrency)
+	}
+}
+
 func WithSeed(seed int64) Option {
 	return func(c *RNGCursor) {
 		c.rng = rand.New(rand.NewSource(seed))
@@ -61,7 +92,15 @@ func WithSeed(seed int64) Option {
 }
 
 func NewRNGCursor(img draw.Image, options ...Option) *RNGCursor {
-	c := &RNGCursor{img: img, bitMask: R_Bit, rng: rand.New(rand.NewSource(0))}
+	c := &RNGCursor{
+		img:         img,
+		bitMask:     R_Bit,
+		rng:         rand.New(rand.NewSource(0)),
+		bitDepth:    1,
+		concurrency: 1,
+		workerChan:  make(chan bitsPayload),
+	}
+
 	for _, opt := range options {
 		opt(c)
 	}
@@ -69,31 +108,39 @@ func NewRNGCursor(img draw.Image, options ...Option) *RNGCursor {
 	c.points = generateSequence(img.Bounds().Max.X, img.Bounds().Max.Y, c.rng)
 	for _, color := range Colors {
 		if c.bitMask&color == color {
-			c.bitCount++
-			c.useBits = append(c.useBits, color)
+			c.useChannels = append(c.useChannels, color)
 		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	c.cancel = cancel
+
+	for i := 0; i < c.concurrency; i++ {
+		go c.writeBitDepthPayload(ctx)
 	}
 
 	return c
 }
 
 var _ Cursor = (*RNGCursor)(nil)
+var _ io.ReadWriteSeeker = (*RNGCursor)(nil)
+var _ io.Closer = (*RNGCursor)(nil)
 
 func (c *RNGCursor) validateBounds(n int64) bool {
-	max := int64(c.img.Bounds().Max.X) * int64(c.img.Bounds().Max.Y) * int64(c.bitCount)
+	max := int64(c.img.Bounds().Max.X) * int64(c.img.Bounds().Max.Y) * int64(len(c.useChannels))
 
 	return n < max
 }
 
 func (c *RNGCursor) tell() (x, y int, cl BitColor) {
 
-	planeCursor := c.cursor / int64(c.bitCount)
-	colorCursor := c.cursor % int64(c.bitCount)
+	planeCursor := c.cursor / int64(len(c.useChannels))
+	colorCursor := c.cursor % int64(len(c.useChannels))
 
 	x = c.points[planeCursor].X
 	y = c.points[planeCursor].Y
 
-	cl = c.useBits[colorCursor]
+	cl = c.useChannels[colorCursor]
 
 	return
 }
@@ -120,7 +167,7 @@ func (c *RNGCursor) Seek(n int64, whence int) (int64, error) {
 		}
 		c.cursor += n
 	case io.SeekEnd:
-		max := int64(c.img.Bounds().Max.X) * int64(c.img.Bounds().Max.Y) * int64(c.bitCount)
+		max := int64(c.img.Bounds().Max.X) * int64(c.img.Bounds().Max.Y) * int64(len(c.useChannels))
 		if n > 0 || (n*-1) > max {
 			return c.cursor, fmt.Errorf("illegal argument")
 		}
@@ -161,6 +208,93 @@ func (c *RNGCursor) WriteBit(bit uint8) (uint, error) {
 	c.cursor++
 
 	return uint(c.cursor), nil
+}
+
+func (c *RNGCursor) Read(payload []byte) (n int, err error) {
+	buffer := make([]int, 0)
+	pixels := math.Ceil(float64(8 / (int(c.bitDepth) * len(c.useChannels))))
+
+	return 0, nil
+}
+
+func (c *RNGCursor) Write(payload []byte) (n int, err error) {
+	buffer := make([]int, 0)
+	responseChan := make(chan response)
+	for i, bite := range payload {
+		bits := byteToBits(bite)
+		buffer = append(buffer, bits...)
+
+		// at this point i would like to write a whole pixel worth of data.
+		// that way i can parellize the writes.
+		if len(buffer) < int(c.bitDepth)*len(c.useChannels) {
+			// no enough bits to write a pixel yet
+			continue
+		}
+
+		// keep only the bits that are part of the pixel
+		currPayload := buffer[:int(c.bitDepth)*len(c.useChannels)]
+		// remove the bits that were used
+		buffer = buffer[int(c.bitDepth)*len(c.useChannels):]
+
+		x, y, _ := c.tell()
+
+		// send the payload to the worker to write on a pixel
+		c.workerChan <- bitsPayload{
+			x:            x,
+			y:            y,
+			n:            i,
+			payload:      currPayload,
+			responseChan: responseChan,
+		}
+
+		c.cursor += int64(c.bitDepth) * int64(len(c.useChannels))
+	}
+
+	for res, ok := <-responseChan; ok; res, ok = <-responseChan {
+		if res.err != nil {
+			return res.seq, err
+		}
+		n += int(c.bitDepth) * len(c.useChannels)
+	}
+
+	return n % 8, nil
+}
+
+func (c *RNGCursor) writeBitDepthPayload(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case pp := <-c.workerChan:
+			channels := splitSlice(pp.payload, int(c.bitDepth))
+
+			r, g, b, a := c.img.At(pp.x, pp.y).RGBA()
+			for i, channel := range channels {
+				p := uint32(0)
+				for e, b := range channel {
+					p = p | uint32(b)<<e
+				}
+
+				switch c.useChannels[i] {
+				case R_Bit:
+					r = p
+				case G_Bit:
+					g = p
+				case B_Bit:
+					b = p
+				}
+			}
+
+			col := color.RGBA{uint8(r), uint8(g), uint8(b), uint8(a)}
+			c.img.Set(pp.x, pp.y, col)
+		}
+	}
+}
+
+func (c *RNGCursor) Close() error {
+	c.cancel()
+
+	return nil
 }
 
 func (c *RNGCursor) ReadBit() (uint8, error) {

@@ -146,3 +146,25 @@ func TestRNGCursor(t *testing.T) {
 	// 	assert.Equal(t, payload, readBack, "Should correctly handle reading/writing with 16-bit depth images")
 	// })
 }
+
+func TestRNGParelellWrites(t *testing.T) {
+	t.Run("1. Basic Read/Write Consistency", func(t *testing.T) {
+		img := image.NewRGBA(image.Rect(0, 0, 10, 10))
+		// Use R and G bits => 2 bits per pixel
+		cur := cursors.NewRNGCursor(img,
+			cursors.UseGreenBit(),
+			cursors.UseBlueBit(),
+			cursors.WithConcurrency(1),
+			cursors.WithBitDepth(2),
+		)
+
+		//defer cur.Close()
+
+		// Capacity = 100 pixels * 2 bits = 200 bits = 25 bytes max
+		payload := []byte("hello steganography")
+		require.LessOrEqual(t, len(payload), 25, "Payload fits in capacity")
+		n, err := cur.Write(payload)
+		assert.NoError(t, err)
+		assert.Equal(t, len(payload), n)
+	})
+}

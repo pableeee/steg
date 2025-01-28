@@ -4,6 +4,9 @@ type Cursor interface {
 	Seek(offset int64, whence int) (int64, error)
 	WriteBit(bit uint8) (uint, error)
 	ReadBit() (uint8, error)
+
+	Write(payload []byte) (n int, err error)
+	Read(payload []byte) (n int, err error)
 }
 
 type BitColor uint
