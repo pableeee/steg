@@ -20,7 +20,7 @@ func Encode(m draw.Image, pass []byte, r io.Reader) error {
 	}
 
 	// Derive a seed from the password
-	seedVal, err := deriveSeedFromPassword(pass)
+	seedVal, err := DeriveSeedFromPassword(pass)
 	if err != nil {
 		return err
 	}
@@ -50,7 +50,7 @@ func Encode(m draw.Image, pass []byte, r io.Reader) error {
 	// Note: For now, we use nonce=0 to maintain format compatibility
 	// TODO: Implement proper nonce storage in container format for full security
 	nonce := uint32(0) // Maintain old format for backward compatibility
-	
+
 	// Create cipher middleware with nonce (currently 0 for compatibility)
 	cm := cursors.CipherMiddleware(cur, cipher.NewCipher(nonce, pass))
 

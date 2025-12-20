@@ -4,8 +4,8 @@ import (
 	"crypto/md5"
 )
 
-// deriveSeedFromPassword takes a password and returns a reproducible int64 seed.
-func deriveSeedFromPassword(pass []byte) (int64, error) {
+// DeriveSeedFromPassword takes a password and returns a reproducible int64 seed.
+func DeriveSeedFromPassword(pass []byte) (int64, error) {
 	hashFn := md5.New()
 	if _, err := hashFn.Write(pass); err != nil {
 		return 0, err

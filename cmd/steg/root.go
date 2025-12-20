@@ -60,8 +60,27 @@ var (
 	}
 
 	capacityFlags = struct {
-		inputImage string
+		inputImage     string
 		bitsPerChannel int
+	}{}
+
+	testVisualCmd = &cobra.Command{
+		Use:   "test-visual",
+		Short: "Generates test images with different channel and bit configurations",
+		Long:  "Generates multiple test images with all combinations of channels (1-max_channels) and bits per channel (1-max_bits) for visual comparison.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runTestVisual()
+		},
+	}
+
+	testVisualFlags = struct {
+		inputImage  string
+		outputDir   string
+		maxChannels int
+		maxBits     int
+		seed        int64
+		key         string
+		dataSize    int64 // Size of random data to encode in bytes (0 = use 80% of capacity)
 	}{}
 )
 
@@ -96,9 +115,32 @@ func init() {
 		&capacityFlags.bitsPerChannel, "bits_per_channel", "b", 1, "Number of bits per channel to use (1-3, default: 1).",
 	)
 
+	testVisualCmd.Flags().StringVarP(
+		&testVisualFlags.inputImage, "input_image", "i", "", "Input image used as medium.",
+	)
+	testVisualCmd.Flags().StringVarP(
+		&testVisualFlags.outputDir, "output_dir", "o", "", "Output directory for test images.",
+	)
+	testVisualCmd.Flags().IntVarP(
+		&testVisualFlags.maxChannels, "max_channels", "c", 3, "Maximum number of channels to test (1-3, default: 3).",
+	)
+	testVisualCmd.Flags().IntVarP(
+		&testVisualFlags.maxBits, "max_bits", "b", 3, "Maximum bits per channel to test (1-3, default: 3).",
+	)
+	testVisualCmd.Flags().Int64VarP(
+		&testVisualFlags.seed, "seed", "s", 42, "Seed for pseudo-random data generation (default: 42).",
+	)
+	testVisualCmd.Flags().StringVarP(
+		&testVisualFlags.key, "password", "p", "YELLOW SUBMARINE", "Password for encryption.",
+	)
+	testVisualCmd.Flags().Int64VarP(
+		&testVisualFlags.dataSize, "data_size", "d", 0, "Size of random data to encode in bytes (0 = use 80%% of capacity, default: 0).",
+	)
+
 	rootCmd.AddCommand(encodeCmd)
 	rootCmd.AddCommand(decodeCmd)
 	rootCmd.AddCommand(capacityCmd)
+	rootCmd.AddCommand(testVisualCmd)
 }
 
 func toDrawImage(src image.Image) draw.Image {
@@ -130,7 +172,7 @@ func runEncode() error {
 	}
 
 	cimg := toDrawImage(src)
-	
+
 	// Open message file
 	fmsg, err := os.Open(encoderFlags.inputMessage)
 	if err != nil {
@@ -231,7 +273,7 @@ func runCapacity() error {
 	// Get capacity in bits
 	capacityBits := cur.Capacity()
 	capacityBytes := capacityBits / 8
-	
+
 	// Calculate usable capacity (accounting for container overhead)
 	// Format overhead: 4 bytes (length) + 16 bytes (MD5 checksum) = 20 bytes
 	containerOverhead := int64(20)
@@ -250,7 +292,7 @@ func runCapacity() error {
 	fmt.Printf("Total capacity: %d bits (%d bytes)\n", capacityBits, capacityBytes)
 	fmt.Printf("Container overhead: %d bytes (length + checksum)\n", containerOverhead)
 	fmt.Printf("Usable capacity: %d bytes\n", usableBytes)
-	
+
 	// Display in human-readable format
 	if usableBytes > 0 {
 		fmt.Printf("\n")

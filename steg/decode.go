@@ -11,7 +11,7 @@ import (
 
 func Decode(m draw.Image, pass []byte) ([]byte, error) {
 	// Derive a seed from the password
-	seedVal, err := deriveSeedFromPassword(pass)
+	seedVal, err := DeriveSeedFromPassword(pass)
 	if err != nil {
 		return nil, err
 	}
