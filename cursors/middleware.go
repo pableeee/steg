@@ -7,6 +7,14 @@ type cipherMiddleware struct {
 	next  Cursor
 }
 
+// GetUnderlyingCursor returns the underlying cursor, unwrapping cipherMiddleware if present
+func GetUnderlyingCursor(c Cursor) (Cursor, cipher.StreamCipherBlock) {
+	if cm, ok := c.(*cipherMiddleware); ok {
+		return cm.next, cm.block
+	}
+	return c, nil
+}
+
 var _ Cursor = (*cipherMiddleware)(nil)
 
 func CipherMiddleware(c Cursor, block cipher.StreamCipherBlock) Cursor {

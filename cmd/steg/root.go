@@ -141,6 +141,7 @@ func init() {
 	rootCmd.AddCommand(decodeCmd)
 	rootCmd.AddCommand(capacityCmd)
 	rootCmd.AddCommand(testVisualCmd)
+	// benchmarkCmd is added in benchmark.go init()
 }
 
 func toDrawImage(src image.Image) draw.Image {

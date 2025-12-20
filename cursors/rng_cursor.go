@@ -192,7 +192,7 @@ func (c *RNGCursor) WriteBit(bit uint8) (uint, error) {
 	x, y, colorBit, bitPos := c.tell()
 
 	r, g, b, a := c.img.At(x, y).RGBA()
-	
+
 	// Convert RGBA (16-bit values) to 8-bit values
 	r8 := uint8(r >> 8)
 	g8 := uint8(g >> 8)
@@ -241,7 +241,7 @@ func (c *RNGCursor) ReadBit() (uint8, error) {
 	}
 	x, y, colorBit, bitPos := c.tell()
 	r, g, b, _ := c.img.At(x, y).RGBA()
-	
+
 	var val uint32
 	switch colorBit {
 	case R_Bit:
@@ -256,11 +256,79 @@ func (c *RNGCursor) ReadBit() (uint8, error) {
 
 	// Extract the 8-bit value (RGBA returns 16-bit values)
 	val8Bit := uint8(val >> 8)
-	
+
 	// Extract the bit at the specific position
 	bit := (val8Bit >> bitPos) & 1
 
 	c.cursor++
 
 	return bit, nil
+}
+
+// PreComputeWritePlan generates all write operations for a given bit sequence
+// without actually modifying the image. This enables parallel pixel writing.
+func (c *RNGCursor) PreComputeWritePlan(bits []uint8) ([]WriteOperation, error) {
+	ops := make([]WriteOperation, 0, len(bits))
+	originalCursor := c.cursor
+
+	// Save cursor position
+	c.cursor = 0
+
+	for i, bit := range bits {
+		if !c.validateBounds(c.cursor) {
+			// Restore cursor position
+			c.cursor = originalCursor
+			return nil, fmt.Errorf("out of bounds at bit position %d: %w", i, io.EOF)
+		}
+
+		x, y, colorBit, bitPos := c.tell()
+
+		ops = append(ops, WriteOperation{
+			PixelX:         x,
+			PixelY:         y,
+			Channel:        colorBit,
+			BitPosition:    bitPos,
+			BitValue:       bit,
+			CursorPosition: c.cursor,
+		})
+
+		c.cursor++
+	}
+
+	// Restore cursor position
+	c.cursor = originalCursor
+
+	return ops, nil
+}
+
+// WritePixelsParallel writes bits to the image using parallel pixel processing
+func (c *RNGCursor) WritePixelsParallel(bits []uint8, config ParallelWriteConfig) error {
+	if !config.Enabled {
+		// Fallback to sequential writing
+		for _, bit := range bits {
+			if _, err := c.WriteBit(bit); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	// Pre-compute all write operations
+	ops, err := c.PreComputeWritePlan(bits)
+	if err != nil {
+		return fmt.Errorf("failed to pre-compute write plan: %w", err)
+	}
+
+	// Group operations by pixel
+	pixelMap := groupByPixel(ops)
+
+	// Convert map to slice for parallel processing
+	pixels := make([]*PixelWrite, 0, len(pixelMap))
+	for _, pixel := range pixelMap {
+		pixels = append(pixels, pixel)
+	}
+
+	// Create parallel writer and execute
+	writer := NewParallelWriter(config.WorkerCount)
+	return writer.WritePixels(c.img, pixels, c.bitsPerChannel)
 }
