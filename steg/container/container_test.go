@@ -23,7 +23,7 @@ func TestContainerRoundTrip(t *testing.T) {
 	// Reset seek to start of stream
 	buf.Seek(0, io.SeekStart)
 
-	readData, err := container.ReadPayload(buf, md5.New())
+	readData, err := container.ReadPayloadOldFormat(buf, md5.New())
 	require.NoError(t, err)
 	assert.Equal(t, payload, readData)
 }
@@ -36,7 +36,7 @@ func TestEmptyPayload(t *testing.T) {
 	require.NoError(t, err)
 
 	buf.Seek(0, io.SeekStart)
-	readData, err := container.ReadPayload(buf, md5.New())
+	readData, err := container.ReadPayloadOldFormat(buf, md5.New())
 	require.NoError(t, err)
 	assert.Empty(t, readData)
 }
@@ -55,7 +55,7 @@ func TestChecksumMismatch(t *testing.T) {
 	buf.Write([]byte{corruptedData})
 
 	buf.Seek(0, io.SeekStart)
-	_, err = container.ReadPayload(buf, md5.New())
+	_, err = container.ReadPayloadOldFormat(buf, md5.New())
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "checksum")
 }
@@ -72,7 +72,7 @@ func TestTruncatedData(t *testing.T) {
 	assert.NoError(t, err)
 
 	buf.Seek(0, io.SeekStart)
-	_, err = container.ReadPayload(buf, md5.New())
+	_, err = container.ReadPayloadOldFormat(buf, md5.New())
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to read")
 }
@@ -90,7 +90,7 @@ func TestExcessiveLength(t *testing.T) {
 	buf.Write([]byte{0xFF, 0xFF, 0xFF, 0x7F})
 
 	buf.Seek(0, io.SeekStart)
-	_, err = container.ReadPayload(buf, md5.New())
+	_, err = container.ReadPayloadOldFormat(buf, md5.New())
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to read payload")
 }

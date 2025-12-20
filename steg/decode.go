@@ -24,12 +24,12 @@ func Decode(m draw.Image, pass []byte) ([]byte, error) {
 		cursors.WithSeed(seedVal),
 	)
 
-	// Create cipher middleware
+	// Create cipher middleware (using nonce=0 for backward compatibility)
 	cm := cursors.CipherMiddleware(cur, cipher.NewCipher(0, pass))
 
 	// CursorAdapter transforms a Cursor into an io.ReadWriteSeeker
 	adapter := cursors.CursorAdapter(cm)
 
-	// Use container to read payload: length + payload + checksum verification
-	return container.ReadPayload(adapter, md5.New())
+	// Use container to read payload: length + payload + checksum verification (old format)
+	return container.ReadPayloadOldFormat(adapter, md5.New())
 }

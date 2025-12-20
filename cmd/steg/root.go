@@ -5,11 +5,10 @@ import (
 	"fmt"
 	"image"
 	"image/draw"
-	"image/png"
-	"log"
 	"os"
 
 	"github.com/pableeee/steg/steg"
+	"github.com/pableeee/steg/steg/imageio"
 	"github.com/spf13/cobra"
 )
 
@@ -87,65 +86,90 @@ func toDrawImage(src image.Image) draw.Image {
 }
 
 func runEncode() error {
+	// Open input image
 	f, err := os.Open(encoderFlags.inputImage)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to open input image: %w", err)
+	}
+	defer f.Close()
+
+	// Detect and decode image format
+	src, format, err := imageio.DecodeImage(encoderFlags.inputImage, bufio.NewReader(f))
+	if err != nil {
+		return fmt.Errorf("failed to decode image: %w", err)
 	}
 
-	src, err := png.Decode(bufio.NewReader(f))
-	if err != nil {
-		return err
+	// Warn about lossy formats
+	if imageio.IsLossyFormat(format) {
+		fmt.Fprintf(os.Stderr, "Warning: %s is a lossy format. Steganographic data may be corrupted.\n", format)
+		fmt.Fprintf(os.Stderr, "Consider using PNG format for better reliability.\n")
 	}
 
 	cimg := toDrawImage(src)
+	
+	// Open message file
 	fmsg, err := os.Open(encoderFlags.inputMessage)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to open message file: %w", err)
+	}
+	defer fmsg.Close()
+
+	// Encode the message
+	if err = steg.Encode(cimg, []byte(encoderFlags.key), bufio.NewReader(fmsg)); err != nil {
+		return fmt.Errorf("encoding failed: %w", err)
 	}
 
+	// Determine output format (use same as input, or detect from extension)
+	outputFormat, err := imageio.DetectImageFormat(encoderFlags.outputImage, nil)
+	if err != nil {
+		// Default to input format if we can't detect from extension
+		outputFormat = format
+	}
+
+	// Create output file
 	out, err := os.Create(encoderFlags.outputImage)
 	if err != nil {
 		return fmt.Errorf("unable to create output file: %w", err)
 	}
 	defer out.Close()
 
-	if err = steg.Encode(cimg, []byte(encoderFlags.key), bufio.NewReader(fmsg)); err != nil {
-		return err
-	}
-
-	err = png.Encode(out, cimg)
-	if err != nil {
-		log.Fatal(err)
+	// Encode the image
+	if err = imageio.EncodeImage(cimg, outputFormat, out); err != nil {
+		return fmt.Errorf("failed to encode output image: %w", err)
 	}
 
 	return nil
 }
 
 func runDecode() error {
+	// Open input image
 	f, err := os.Open(decoderFlags.inputFile)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to open input image: %w", err)
 	}
+	defer f.Close()
 
-	src, err := png.Decode(bufio.NewReader(f))
+	// Detect and decode image format
+	src, _, err := imageio.DecodeImage(decoderFlags.inputFile, bufio.NewReader(f))
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to decode image: %w", err)
 	}
 
+	// Decode the message
+	b, err := steg.Decode(toDrawImage(src), []byte(decoderFlags.key))
+	if err != nil {
+		return fmt.Errorf("decoding failed: %w", err)
+	}
+
+	// Write output file
 	out, err := os.Create(decoderFlags.outputFile)
 	if err != nil {
 		return fmt.Errorf("unable to create output file: %w", err)
 	}
 	defer out.Close()
 
-	b, err := steg.Decode(toDrawImage(src), []byte(decoderFlags.key))
-	if err != nil {
-		return err
-	}
-
-	_, err = out.Write(b)
-	if err != nil {
-		return err
+	if _, err = out.Write(b); err != nil {
+		return fmt.Errorf("failed to write output file: %w", err)
 	}
 
 	return nil
