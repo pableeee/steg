@@ -52,3 +52,7 @@ func (c *cipherMiddleware) ReadBit() (uint8, error) {
 
 	return b, err
 }
+
+func (c *cipherMiddleware) Capacity() int64 {
+	return c.next.Capacity()
+}

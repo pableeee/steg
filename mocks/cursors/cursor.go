@@ -156,3 +156,17 @@ func (mr *MockCursorMockRecorder) WriteBit(bit interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "WriteBit", reflect.TypeOf((*MockCursor)(nil).WriteBit), bit)
 }
+
+// Capacity mocks base method.
+func (m *MockCursor) Capacity() int64 {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "Capacity")
+	ret0, _ := ret[0].(int64)
+	return ret0
+}
+
+// Capacity indicates an expected call of Capacity.
+func (mr *MockCursorMockRecorder) Capacity() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Capacity", reflect.TypeOf((*MockCursor)(nil).Capacity))
+}
