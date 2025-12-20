@@ -7,6 +7,7 @@ import (
 	"image/draw"
 	"os"
 
+	"github.com/pableeee/steg/cursors"
 	"github.com/pableeee/steg/steg"
 	"github.com/pableeee/steg/steg/imageio"
 	"github.com/spf13/cobra"
@@ -48,6 +49,20 @@ var (
 		outputFile,
 		key string
 	}{}
+
+	capacityCmd = &cobra.Command{
+		Use:   "capacity",
+		Short: "Shows the encoding capacity of an image",
+		Long:  "Shows the encoding capacity of an image in bytes. This indicates how much data can be encoded into the image.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runCapacity()
+		},
+	}
+
+	capacityFlags = struct {
+		inputImage string
+		bitsPerChannel int
+	}{}
 )
 
 func init() {
@@ -73,8 +88,17 @@ func init() {
 	decodeCmd.Flags().StringVarP(
 		&decoderFlags.key, "password", "p", "YELLOW SUBMARINE", "passphrase to extract the contents.",
 	)
+
+	capacityCmd.Flags().StringVarP(
+		&capacityFlags.inputImage, "input_image", "i", "", "Input image to check capacity.",
+	)
+	capacityCmd.Flags().IntVarP(
+		&capacityFlags.bitsPerChannel, "bits_per_channel", "b", 1, "Number of bits per channel to use (1-3, default: 1).",
+	)
+
 	rootCmd.AddCommand(encodeCmd)
 	rootCmd.AddCommand(decodeCmd)
+	rootCmd.AddCommand(capacityCmd)
 }
 
 func toDrawImage(src image.Image) draw.Image {
@@ -170,6 +194,73 @@ func runDecode() error {
 
 	if _, err = out.Write(b); err != nil {
 		return fmt.Errorf("failed to write output file: %w", err)
+	}
+
+	return nil
+}
+
+func runCapacity() error {
+	// Open input image
+	f, err := os.Open(capacityFlags.inputImage)
+	if err != nil {
+		return fmt.Errorf("failed to open input image: %w", err)
+	}
+	defer f.Close()
+
+	// Detect and decode image format
+	src, format, err := imageio.DecodeImage(capacityFlags.inputImage, bufio.NewReader(f))
+	if err != nil {
+		return fmt.Errorf("failed to decode image: %w", err)
+	}
+
+	cimg := toDrawImage(src)
+
+	// Validate bits per channel
+	if capacityFlags.bitsPerChannel < 1 || capacityFlags.bitsPerChannel > 3 {
+		return fmt.Errorf("bits per channel must be between 1 and 3, got: %d", capacityFlags.bitsPerChannel)
+	}
+
+	// Create RNG cursor with same options as encoding (G and B channels)
+	cur := cursors.NewRNGCursor(
+		cimg,
+		cursors.UseGreenBit(),
+		cursors.UseBlueBit(),
+		cursors.WithBitsPerChannel(capacityFlags.bitsPerChannel),
+	)
+
+	// Get capacity in bits
+	capacityBits := cur.Capacity()
+	capacityBytes := capacityBits / 8
+	
+	// Calculate usable capacity (accounting for container overhead)
+	// Format overhead: 4 bytes (length) + 16 bytes (MD5 checksum) = 20 bytes
+	containerOverhead := int64(20)
+	usableBytes := capacityBytes - containerOverhead
+	if usableBytes < 0 {
+		usableBytes = 0
+	}
+
+	// Display results
+	fmt.Printf("Image: %s\n", capacityFlags.inputImage)
+	fmt.Printf("Format: %s\n", format)
+	fmt.Printf("Dimensions: %d x %d pixels\n", cimg.Bounds().Dx(), cimg.Bounds().Dy())
+	fmt.Printf("Channels used: Green, Blue (2 channels)\n")
+	fmt.Printf("Bits per channel: %d\n", capacityFlags.bitsPerChannel)
+	fmt.Printf("\n")
+	fmt.Printf("Total capacity: %d bits (%d bytes)\n", capacityBits, capacityBytes)
+	fmt.Printf("Container overhead: %d bytes (length + checksum)\n", containerOverhead)
+	fmt.Printf("Usable capacity: %d bytes\n", usableBytes)
+	
+	// Display in human-readable format
+	if usableBytes > 0 {
+		fmt.Printf("\n")
+		if usableBytes >= 1024*1024 {
+			fmt.Printf("  ≈ %.2f MB\n", float64(usableBytes)/(1024*1024))
+		} else if usableBytes >= 1024 {
+			fmt.Printf("  ≈ %.2f KB\n", float64(usableBytes)/1024)
+		}
+	} else {
+		fmt.Printf("\n⚠️  Image is too small to encode any data.\n")
 	}
 
 	return nil
