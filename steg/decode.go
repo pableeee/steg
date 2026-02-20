@@ -13,7 +13,7 @@ import (
 )
 
 func Decode(m draw.Image, pass []byte) ([]byte, error) {
-	seed, aesKey, err := deriveKeys(pass)
+	seed, encKey, macKey, err := deriveKeys(pass)
 	if err != nil {
 		return nil, err
 	}
@@ -33,7 +33,7 @@ func Decode(m draw.Image, pass []byte) ([]byte, error) {
 	}
 	nonce := binary.BigEndian.Uint32(nonceBuf)
 
-	c, err := cipher.NewCipher(nonce, aesKey)
+	c, err := cipher.NewCipher(nonce, encKey)
 	if err != nil {
 		return nil, err
 	}
@@ -44,6 +44,6 @@ func Decode(m draw.Image, pass []byte) ([]byte, error) {
 	}
 
 	adapter := cursors.CursorAdapter(cm)
-	mac := hmac.New(sha256.New, aesKey)
+	mac := hmac.New(sha256.New, macKey)
 	return container.ReadPayload(adapter, mac)
 }

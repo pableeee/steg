@@ -2,6 +2,7 @@ package steg
 
 import (
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"image/draw"
@@ -13,7 +14,7 @@ import (
 )
 
 func Encode(m draw.Image, pass []byte, r io.Reader) error {
-	seed, aesKey, err := deriveKeys(pass)
+	seed, encKey, macKey, err := deriveKeys(pass)
 	if err != nil {
 		return err
 	}
@@ -25,16 +26,22 @@ func Encode(m draw.Image, pass []byte, r io.Reader) error {
 		cursors.WithSeed(seed),
 	)
 
-	// Read 4 bytes from the carrier image pixel LSBs in plaintext.
-	// These become the per-image nonce. The cursor advances to bit 32.
-	rawAdapter := cursors.CursorAdapter(cur)
+	// Generate a cryptographically random nonce and write it as the first 4
+	// bytes (32 bits) of the pixel sequence in plaintext. Decode reads these
+	// same bits to reconstruct the nonce, so each encode with the same carrier
+	// and password produces a unique keystream.
 	nonceBuf := make([]byte, 4)
-	if _, err = io.ReadFull(rawAdapter, nonceBuf); err != nil {
+	if _, err = rand.Read(nonceBuf); err != nil {
 		return err
 	}
 	nonce := binary.BigEndian.Uint32(nonceBuf)
 
-	c, err := cipher.NewCipher(nonce, aesKey)
+	rawAdapter := cursors.CursorAdapter(cur)
+	if _, err = rawAdapter.Write(nonceBuf); err != nil {
+		return err
+	}
+
+	c, err := cipher.NewCipher(nonce, encKey)
 	if err != nil {
 		return err
 	}
@@ -46,6 +53,6 @@ func Encode(m draw.Image, pass []byte, r io.Reader) error {
 	}
 
 	adapter := cursors.CursorAdapter(cm)
-	mac := hmac.New(sha256.New, aesKey)
+	mac := hmac.New(sha256.New, macKey)
 	return container.WritePayload(adapter, r, mac)
 }
