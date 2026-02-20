@@ -1,22 +1,26 @@
 package steg
 
 import (
-	"crypto/md5"
+	"encoding/binary"
+	"fmt"
+
+	"golang.org/x/crypto/argon2"
 )
 
-// deriveSeedFromPassword takes a password and returns a reproducible int64 seed.
-func deriveSeedFromPassword(pass []byte) (int64, error) {
-	hashFn := md5.New()
-	if _, err := hashFn.Write(pass); err != nil {
-		return 0, err
-	}
-	seedBytes := hashFn.Sum(nil)
+// appSalt is a fixed domain separator. Argon2id's memory-hardness
+// provides key-stretching even with a fixed salt.
+var appSalt = []byte("github.com/pableeee/steg/v1")
 
-	var seedVal int64
-	// Use the first 8 bytes (or fewer, if shorter) of the hash to form a seed.
-	for i := 0; i < 8 && i < len(seedBytes); i++ {
-		seedVal = (seedVal << 8) | int64(seedBytes[i])
+// deriveKeys stretches pass using Argon2id and returns:
+//   - seed: int64 to initialize the RNG cursor
+//   - aesKey: 16-byte AES-128 key
+func deriveKeys(pass []byte) (seed int64, aesKey []byte, err error) {
+	if len(pass) == 0 {
+		return 0, nil, fmt.Errorf("password must not be empty")
 	}
-
-	return seedVal, nil
+	// OWASP 2023 interactive parameters: time=1, memory=64 MiB, threads=4
+	derived := argon2.IDKey(pass, appSalt, 1, 64*1024, 4, 24)
+	seed = int64(binary.BigEndian.Uint64(derived[0:8]))
+	aesKey = derived[8:24]
+	return seed, aesKey, nil
 }

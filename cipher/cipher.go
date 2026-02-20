@@ -1,44 +1,12 @@
 package cipher
 
 import (
-	"bytes"
 	"crypto/aes"
 	std_cipher "crypto/cipher"
 	"encoding/binary"
 	"fmt"
 	"io"
 )
-
-// thanks to: https://github.com/go-web/tokenizer/blob/master/pkcs7.go
-// pkcs7Pad pads the input byte slice to a multiple of the block size using PKCS#7 padding.
-//
-// It returns an error if the block size is invalid or the input byte slice is nil or empty.
-//
-// blocksize: Size of the blocks to pad to.
-// b: The byte slice to pad.
-//
-// Returns the padded byte slice or an error.
-func pkcs7Pad(b []byte, blocksize int) ([]byte, error) {
-	if blocksize <= 0 {
-		return nil, fmt.Errorf("invalid blocksize")
-	}
-
-	if len(b) == 0 {
-		return nil, fmt.Errorf("invalid byte array")
-	}
-
-	if len(b)%blocksize == 0 {
-		return b, nil
-	}
-
-	n := blocksize - (len(b) % blocksize)
-	pb := make([]byte, len(b)+n)
-
-	copy(pb, b)
-	copy(pb[len(b):], bytes.Repeat([]byte{byte(n)}, n))
-
-	return pb, nil
-}
 
 // StreamCipherBlock represents a block cipher in stream mode that supports
 // seeking and bitwise encryption and decryption.
@@ -81,16 +49,18 @@ func WithBlock(b std_cipher.Block) Option {
 	}
 }
 
-// NewCipher creates a new StreamCipherBlock with the given nonce and passphrase.
+// NewCipher creates a new StreamCipherBlock with the given nonce and key.
 //
 // nonce: A unique nonce for the cipher.
-// pass: The passphrase used to generate the AES key.
+// key: A 16-byte AES-128 key.
 //
-// Returns a StreamCipherBlock instance.
-func NewCipher(nonce uint32, pass []byte, options ...Option) *streamCipherImpl {
+// Returns a StreamCipherBlock instance and an error.
+func NewCipher(nonce uint32, key []byte, options ...Option) (*streamCipherImpl, error) {
 	opts := Options{blockSize: 16}
-	pass, _ = pkcs7Pad(pass, opts.blockSize)
-	cb, _ := aes.NewCipher(pass)
+	cb, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, fmt.Errorf("cipher.NewCipher: %w", err)
+	}
 	opts.block = cb
 
 	for _, opt := range options {
@@ -98,10 +68,8 @@ func NewCipher(nonce uint32, pass []byte, options ...Option) *streamCipherImpl {
 	}
 
 	s := &streamCipherImpl{nonce: nonce, blockSize: uint32(opts.blockSize), block: opts.block}
-
 	s.refreshCipherBlock()
-
-	return s
+	return s, nil
 }
 
 // refreshCipherBlock generates a new cipher block using the current nonce and counter values.

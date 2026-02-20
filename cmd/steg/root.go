@@ -62,8 +62,9 @@ func init() {
 		&encoderFlags.outputImage, "output_image", "o", "", "Image containing the coded message.",
 	)
 	encodeCmd.Flags().StringVarP(
-		&encoderFlags.key, "password", "p", "YELLOW SUBMARINE", "passphrase to cipher the contents.",
+		&encoderFlags.key, "password", "p", "", "passphrase to cipher the contents.",
 	)
+	encodeCmd.MarkFlagRequired("password")
 
 	decodeCmd.Flags().StringVarP(
 		&decoderFlags.inputFile, "input_image", "i", "", "Image containing the coded message.",
@@ -72,8 +73,9 @@ func init() {
 		&decoderFlags.outputFile, "output_file", "o", "", "Path for the output file containing the coded data.",
 	)
 	decodeCmd.Flags().StringVarP(
-		&decoderFlags.key, "password", "p", "YELLOW SUBMARINE", "passphrase to extract the contents.",
+		&decoderFlags.key, "password", "p", "", "passphrase to extract the contents.",
 	)
+	decodeCmd.MarkFlagRequired("password")
 	rootCmd.AddCommand(encodeCmd)
 	rootCmd.AddCommand(decodeCmd)
 }

@@ -1,8 +1,11 @@
 package steg
 
 import (
-	"crypto/md5"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/binary"
 	"image/draw"
+	"io"
 
 	"github.com/pableeee/steg/cipher"
 	"github.com/pableeee/steg/cursors"
@@ -10,26 +13,37 @@ import (
 )
 
 func Decode(m draw.Image, pass []byte) ([]byte, error) {
-	// Derive a seed from the password
-	seedVal, err := deriveSeedFromPassword(pass)
+	seed, aesKey, err := deriveKeys(pass)
 	if err != nil {
 		return nil, err
 	}
 
-	// Create RNG cursor
 	cur := cursors.NewRNGCursor(
 		m,
 		cursors.UseGreenBit(),
 		cursors.UseBlueBit(),
-		cursors.WithSeed(seedVal),
+		cursors.WithSeed(seed),
 	)
 
-	// Create cipher middleware
-	cm := cursors.CipherMiddleware(cur, cipher.NewCipher(0, pass))
+	// Read the same 4 nonce bytes from the same pixel positions used during encode.
+	rawAdapter := cursors.CursorAdapter(cur)
+	nonceBuf := make([]byte, 4)
+	if _, err = io.ReadFull(rawAdapter, nonceBuf); err != nil {
+		return nil, err
+	}
+	nonce := binary.BigEndian.Uint32(nonceBuf)
 
-	// CursorAdapter transforms a Cursor into an io.ReadWriteSeeker
+	c, err := cipher.NewCipher(nonce, aesKey)
+	if err != nil {
+		return nil, err
+	}
+
+	cm := cursors.CipherMiddleware(cur, c)
+	if _, err = cm.Seek(32, io.SeekStart); err != nil {
+		return nil, err
+	}
+
 	adapter := cursors.CursorAdapter(cm)
-
-	// Use container to read payload: length + payload + checksum verification
-	return container.ReadPayload(adapter, md5.New())
+	mac := hmac.New(sha256.New, aesKey)
+	return container.ReadPayload(adapter, mac)
 }
