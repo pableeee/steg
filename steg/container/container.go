@@ -8,8 +8,14 @@ import (
 )
 
 func WritePayload(w io.WriteSeeker, payload io.Reader, hashFn hash.Hash) error {
-	// Reserve space for length (4 bytes)
-	_, err := w.Seek(4, io.SeekStart)
+	// Capture current position. When called from encode, basePos=4 (after nonce).
+	// When called directly (container tests), basePos=0. Behavior identical in both cases.
+	basePos, err := w.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
+
+	_, err = w.Seek(basePos+4, io.SeekStart) // skip past length field
 	if err != nil {
 		return err
 	}
@@ -20,8 +26,7 @@ func WritePayload(w io.WriteSeeker, payload io.Reader, hashFn hash.Hash) error {
 		n, readErr := payload.Read(buf)
 		if n > 0 {
 			hashFn.Write(buf[:n])
-			_, writeErr := w.Write(buf[:n])
-			if writeErr != nil {
+			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
 				return writeErr
 			}
 			length += uint32(n)
@@ -34,16 +39,12 @@ func WritePayload(w io.WriteSeeker, payload io.Reader, hashFn hash.Hash) error {
 		}
 	}
 
-	// Write the hash
 	checksum := hashFn.Sum(nil)
-	_, err = w.Write(checksum)
-	if err != nil {
+	if _, err = w.Write(checksum); err != nil {
 		return err
 	}
 
-	// Go back and write the length
-	_, err = w.Seek(0, io.SeekStart)
-	if err != nil {
+	if _, err = w.Seek(basePos, io.SeekStart); err != nil { // seek back to write length
 		return err
 	}
 

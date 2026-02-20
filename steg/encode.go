@@ -1,7 +1,10 @@
 package steg
 
 import (
-	"crypto/md5"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
 	"image/draw"
 	"io"
 
@@ -11,26 +14,45 @@ import (
 )
 
 func Encode(m draw.Image, pass []byte, r io.Reader) error {
-	// Derive a seed from the password
-	seedVal, err := deriveSeedFromPassword(pass)
+	seed, encKey, macKey, err := deriveKeys(pass)
 	if err != nil {
 		return err
 	}
 
-	// Create RNG cursor with options
 	cur := cursors.NewRNGCursor(
 		m,
 		cursors.UseGreenBit(),
 		cursors.UseBlueBit(),
-		cursors.WithSeed(seedVal),
+		cursors.WithSeed(seed),
 	)
 
-	// Create cipher middleware
-	cm := cursors.CipherMiddleware(cur, cipher.NewCipher(0, pass))
+	// Generate a cryptographically random nonce and write it as the first 4
+	// bytes (32 bits) of the pixel sequence in plaintext. Decode reads these
+	// same bits to reconstruct the nonce, so each encode with the same carrier
+	// and password produces a unique keystream.
+	nonceBuf := make([]byte, 4)
+	if _, err = rand.Read(nonceBuf); err != nil {
+		return err
+	}
+	nonce := binary.BigEndian.Uint32(nonceBuf)
 
-	// CursorAdapter transforms a Cursor into an io.ReadWriteSeeker
+	rawAdapter := cursors.CursorAdapter(cur)
+	if _, err = rawAdapter.Write(nonceBuf); err != nil {
+		return err
+	}
+
+	c, err := cipher.NewCipher(nonce, encKey)
+	if err != nil {
+		return err
+	}
+
+	// Wrap the same cursor in cipher middleware and sync cipher counter to bit 32.
+	cm := cursors.CipherMiddleware(cur, c)
+	if _, err = cm.Seek(32, io.SeekStart); err != nil {
+		return err
+	}
+
 	adapter := cursors.CursorAdapter(cm)
-
-	// Use container to write payload: length + payload + checksum
-	return container.WritePayload(adapter, r, md5.New())
+	mac := hmac.New(sha256.New, macKey)
+	return container.WritePayload(adapter, r, mac)
 }

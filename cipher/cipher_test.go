@@ -1,7 +1,6 @@
 package cipher
 
 import (
-	"crypto/aes"
 	"io"
 	"testing"
 
@@ -32,7 +31,8 @@ func Test_StreamCipherPrimitive(t *testing.T) {
 	t.Run("underliying cipher block should change after block size number encriptions/decriptions", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		b := dummyBlock(ctrl)
-		c := NewCipher(0, pass, WithBlock(b))
+		c, err := NewCipher(0, pass, WithBlock(b))
+		require.NoError(t, err)
 
 		funcs := []func(uint8) (uint8, error){
 			c.DecryptBit,
@@ -63,9 +63,9 @@ func Test_StreamCipherPrimitive(t *testing.T) {
 	})
 	t.Run("seeking within a block, should not create a new cipher block", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
-		_, _ = aes.NewCipher(pass)
 		b := dummyBlock(ctrl)
-		c := NewCipher(0, pass, WithBlock(b))
+		c, err := NewCipher(0, pass, WithBlock(b))
+		require.NoError(t, err)
 
 		for i := 0; i < 2; i++ {
 			// seek at the begining of a block
@@ -91,9 +91,9 @@ func Test_StreamCipherPrimitive(t *testing.T) {
 
 	t.Run("visiting previuos blocks should generate equal blocks", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
-		_, _ = aes.NewCipher(pass)
 		b := dummyBlock(ctrl)
-		c := NewCipher(0, pass, WithBlock(b))
+		c, err := NewCipher(0, pass, WithBlock(b))
+		require.NoError(t, err)
 		times := 2
 		blocksSeen := make(map[int64][]byte)
 
