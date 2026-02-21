@@ -15,16 +15,6 @@ type readWriteSeekerAdapter struct {
 	cur Cursor
 }
 
-func byteToBits(b byte) []int {
-	var bits []int
-	for i := 7; i >= 0; i-- { // Extract bits from most significant to least significant
-		bit := (b >> i) & 1
-		bits = append(bits, int(bit))
-	}
-
-	return bits
-}
-
 func (r *readWriteSeekerAdapter) Seek(offset int64, whence int) (int64, error) {
 	// Seek sets the offset for the next Read or Write to offset,
 	// interpreted according to whence:
@@ -55,9 +45,8 @@ func (r *readWriteSeekerAdapter) Read(payload []byte) (n int, err error) {
 }
 func (r *readWriteSeekerAdapter) Write(payload []byte) (n int, err error) {
 	for i, bite := range payload {
-		bits := byteToBits(bite)
-		for _, b := range bits {
-			_, err = r.cur.WriteBit(uint8(b))
+		for j := 7; j >= 0; j-- {
+			_, err = r.cur.WriteBit((bite >> j) & 1)
 			if err != nil {
 				return i, err
 			}
