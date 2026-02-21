@@ -54,15 +54,8 @@ func EncodeParallel(m draw.Image, pass []byte, r io.Reader) error {
 	bounds := m.Bounds()
 	points := cursors.GenerateSequence(bounds.Max.X, bounds.Max.Y, seed)
 
-	// Detect bitCount by constructing a temp cursor with the same options.
-	tempCur := cursors.NewRNGCursor(m,
-		cursors.UseGreenBit(),
-		cursors.UseBlueBit(),
-		cursors.WithSharedPoints(points),
-	)
-	bitCount := int(tempCur.BitCount())
-
 	// Minimum chunk alignment: lcm(8 bits/byte, bitCount bits/pixel) / 8 bytes.
+	const bitCount = 3 // R_Bit | G_Bit | B_Bit
 	alignment := lcmBytes(8, bitCount)
 	chunkSize := alignment * 1024
 
@@ -211,13 +204,7 @@ func DecodeParallel(m draw.Image, pass []byte) ([]byte, error) {
 	totalRemaining := payloadLen + 32
 	decryptedBuf := make([]byte, totalRemaining)
 
-	// Detect alignment for chunk splitting.
-	tempCur := cursors.NewRNGCursor(m,
-		cursors.UseGreenBit(),
-		cursors.UseBlueBit(),
-		cursors.WithSharedPoints(points),
-	)
-	bitCount := int(tempCur.BitCount())
+	const bitCount = 3 // R_Bit | G_Bit | B_Bit
 	alignment := lcmBytes(8, bitCount)
 	chunkSize := int64(alignment * 1024)
 
