@@ -14,6 +14,8 @@ type StreamCipherBlock interface {
 	Seek(offset int64, whence int) (int64, error)
 	EncryptBit(bit uint8) (uint8, error)
 	DecryptBit(bit uint8) (uint8, error)
+	EncryptByte(b uint8) (uint8, error)
+	DecryptByte(b uint8) (uint8, error)
 }
 
 var _ StreamCipherBlock = (*streamCipherImpl)(nil)
@@ -131,6 +133,24 @@ func (s *streamCipherImpl) EncryptBit(bichi uint8) (uint8, error) {
 // Returns the decrypted bit and an error if any.
 func (s *streamCipherImpl) DecryptBit(bichi uint8) (uint8, error) {
 	return s.processBit(bichi)
+}
+
+// EncryptByte encrypts all 8 bits of b in one call, MSB first.
+func (s *streamCipherImpl) EncryptByte(b uint8) (uint8, error) {
+	var out uint8
+	for i := 7; i >= 0; i-- {
+		enc, err := s.processBit((b >> i) & 1)
+		if err != nil {
+			return 0, err
+		}
+		out |= enc << i
+	}
+	return out, nil
+}
+
+// DecryptByte decrypts all 8 bits of b in one call. CTR mode: identical to EncryptByte.
+func (s *streamCipherImpl) DecryptByte(b uint8) (uint8, error) {
+	return s.EncryptByte(b)
 }
 
 // processBit processes a single bit for encryption or decryption.

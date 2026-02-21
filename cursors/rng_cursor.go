@@ -43,6 +43,21 @@ type RNGCursor struct {
 	useBits  []BitColor
 	points   []image.Point
 	rng      *rand.Rand
+	maxBits  int64 // pre-computed capacity in bits
+
+	// pixel cache — amortises img.At() and img.Set() across the bits of one pixel.
+	// Write-back: img.Set() is deferred until the cursor leaves the current pixel
+	// (via loadPixel or Flush), so each pixel costs one At + one Set regardless
+	// of how many of its bits are modified.
+	pixelCached bool
+	dirty       bool
+	cacheIdx    int64
+	cacheX      int
+	cacheY      int
+	cacheR      uint32
+	cacheG      uint32
+	cacheB      uint32
+	cacheA      uint32
 }
 
 type Option func(*RNGCursor)
@@ -84,7 +99,7 @@ func NewRNGCursor(img draw.Image, options ...Option) *RNGCursor {
 			c.useBits = append(c.useBits, color)
 		}
 	}
-
+	c.maxBits = int64(img.Bounds().Max.X) * int64(img.Bounds().Max.Y) * int64(c.bitCount)
 	return c
 }
 
@@ -93,33 +108,36 @@ func (c *RNGCursor) BitCount() uint { return c.bitCount }
 var _ Cursor = (*RNGCursor)(nil)
 
 func (c *RNGCursor) validateBounds(n int64) bool {
-	max := int64(c.img.Bounds().Max.X) * int64(c.img.Bounds().Max.Y) * int64(c.bitCount)
-
-	return n < max
+	return n < c.maxBits
 }
 
-func (c *RNGCursor) tell() (x, y int, cl BitColor) {
+// Flush writes the cached pixel to the image if it has been modified.
+// Must be called after the final WriteByte before the cursor is abandoned.
+func (c *RNGCursor) Flush() {
+	if c.dirty {
+		c.img.Set(c.cacheX, c.cacheY, color.RGBA{uint8(c.cacheR), uint8(c.cacheG), uint8(c.cacheB), uint8(c.cacheA)})
+		c.dirty = false
+	}
+}
 
-	planeCursor := c.cursor / int64(c.bitCount)
-	colorCursor := c.cursor % int64(c.bitCount)
-
-	x = c.points[planeCursor].X
-	y = c.points[planeCursor].Y
-
-	cl = c.useBits[colorCursor]
-
-	return
+// loadPixel flushes the current dirty pixel (if any) then loads pixelIdx into cache.
+func (c *RNGCursor) loadPixel(pixelIdx int64) {
+	c.Flush()
+	pt := c.points[pixelIdx]
+	r, g, b, a := c.img.At(pt.X, pt.Y).RGBA()
+	c.cacheIdx = pixelIdx
+	c.cacheX, c.cacheY = pt.X, pt.Y
+	c.cacheR, c.cacheG, c.cacheB, c.cacheA = r, g, b, a
+	c.pixelCached = true
 }
 
 func (c *RNGCursor) Seek(n int64, whence int) (int64, error) {
-	// Seek sets the offset for the next Read or Write to offset,
-	// interpreted according to whence:
-	// [SeekStart] means relative to the start of the file,
-	// [SeekCurrent] means relative to the current offset, and
-	// [SeekEnd] means relative to the end
 	if !c.validateBounds(n) {
 		return c.cursor, fmt.Errorf("out of bounds: %w", io.EOF)
 	}
+
+	c.Flush()
+	c.pixelCached = false
 
 	switch whence {
 	case io.SeekStart:
@@ -133,68 +151,95 @@ func (c *RNGCursor) Seek(n int64, whence int) (int64, error) {
 		}
 		c.cursor += n
 	case io.SeekEnd:
-		max := int64(c.img.Bounds().Max.X) * int64(c.img.Bounds().Max.Y) * int64(c.bitCount)
-		if n > 0 || (n*-1) > max {
+		if n > 0 || (n*-1) > c.maxBits {
 			return c.cursor, fmt.Errorf("illegal argument")
 		}
-
-		c.cursor = max + n
+		c.cursor = c.maxBits + n
 	}
 
 	return c.cursor, nil
 }
 
-func (c *RNGCursor) WriteBit(bit uint8) (uint, error) {
-	if !c.validateBounds(c.cursor) {
-		return uint(c.cursor), fmt.Errorf("out of bounds: %w", io.EOF)
-	}
+// ReadByte reads 8 bits MSB-first from the cursor.
+// pixelIdx and channelIdx are maintained by increment rather than division,
+// and img.At() is called at most once per pixel (cache miss only).
+func (c *RNGCursor) ReadByte() (uint8, error) {
+	pixelIdx := c.cursor / int64(c.bitCount)
+	channelIdx := int(c.cursor % int64(c.bitCount))
+	var out uint8
 
-	fn := func(r *uint32) {
-		if bit == 1 {
-			*r = *r | justLast
-		} else {
-			*r = *r & offLast
+	for i := 7; i >= 0; i-- {
+		if c.cursor >= c.maxBits {
+			return 0, fmt.Errorf("out of bounds: %w", io.EOF)
+		}
+		if !c.pixelCached || pixelIdx != c.cacheIdx {
+			c.loadPixel(pixelIdx)
+		}
+		var val uint32
+		switch c.useBits[channelIdx] {
+		case R_Bit:
+			val = c.cacheR
+		case G_Bit:
+			val = c.cacheG
+		case B_Bit:
+			val = c.cacheB
+		}
+		out |= uint8(val&1) << i
+		c.cursor++
+		channelIdx++
+		if channelIdx >= int(c.bitCount) {
+			channelIdx = 0
+			pixelIdx++
 		}
 	}
-
-	x, y, colorBit := c.tell()
-
-	r, g, b, a := c.img.At(x, y).RGBA()
-	switch colorBit {
-	case R_Bit:
-		fn(&r)
-	case G_Bit:
-		fn(&g)
-	case B_Bit:
-		fn(&b)
-	}
-
-	c.img.Set(x, y, color.RGBA{uint8(r), uint8(g), uint8(b), uint8(a)})
-
-	c.cursor++
-
-	return uint(c.cursor), nil
+	return out, nil
 }
 
-func (c *RNGCursor) ReadBit() (uint8, error) {
-	if !c.validateBounds(c.cursor) {
-		return 0, fmt.Errorf("out of bounds")
+// WriteByte writes 8 bits MSB-first to the cursor.
+// Uses write-back caching: img.Set() is deferred until the cursor moves to the
+// next pixel or Flush() is called — one Set per pixel regardless of bit count.
+func (c *RNGCursor) WriteByte(b uint8) error {
+	pixelIdx := c.cursor / int64(c.bitCount)
+	channelIdx := int(c.cursor % int64(c.bitCount))
+
+	for i := 7; i >= 0; i-- {
+		if c.cursor >= c.maxBits {
+			return fmt.Errorf("out of bounds: %w", io.EOF)
+		}
+		if !c.pixelCached || pixelIdx != c.cacheIdx {
+			c.loadPixel(pixelIdx) // flushes previous dirty pixel
+		}
+		bit := (b >> i) & 1
+		switch c.useBits[channelIdx] {
+		case R_Bit:
+			if bit == 1 {
+				c.cacheR |= justLast
+			} else {
+				c.cacheR &= offLast
+			}
+		case G_Bit:
+			if bit == 1 {
+				c.cacheG |= justLast
+			} else {
+				c.cacheG &= offLast
+			}
+		case B_Bit:
+			if bit == 1 {
+				c.cacheB |= justLast
+			} else {
+				c.cacheB &= offLast
+			}
+		}
+		c.dirty = true
+		c.cursor++
+		channelIdx++
+		if channelIdx >= int(c.bitCount) {
+			channelIdx = 0
+			pixelIdx++
+		}
 	}
-	x, y, colorBit := c.tell()
-	r, g, b, _ := c.img.At(x, y).RGBA()
-	c.cursor++
-	val := r
-
-	switch colorBit {
-	case R_Bit:
-		val = r
-	case G_Bit:
-		val = g
-	case B_Bit:
-		val = b
-	}
-
-	bit := val & justLast
-
-	return uint8(bit), nil
+	// Flush the last modified pixel so that any reader that follows immediately
+	// (without an intervening seek) sees the correct image data.
+	c.Flush()
+	return nil
 }

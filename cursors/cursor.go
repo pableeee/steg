@@ -2,8 +2,8 @@ package cursors
 
 type Cursor interface {
 	Seek(offset int64, whence int) (int64, error)
-	WriteBit(bit uint8) (uint, error)
-	ReadBit() (uint8, error)
+	ReadByte() (uint8, error)
+	WriteByte(uint8) error
 }
 
 type BitColor uint

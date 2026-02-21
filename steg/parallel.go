@@ -74,6 +74,9 @@ func EncodeParallel(m draw.Image, pass []byte, r io.Reader) error {
 	if _, err = rawAdapter.Write(nonceBuf); err != nil {
 		return err
 	}
+	// Flush write-back cache: the nonce write may have left a partially-modified
+	// pixel in rawCur that hasn't been committed to the image yet.
+	rawCur.Flush()
 
 	numWorkers := runtime.GOMAXPROCS(0)
 	jobChan := make(chan encJob, numWorkers*2)
@@ -98,6 +101,11 @@ func EncodeParallel(m draw.Image, pass []byte, r io.Reader) error {
 					errChan <- werr2
 					return
 				}
+			}
+			// Flush write-back cache: last job may have left a dirty pixel.
+			// Seek(0) flushes via RNGCursor.Seek without disturbing other workers.
+			if _, ferr := adapter.Seek(0, io.SeekStart); ferr != nil {
+				errChan <- ferr
 			}
 		}()
 	}
@@ -158,7 +166,11 @@ func EncodeParallel(m draw.Image, pass []byte, r io.Reader) error {
 		return err
 	}
 	tag := hashFn.Sum(nil)
-	_, err = seqAdapter.Write(tag)
+	if _, err = seqAdapter.Write(tag); err != nil {
+		return err
+	}
+	// Flush write-back cache on seqAdapter via a no-op seek.
+	_, err = seqAdapter.Seek(0, io.SeekStart)
 	return err
 }
 

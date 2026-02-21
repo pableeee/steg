@@ -54,5 +54,11 @@ func Encode(m draw.Image, pass []byte, r io.Reader) error {
 
 	adapter := cursors.CursorAdapter(cm)
 	mac := hmac.New(sha256.New, macKey)
-	return container.WritePayload(adapter, r, mac)
+	if err = container.WritePayload(adapter, r, mac); err != nil {
+		return err
+	}
+	// Flush the write-back pixel cache: the last pixel modified by WritePayload
+	// may not have been committed to the image yet.
+	cur.Flush()
+	return nil
 }

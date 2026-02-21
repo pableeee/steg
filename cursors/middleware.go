@@ -30,25 +30,18 @@ func (c *cipherMiddleware) Seek(n int64, whence int) (int64, error) {
 	return n, nil
 }
 
-func (c *cipherMiddleware) WriteBit(bit uint8) (uint, error) {
-	b, err := c.block.EncryptBit(bit)
+func (c *cipherMiddleware) WriteByte(b uint8) error {
+	encrypted, err := c.block.EncryptByte(b)
 	if err != nil {
-		return 0, err
+		return err
 	}
-
-	return c.next.WriteBit(b)
+	return c.next.WriteByte(encrypted)
 }
-func (c *cipherMiddleware) ReadBit() (uint8, error) {
 
-	b, err := c.next.ReadBit()
+func (c *cipherMiddleware) ReadByte() (uint8, error) {
+	b, err := c.next.ReadByte()
 	if err != nil {
 		return 0, err
 	}
-
-	b, err = c.block.DecryptBit(b)
-	if err != nil {
-		return 0, err
-	}
-
-	return b, err
+	return c.block.DecryptByte(b)
 }

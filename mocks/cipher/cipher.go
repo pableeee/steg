@@ -48,6 +48,21 @@ func (mr *MockStreamCipherBlockMockRecorder) DecryptBit(bit interface{}) *gomock
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DecryptBit", reflect.TypeOf((*MockStreamCipherBlock)(nil).DecryptBit), bit)
 }
 
+// DecryptByte mocks base method.
+func (m *MockStreamCipherBlock) DecryptByte(b uint8) (uint8, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "DecryptByte", b)
+	ret0, _ := ret[0].(uint8)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// DecryptByte indicates an expected call of DecryptByte.
+func (mr *MockStreamCipherBlockMockRecorder) DecryptByte(b interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DecryptByte", reflect.TypeOf((*MockStreamCipherBlock)(nil).DecryptByte), b)
+}
+
 // EncryptBit mocks base method.
 func (m *MockStreamCipherBlock) EncryptBit(bit uint8) (uint8, error) {
 	m.ctrl.T.Helper()
@@ -61,6 +76,21 @@ func (m *MockStreamCipherBlock) EncryptBit(bit uint8) (uint8, error) {
 func (mr *MockStreamCipherBlockMockRecorder) EncryptBit(bit interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "EncryptBit", reflect.TypeOf((*MockStreamCipherBlock)(nil).EncryptBit), bit)
+}
+
+// EncryptByte mocks base method.
+func (m *MockStreamCipherBlock) EncryptByte(b uint8) (uint8, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "EncryptByte", b)
+	ret0, _ := ret[0].(uint8)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// EncryptByte indicates an expected call of EncryptByte.
+func (mr *MockStreamCipherBlockMockRecorder) EncryptByte(b interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "EncryptByte", reflect.TypeOf((*MockStreamCipherBlock)(nil).EncryptByte), b)
 }
 
 // Seek mocks base method.
