@@ -33,13 +33,13 @@ jobs:
       - name: Compute release tag
         id: tag
         run: |
-          echo "tag=master-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "tag=v$(date -u +%Y%m%d)-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Create or update release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
-          name: master ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
           body: |
             Automated release from commit ${{ github.sha }}
 
