@@ -20,7 +20,7 @@ make mocks
 
 ## Architecture
 
-**Steg** is a Go steganography tool that hides encrypted data in PNG images by modifying the least-significant bits (LSB) of the green and blue color channels in a pseudorandom pixel sequence.
+**Steg** is a Go steganography tool that hides encrypted data in PNG images by modifying the least-significant bits (LSB) of the R, G, and B color channels in a pseudorandom pixel sequence.
 
 ### Core pipeline (encode direction)
 
@@ -57,4 +57,6 @@ Decoding reverses the pipeline: reads the 4-byte nonce plaintext, reconstructs t
 
 ### Capacity and channels
 
-Each pixel contributes 2 bits (green + blue LSB). Red channel exists on the `Cursor` interface but is not used by default. Image capacity = `width × height × 2` bits.
+`NewRNGCursor` defaults to `R_Bit`. The encode/decode functions add G and B via `UseGreenBit()` and `UseBlueBit()` options, giving **3 bits per pixel** (R, G, B — 1 LSB each). Image capacity = `width × height × 3` bits.
+
+Chunk alignment for parallel operation: `lcm(8 bits/byte, 3 bits/pixel) / 8 = 3 bytes = 8 pixels` per aligned chunk boundary.

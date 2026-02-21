@@ -12,6 +12,11 @@ import (
 const offLast = 0xfffe
 const justLast = 0x0001
 
+func GenerateSequence(width, height int, seed int64) []image.Point {
+	rng := rand.New(rand.NewSource(seed))
+	return generateSequence(width, height, rng)
+}
+
 func generateSequence(width, height int, rng *rand.Rand) []image.Point {
 	totalPixels := width * height
 	positions := make([]image.Point, totalPixels)
@@ -60,13 +65,19 @@ func WithSeed(seed int64) Option {
 	}
 }
 
+func WithSharedPoints(points []image.Point) Option {
+	return func(c *RNGCursor) { c.points = points }
+}
+
 func NewRNGCursor(img draw.Image, options ...Option) *RNGCursor {
 	c := &RNGCursor{img: img, bitMask: R_Bit, rng: rand.New(rand.NewSource(0))}
 	for _, opt := range options {
 		opt(c)
 	}
 
-	c.points = generateSequence(img.Bounds().Max.X, img.Bounds().Max.Y, c.rng)
+	if c.points == nil {
+		c.points = generateSequence(img.Bounds().Max.X, img.Bounds().Max.Y, c.rng)
+	}
 	for _, color := range Colors {
 		if c.bitMask&color == color {
 			c.bitCount++
@@ -76,6 +87,8 @@ func NewRNGCursor(img draw.Image, options ...Option) *RNGCursor {
 
 	return c
 }
+
+func (c *RNGCursor) BitCount() uint { return c.bitCount }
 
 var _ Cursor = (*RNGCursor)(nil)
 

@@ -11,6 +11,16 @@ import (
 // provides key-stretching even with a fixed salt.
 var appSalt = []byte("github.com/pableeee/steg/v1")
 
+func gcd(a, b int) int {
+	for b != 0 {
+		a, b = b, a%b
+	}
+	return a
+}
+
+func lcm(a, b int) int         { return a / gcd(a, b) * b }
+func lcmBytes(bpb, bc int) int { return lcm(bpb, bc) / bpb }
+
 // deriveKeys stretches pass using Argon2id and returns:
 //   - seed: int64 to initialize the RNG cursor
 //   - encKey: 16-byte AES-128 encryption key

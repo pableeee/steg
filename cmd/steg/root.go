@@ -13,6 +13,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var parallel bool
+
 var (
 	rootCmd = &cobra.Command{
 		Use:   "steg",
@@ -64,6 +66,7 @@ func init() {
 	encodeCmd.Flags().StringVarP(
 		&encoderFlags.key, "password", "p", "", "passphrase to cipher the contents.",
 	)
+	encodeCmd.Flags().BoolVarP(&parallel, "parallel", "P", false, "use parallel encode")
 	encodeCmd.MarkFlagRequired("password")
 
 	decodeCmd.Flags().StringVarP(
@@ -75,6 +78,7 @@ func init() {
 	decodeCmd.Flags().StringVarP(
 		&decoderFlags.key, "password", "p", "", "passphrase to extract the contents.",
 	)
+	decodeCmd.Flags().BoolVarP(&parallel, "parallel", "P", false, "use parallel decode")
 	decodeCmd.MarkFlagRequired("password")
 	rootCmd.AddCommand(encodeCmd)
 	rootCmd.AddCommand(decodeCmd)
@@ -111,7 +115,12 @@ func runEncode() error {
 	}
 	defer out.Close()
 
-	if err = steg.Encode(cimg, []byte(encoderFlags.key), bufio.NewReader(fmsg)); err != nil {
+	if parallel {
+		err = steg.EncodeParallel(cimg, []byte(encoderFlags.key), bufio.NewReader(fmsg))
+	} else {
+		err = steg.Encode(cimg, []byte(encoderFlags.key), bufio.NewReader(fmsg))
+	}
+	if err != nil {
 		return err
 	}
 
@@ -140,7 +149,12 @@ func runDecode() error {
 	}
 	defer out.Close()
 
-	b, err := steg.Decode(toDrawImage(src), []byte(decoderFlags.key))
+	var b []byte
+	if parallel {
+		b, err = steg.DecodeParallel(toDrawImage(src), []byte(decoderFlags.key))
+	} else {
+		b, err = steg.Decode(toDrawImage(src), []byte(decoderFlags.key))
+	}
 	if err != nil {
 		return err
 	}
