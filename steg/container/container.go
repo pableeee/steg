@@ -1,6 +1,7 @@
 package container
 
 import (
+	"crypto/hmac"
 	"encoding/binary"
 	"fmt"
 	"hash"
@@ -75,21 +76,9 @@ func ReadPayload(r io.ReadWriteSeeker, hashFn hash.Hash) ([]byte, error) {
 		return nil, fmt.Errorf("failed to read checksum: %w", err)
 	}
 
-	if !bytesEqual(checksum, hashFn.Sum(nil)) {
+	if !hmac.Equal(checksum, hashFn.Sum(nil)) {
 		return nil, fmt.Errorf("checksum validation failed")
 	}
 
 	return payload, nil
-}
-
-func bytesEqual(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
