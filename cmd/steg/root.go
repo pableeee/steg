@@ -7,7 +7,6 @@ import (
 	"image"
 	"image/draw"
 	"image/png"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -202,6 +201,7 @@ func runEncode() error {
 	if err != nil {
 		return err
 	}
+	defer fmsg.Close()
 
 	if parallel {
 		err = steg.EncodeParallel(cimg, []byte(encoderFlags.key), bufio.NewReader(fmsg), bitsPerChannel, channels)
@@ -212,11 +212,7 @@ func runEncode() error {
 		return err
 	}
 
-	if err = encodeImage(encoderFlags.outputImage, cimg); err != nil {
-		log.Fatal(err)
-	}
-
-	return nil
+	return encodeImage(encoderFlags.outputImage, cimg)
 }
 
 func runDecode() error {
