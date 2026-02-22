@@ -1,5 +1,10 @@
 # Parallel Writing Performance Analysis
 
+> **OBSOLETE — historical notes only.**
+> This document analyses a pre-rewrite parallel implementation that used `PreComputeWritePlan()`, string-based pixel map keys, and per-pixel goroutines. That implementation was scrapped and replaced with the seekable per-worker cipher stack described in `docs/adr-001-parallel-encode-decode.md` and implemented in `steg/parallel.go`. The current implementation achieves ~2.5× speedup on 4K images; the findings below no longer apply.
+
+---
+
 ## Problem Statement
 
 Benchmark results show that parallel writing is **8-15x slower** than sequential writing across all image sizes. This document analyzes why and identifies the root causes.

@@ -26,9 +26,9 @@
 
 ## 1. Overview
 
-Steg hides an arbitrary file inside a PNG image by modifying the least-significant bit (LSB) of selected color channels of a pseudorandom subset of pixels. The data is encrypted and authenticated before being written, so an observer who recovers the bits cannot read the payload without the password, and any tampering is detected at decode time.
+Steg hides an arbitrary file inside a lossless image by modifying the least-significant bit (LSB) of selected color channels of a pseudorandom subset of pixels. The data is encrypted and authenticated before being written, so an observer who recovers the bits cannot read the payload without the password, and any tampering is detected at decode time.
 
-The tool operates entirely on the local filesystem. Input and output are both PNG files. The carrier image is modified in-place in memory and re-encoded as a lossless PNG, so no visual quality is lost and no pixel value changes by more than 1 in the modified channels.
+The tool operates entirely on the local filesystem. Input and output are PNG, BMP, or TIFF files. The carrier image is modified in-place in memory and re-encoded in lossless format, so no visual quality is lost and no pixel value changes by more than 1 in the modified channels.
 
 ---
 

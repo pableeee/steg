@@ -40,23 +40,10 @@ Small images are dominated by Argon2id (~10 ms fixed cost). Speedup grows with p
 
 ## Outstanding items (prioritised)
 
-### 1. Security — `bytesEqual` timing oracle in sequential decode (easy fix)
+### 1. ~~Security — `bytesEqual` timing oracle in sequential decode~~ ✅ DONE
 
-**File:** `steg/container/container.go:78`
-
-`container.ReadPayload` uses a hand-rolled `bytesEqual` that short-circuits on the
-first mismatched byte — leaks timing info about the HMAC tag.
-`DecodeParallel` already uses `hmac.Equal` (constant-time). The sequential path needs
-the same treatment.
-
-```go
-// Fix: replace
-if !bytesEqual(checksum, hashFn.Sum(nil)) {
-// with
-if !hmac.Equal(checksum, hashFn.Sum(nil)) {
-```
-
-Add `"crypto/hmac"` to imports; delete `bytesEqual`.
+`container.ReadPayload` now uses `hmac.Equal` (constant-time) for tag comparison.
+`bytesEqual` has been deleted.
 
 ---
 

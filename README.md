@@ -33,7 +33,7 @@
 - **`capacity` command** — prints a table of usable byte capacity for every (channels × bits-per-channel) combination for a given image.
 - **`test-visual` command** — generates carrier images filled to capacity at every encoding intensity for side-by-side visual comparison.
 - **Multiple image formats** — PNG, BMP, and TIFF are supported as both input and output.
-- **Parallel mode** — a worker-pool implementation (`-P`) scales encode/decode across all available CPUs, giving up to 3.5× speedup on large images.
+- **Parallel mode** — a worker-pool implementation (`-P`) scales encode/decode across all available CPUs, giving up to ~2.5× speedup on large images.
 - **Interoperable modes** — images encoded with the sequential path can be decoded with the parallel path and vice versa.
 
 ---

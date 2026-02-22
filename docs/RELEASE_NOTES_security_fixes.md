@@ -227,4 +227,4 @@ func (r *readWriteSeekerAdapter) Seek(offset int64, whence int) (int64, error) {
 
 - **Fixed application salt:** A per-image random salt stored in plaintext on the carrier would be marginally stronger against targeted precomputation. This was not implemented to avoid a bootstrapping problem (the salt must be readable before cipher initialisation, similar to the nonce).
 - **MAC-then-Encrypt:** The HMAC tag is computed over the plaintext and then written through the cipher. Encrypt-then-MAC would be more conventional but requires a more significant restructuring of the container format.
-- **`bytesEqual` vs `hmac.Equal`:** The tag comparison in `container.go` uses a simple byte loop rather than `hmac.Equal` (constant-time). Given the tag is inside an encrypted channel this is not directly exploitable, but should be addressed in a follow-up.
+- **`bytesEqual` vs `hmac.Equal`:** *(Fixed in follow-up.)* The tag comparison in `container.go` now uses `hmac.Equal` (constant-time); the hand-rolled `bytesEqual` has been deleted.
