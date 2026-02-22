@@ -13,7 +13,7 @@ import (
 	"github.com/pableeee/steg/steg/container"
 )
 
-func Encode(m draw.Image, pass []byte, r io.Reader) error {
+func Encode(m draw.Image, pass []byte, r io.Reader, bitsPerChannel int) error {
 	seed, encKey, macKey, err := deriveKeys(pass)
 	if err != nil {
 		return err
@@ -24,6 +24,7 @@ func Encode(m draw.Image, pass []byte, r io.Reader) error {
 		cursors.UseGreenBit(),
 		cursors.UseBlueBit(),
 		cursors.WithSeed(seed),
+		cursors.WithBitsPerChannel(bitsPerChannel),
 	)
 
 	// Generate a cryptographically random nonce and write it as the first 4

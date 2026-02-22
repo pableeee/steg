@@ -9,9 +9,6 @@ import (
 	"math/rand"
 )
 
-const offLast = 0xfffe
-const justLast = 0x0001
-
 func GenerateSequence(width, height int, seed int64) []image.Point {
 	rng := rand.New(rand.NewSource(seed))
 	return generateSequence(width, height, rng)
@@ -36,14 +33,15 @@ func generateSequence(width, height int, rng *rand.Rand) []image.Point {
 }
 
 type RNGCursor struct {
-	img      draw.Image
-	cursor   int64
-	bitMask  BitColor
-	bitCount uint
-	useBits  []BitColor
-	points   []image.Point
-	rng      *rand.Rand
-	maxBits  int64 // pre-computed capacity in bits
+	img             draw.Image
+	cursor          int64
+	bitMask         BitColor
+	bitCount        uint
+	bitsPerChannel  int
+	useBits         []BitColor
+	points          []image.Point
+	rng             *rand.Rand
+	maxBits         int64 // pre-computed capacity in bits
 
 	// pixel cache — amortises img.At() and img.Set() across the bits of one pixel.
 	// Write-back: img.Set() is deferred until the cursor leaves the current pixel
@@ -84,8 +82,12 @@ func WithSharedPoints(points []image.Point) Option {
 	return func(c *RNGCursor) { c.points = points }
 }
 
+func WithBitsPerChannel(n int) Option {
+	return func(c *RNGCursor) { c.bitsPerChannel = n }
+}
+
 func NewRNGCursor(img draw.Image, options ...Option) *RNGCursor {
-	c := &RNGCursor{img: img, bitMask: R_Bit, rng: rand.New(rand.NewSource(0))}
+	c := &RNGCursor{img: img, bitMask: R_Bit, bitsPerChannel: 1, rng: rand.New(rand.NewSource(0))}
 	for _, opt := range options {
 		opt(c)
 	}
@@ -99,7 +101,7 @@ func NewRNGCursor(img draw.Image, options ...Option) *RNGCursor {
 			c.useBits = append(c.useBits, color)
 		}
 	}
-	c.maxBits = int64(img.Bounds().Max.X) * int64(img.Bounds().Max.Y) * int64(c.bitCount)
+	c.maxBits = int64(img.Bounds().Max.X) * int64(img.Bounds().Max.Y) * int64(c.bitCount) * int64(c.bitsPerChannel)
 	return c
 }
 
@@ -161,11 +163,13 @@ func (c *RNGCursor) Seek(n int64, whence int) (int64, error) {
 }
 
 // ReadByte reads 8 bits MSB-first from the cursor.
-// pixelIdx and channelIdx are maintained by increment rather than division,
-// and img.At() is called at most once per pixel (cache miss only).
+// Slot arithmetic accounts for bitsPerChannel: each pixel holds
+// bitCount*bitsPerChannel bit slots, ordered by channel then by bit
+// position within the channel (MSB-first within each channel's N bits).
 func (c *RNGCursor) ReadByte() (uint8, error) {
-	pixelIdx := c.cursor / int64(c.bitCount)
-	channelIdx := int(c.cursor % int64(c.bitCount))
+	bitsPerPixel := int64(c.bitCount) * int64(c.bitsPerChannel)
+	pixelIdx := c.cursor / bitsPerPixel
+	slotInPixel := int(c.cursor % bitsPerPixel)
 	var out uint8
 
 	for i := 7; i >= 0; i-- {
@@ -175,6 +179,8 @@ func (c *RNGCursor) ReadByte() (uint8, error) {
 		if !c.pixelCached || pixelIdx != c.cacheIdx {
 			c.loadPixel(pixelIdx)
 		}
+		channelIdx := slotInPixel / c.bitsPerChannel
+		bitInChannel := (c.bitsPerChannel - 1) - (slotInPixel % c.bitsPerChannel)
 		var val uint32
 		switch c.useBits[channelIdx] {
 		case R_Bit:
@@ -184,11 +190,11 @@ func (c *RNGCursor) ReadByte() (uint8, error) {
 		case B_Bit:
 			val = c.cacheB
 		}
-		out |= uint8(val&1) << i
+		out |= uint8((val>>bitInChannel)&1) << i
 		c.cursor++
-		channelIdx++
-		if channelIdx >= int(c.bitCount) {
-			channelIdx = 0
+		slotInPixel++
+		if slotInPixel >= int(bitsPerPixel) {
+			slotInPixel = 0
 			pixelIdx++
 		}
 	}
@@ -198,9 +204,13 @@ func (c *RNGCursor) ReadByte() (uint8, error) {
 // WriteByte writes 8 bits MSB-first to the cursor.
 // Uses write-back caching: img.Set() is deferred until the cursor moves to the
 // next pixel or Flush() is called — one Set per pixel regardless of bit count.
+// Slot arithmetic accounts for bitsPerChannel: each pixel holds
+// bitCount*bitsPerChannel bit slots, ordered by channel then by bit
+// position within the channel (MSB-first within each channel's N bits).
 func (c *RNGCursor) WriteByte(b uint8) error {
-	pixelIdx := c.cursor / int64(c.bitCount)
-	channelIdx := int(c.cursor % int64(c.bitCount))
+	bitsPerPixel := int64(c.bitCount) * int64(c.bitsPerChannel)
+	pixelIdx := c.cursor / bitsPerPixel
+	slotInPixel := int(c.cursor % bitsPerPixel)
 
 	for i := 7; i >= 0; i-- {
 		if c.cursor >= c.maxBits {
@@ -209,32 +219,35 @@ func (c *RNGCursor) WriteByte(b uint8) error {
 		if !c.pixelCached || pixelIdx != c.cacheIdx {
 			c.loadPixel(pixelIdx) // flushes previous dirty pixel
 		}
+		channelIdx := slotInPixel / c.bitsPerChannel
+		bitInChannel := (c.bitsPerChannel - 1) - (slotInPixel % c.bitsPerChannel)
 		bit := (b >> i) & 1
+		mask := uint32(1) << bitInChannel
 		switch c.useBits[channelIdx] {
 		case R_Bit:
 			if bit == 1 {
-				c.cacheR |= justLast
+				c.cacheR |= mask
 			} else {
-				c.cacheR &= offLast
+				c.cacheR &^= mask
 			}
 		case G_Bit:
 			if bit == 1 {
-				c.cacheG |= justLast
+				c.cacheG |= mask
 			} else {
-				c.cacheG &= offLast
+				c.cacheG &^= mask
 			}
 		case B_Bit:
 			if bit == 1 {
-				c.cacheB |= justLast
+				c.cacheB |= mask
 			} else {
-				c.cacheB &= offLast
+				c.cacheB &^= mask
 			}
 		}
 		c.dirty = true
 		c.cursor++
-		channelIdx++
-		if channelIdx >= int(c.bitCount) {
-			channelIdx = 0
+		slotInPixel++
+		if slotInPixel >= int(bitsPerPixel) {
+			slotInPixel = 0
 			pixelIdx++
 		}
 	}

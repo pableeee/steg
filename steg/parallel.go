@@ -29,11 +29,12 @@ type decJob struct {
 // newWorkerStack creates a per-worker cipher+cursor stack seeked to the correct
 // byte offset. Each worker has its own independent cipher and cursor state.
 func newWorkerStack(m draw.Image, nonce uint32, encKey []byte,
-	points []image.Point) (io.ReadWriteSeeker, error) {
+	points []image.Point, bitsPerChannel int) (io.ReadWriteSeeker, error) {
 	cur := cursors.NewRNGCursor(m,
 		cursors.UseGreenBit(),
 		cursors.UseBlueBit(),
 		cursors.WithSharedPoints(points),
+		cursors.WithBitsPerChannel(bitsPerChannel),
 	)
 	c, err := cipher.NewCipher(nonce, encKey)
 	if err != nil {
@@ -45,7 +46,7 @@ func newWorkerStack(m draw.Image, nonce uint32, encKey []byte,
 // EncodeParallel encodes r into m using a parallel worker pool.
 // The on-image layout is identical to Encode, so DecodeParallel and Decode
 // can both decode images written by EncodeParallel (and vice-versa).
-func EncodeParallel(m draw.Image, pass []byte, r io.Reader) error {
+func EncodeParallel(m draw.Image, pass []byte, r io.Reader, bitsPerChannel int) error {
 	seed, encKey, macKey, err := deriveKeys(pass)
 	if err != nil {
 		return err
@@ -54,9 +55,8 @@ func EncodeParallel(m draw.Image, pass []byte, r io.Reader) error {
 	bounds := m.Bounds()
 	points := cursors.GenerateSequence(bounds.Max.X, bounds.Max.Y, seed)
 
-	// Minimum chunk alignment: lcm(8 bits/byte, bitCount bits/pixel) / 8 bytes.
-	const bitCount = 3 // R_Bit | G_Bit | B_Bit
-	alignment := lcmBytes(8, bitCount)
+	// Minimum chunk alignment: lcm(8 bits/byte, bitCount*bitsPerChannel bits/pixel) / 8 bytes.
+	alignment := lcmBytes(8, 3*bitsPerChannel)
 	chunkSize := alignment * 1024
 
 	// Write 4-byte nonce plaintext via raw (unencrypted) cursor.
@@ -64,6 +64,7 @@ func EncodeParallel(m draw.Image, pass []byte, r io.Reader) error {
 		cursors.UseGreenBit(),
 		cursors.UseBlueBit(),
 		cursors.WithSharedPoints(points),
+		cursors.WithBitsPerChannel(bitsPerChannel),
 	)
 	nonceBuf := make([]byte, 4)
 	if _, err = rand.Read(nonceBuf); err != nil {
@@ -87,7 +88,7 @@ func EncodeParallel(m draw.Image, pass []byte, r io.Reader) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			adapter, werr := newWorkerStack(m, nonce, encKey, points)
+			adapter, werr := newWorkerStack(m, nonce, encKey, points, bitsPerChannel)
 			if werr != nil {
 				errChan <- werr
 				return
@@ -146,7 +147,7 @@ func EncodeParallel(m draw.Image, pass []byte, r io.Reader) error {
 	}
 
 	// Post-parallel sequential writes: length field (byte 4) and HMAC tag.
-	seqAdapter, err := newWorkerStack(m, nonce, encKey, points)
+	seqAdapter, err := newWorkerStack(m, nonce, encKey, points, bitsPerChannel)
 	if err != nil {
 		return err
 	}
@@ -176,7 +177,7 @@ func EncodeParallel(m draw.Image, pass []byte, r io.Reader) error {
 
 // DecodeParallel decodes a message from m using a parallel worker pool.
 // Images encoded by Encode (sequential) are fully compatible.
-func DecodeParallel(m draw.Image, pass []byte) ([]byte, error) {
+func DecodeParallel(m draw.Image, pass []byte, bitsPerChannel int) ([]byte, error) {
 	seed, encKey, macKey, err := deriveKeys(pass)
 	if err != nil {
 		return nil, err
@@ -190,6 +191,7 @@ func DecodeParallel(m draw.Image, pass []byte) ([]byte, error) {
 		cursors.UseGreenBit(),
 		cursors.UseBlueBit(),
 		cursors.WithSharedPoints(points),
+		cursors.WithBitsPerChannel(bitsPerChannel),
 	)
 	rawAdapter := cursors.CursorAdapter(rawCur)
 	nonceBuf := make([]byte, 4)
@@ -199,7 +201,7 @@ func DecodeParallel(m draw.Image, pass []byte) ([]byte, error) {
 	nonce := binary.BigEndian.Uint32(nonceBuf)
 
 	// Read encrypted 4-byte length sequentially (cipher at byte offset 4).
-	seqAdapter, err := newWorkerStack(m, nonce, encKey, points)
+	seqAdapter, err := newWorkerStack(m, nonce, encKey, points, bitsPerChannel)
 	if err != nil {
 		return nil, err
 	}
@@ -216,8 +218,7 @@ func DecodeParallel(m draw.Image, pass []byte) ([]byte, error) {
 	totalRemaining := payloadLen + 32
 	decryptedBuf := make([]byte, totalRemaining)
 
-	const bitCount = 3 // R_Bit | G_Bit | B_Bit
-	alignment := lcmBytes(8, bitCount)
+	alignment := lcmBytes(8, 3*bitsPerChannel)
 	chunkSize := int64(alignment * 1024)
 
 	numWorkers := runtime.GOMAXPROCS(0)
@@ -229,7 +230,7 @@ func DecodeParallel(m draw.Image, pass []byte) ([]byte, error) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			adapter, werr := newWorkerStack(m, nonce, encKey, points)
+			adapter, werr := newWorkerStack(m, nonce, encKey, points, bitsPerChannel)
 			if werr != nil {
 				errChan <- werr
 				return

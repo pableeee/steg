@@ -14,6 +14,7 @@ import (
 )
 
 var parallel bool
+var bitsPerChannel int
 
 var (
 	rootCmd = &cobra.Command{
@@ -67,6 +68,7 @@ func init() {
 		&encoderFlags.key, "password", "p", "", "passphrase to cipher the contents.",
 	)
 	encodeCmd.Flags().BoolVarP(&parallel, "parallel", "P", false, "use parallel encode")
+	encodeCmd.Flags().IntVarP(&bitsPerChannel, "bits-per-channel", "b", 1, "number of LSBs to use per color channel (1-8)")
 	encodeCmd.MarkFlagRequired("password")
 
 	decodeCmd.Flags().StringVarP(
@@ -79,6 +81,7 @@ func init() {
 		&decoderFlags.key, "password", "p", "", "passphrase to extract the contents.",
 	)
 	decodeCmd.Flags().BoolVarP(&parallel, "parallel", "P", false, "use parallel decode")
+	decodeCmd.Flags().IntVarP(&bitsPerChannel, "bits-per-channel", "b", 1, "number of LSBs to use per color channel (1-8)")
 	decodeCmd.MarkFlagRequired("password")
 	rootCmd.AddCommand(encodeCmd)
 	rootCmd.AddCommand(decodeCmd)
@@ -93,6 +96,10 @@ func toDrawImage(src image.Image) draw.Image {
 }
 
 func runEncode() error {
+	if bitsPerChannel < 1 || bitsPerChannel > 8 {
+		return fmt.Errorf("--bits-per-channel must be between 1 and 8, got %d", bitsPerChannel)
+	}
+
 	f, err := os.Open(encoderFlags.inputImage)
 	if err != nil {
 		return err
@@ -116,9 +123,9 @@ func runEncode() error {
 	defer out.Close()
 
 	if parallel {
-		err = steg.EncodeParallel(cimg, []byte(encoderFlags.key), bufio.NewReader(fmsg))
+		err = steg.EncodeParallel(cimg, []byte(encoderFlags.key), bufio.NewReader(fmsg), bitsPerChannel)
 	} else {
-		err = steg.Encode(cimg, []byte(encoderFlags.key), bufio.NewReader(fmsg))
+		err = steg.Encode(cimg, []byte(encoderFlags.key), bufio.NewReader(fmsg), bitsPerChannel)
 	}
 	if err != nil {
 		return err
@@ -133,6 +140,10 @@ func runEncode() error {
 }
 
 func runDecode() error {
+	if bitsPerChannel < 1 || bitsPerChannel > 8 {
+		return fmt.Errorf("--bits-per-channel must be between 1 and 8, got %d", bitsPerChannel)
+	}
+
 	f, err := os.Open(decoderFlags.inputFile)
 	if err != nil {
 		return err
@@ -151,9 +162,9 @@ func runDecode() error {
 
 	var b []byte
 	if parallel {
-		b, err = steg.DecodeParallel(toDrawImage(src), []byte(decoderFlags.key))
+		b, err = steg.DecodeParallel(toDrawImage(src), []byte(decoderFlags.key), bitsPerChannel)
 	} else {
-		b, err = steg.Decode(toDrawImage(src), []byte(decoderFlags.key))
+		b, err = steg.Decode(toDrawImage(src), []byte(decoderFlags.key), bitsPerChannel)
 	}
 	if err != nil {
 		return err

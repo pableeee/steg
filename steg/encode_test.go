@@ -18,11 +18,11 @@ func TestEncodeRoundTrip(t *testing.T) {
 	m := image.NewRGBA(image.Rect(0, 0, 100, 50))
 
 	// Encode the payload
-	err := steg.Encode(m, pass, bytes.NewReader(payload))
+	err := steg.Encode(m, pass, bytes.NewReader(payload), 1)
 	require.NoError(t, err)
 
 	// Decode the payload
-	readData, err := steg.Decode(m, pass)
+	readData, err := steg.Decode(m, pass, 1)
 	require.NoError(t, err)
 	assert.Equal(t, payload, readData)
 }
@@ -35,6 +35,6 @@ func TestEncodeWithSmallImage(t *testing.T) {
 	m := image.NewRGBA(image.Rect(0, 0, 1, 1))
 
 	// Encoding should fail due to insufficient space
-	err := steg.Encode(m, pass, bytes.NewReader(payload))
+	err := steg.Encode(m, pass, bytes.NewReader(payload), 1)
 	assert.Error(t, err)
 }

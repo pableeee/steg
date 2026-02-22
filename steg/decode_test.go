@@ -15,10 +15,10 @@ func TestDecodeRoundTrip(t *testing.T) {
 	payload := []byte("another secret")
 
 	m := image.NewRGBA(image.Rect(0, 0, 100, 50))
-	err := steg.Encode(m, pass, bytes.NewReader(payload))
+	err := steg.Encode(m, pass, bytes.NewReader(payload), 1)
 	require.NoError(t, err)
 
-	readData, err := steg.Decode(m, pass)
+	readData, err := steg.Decode(m, pass, 1)
 	require.NoError(t, err)
 	assert.Equal(t, payload, readData)
 }
@@ -28,11 +28,11 @@ func TestDecodeWrongPassword(t *testing.T) {
 	payload := []byte("hidden message")
 
 	m := image.NewRGBA(image.Rect(0, 0, 100, 50))
-	err := steg.Encode(m, pass, bytes.NewReader(payload))
+	err := steg.Encode(m, pass, bytes.NewReader(payload), 1)
 	require.NoError(t, err)
 
 	// Try decoding with a wrong password
-	_, err = steg.Decode(m, []byte("wrong-pass"))
+	_, err = steg.Decode(m, []byte("wrong-pass"), 1)
 	assert.Error(t, err)
 }
 

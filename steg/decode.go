@@ -12,7 +12,7 @@ import (
 	"github.com/pableeee/steg/steg/container"
 )
 
-func Decode(m draw.Image, pass []byte) ([]byte, error) {
+func Decode(m draw.Image, pass []byte, bitsPerChannel int) ([]byte, error) {
 	seed, encKey, macKey, err := deriveKeys(pass)
 	if err != nil {
 		return nil, err
@@ -23,6 +23,7 @@ func Decode(m draw.Image, pass []byte) ([]byte, error) {
 		cursors.UseGreenBit(),
 		cursors.UseBlueBit(),
 		cursors.WithSeed(seed),
+		cursors.WithBitsPerChannel(bitsPerChannel),
 	)
 
 	// Read the same 4 nonce bytes from the same pixel positions used during encode.
