@@ -271,9 +271,9 @@ The cipher is seeked to bit offset 32 before encryption begins, keeping keystrea
 └──────┬────────────────────────────┬─────────────┘
        │ seed                       │ encKey, macKey
 ┌──────▼────────────┐   ┌───────────▼─────────────┐
-│  RNGCursor        │   │  cipher.NewCipher        │
-│  pixel traversal  │   │  AES-128-CTR, seekable   │
-│  pixel cache      │   │  bit/byte-level XOR      │
+│  RNGCursor        │   │  cipher.NewCipher       │
+│  pixel traversal  │   │  AES-128-CTR, seekable  │
+│  pixel cache      │   │  bit/byte-level XOR     │
 └──────┬────────────┘   └───────────┬─────────────┘
        │ Cursor                     │ StreamCipherBlock
 ┌──────▼────────────────────────────▼─────────────┐
