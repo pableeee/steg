@@ -51,12 +51,14 @@ Decoding reverses the pipeline: reads the 4-byte nonce plaintext, reconstructs t
   - `adapter.go`: Converts the bit-level `Cursor` interface into `io.ReadWriteSeeker` (bytes, MSB-first).
   - `middleware.go`: Decorator that transparently encrypts/decrypts bits passing through the cursor.
 - **`cipher/`** — AES-128 counter-mode stream cipher operating at the bit level; supports `Seek()` for random access within the keystream. Accepts a pre-derived 16-byte `encKey` and a 4-byte nonce; returns an error if key setup fails.
-- **`cmd/steg/`** — Cobra CLI with `encode` and `decode` subcommands; handles PNG I/O.
+- **`cmd/steg/`** — Cobra CLI with `encode`, `decode`, `capacity`, and `test-visual` subcommands; handles PNG, BMP, and TIFF I/O.
 - **`mocks/`** — Generated mocks for `cipher.StreamCipherBlock` and `cursors.Cursor` interfaces.
 - **`testutil/`** — `MemReadWriteSeeker`: in-memory `io.ReadWriteSeeker` used in tests.
 
 ### Capacity and channels
 
-`NewRNGCursor` defaults to `R_Bit`. The encode/decode functions add G and B via `UseGreenBit()` and `UseBlueBit()` options, giving **3 bits per pixel** (R, G, B — 1 LSB each). Image capacity = `width × height × 3` bits.
+`NewRNGCursor` defaults to `R_Bit`. The `channels` parameter controls which channels are active: 1 = R only, 2 = R+G (adds `UseGreenBit()`), 3 = R+G+B (adds `UseBlueBit()`). The `bitsPerChannel` parameter (1–8) controls how many LSBs per channel are used. Image capacity in bits = `width × height × channels × bitsPerChannel`.
 
-Chunk alignment for parallel operation: `lcm(8 bits/byte, 3 bits/pixel) / 8 = 3 bytes = 8 pixels` per aligned chunk boundary.
+The `cursorOptions(seed, bitsPerChannel, channels)` helper in `steg/steg.go` builds the option slice used by `Encode`, `Decode`, `EncodeParallel`, and `DecodeParallel`.
+
+Chunk alignment for parallel operation: `lcm(8 bits/byte, channels × bitsPerChannel bits/pixel) / 8` bytes per aligned chunk boundary. With defaults (3 channels, 1 bit/ch) this is 3 bytes = 8 pixels; values change with different settings.

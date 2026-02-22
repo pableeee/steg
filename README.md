@@ -1,6 +1,6 @@
 # steg
 
-**steg** is a command-line steganography tool written in Go. It hides an arbitrary file inside a PNG image by modifying the least-significant bit of the R, G, and B channels of a pseudorandom pixel sequence. The hidden data is encrypted and authenticated, so the carrier image looks identical to the original while the payload is unreadable and tamper-evident without the correct password.
+**steg** is a command-line steganography tool written in Go. It hides an arbitrary file inside a PNG, BMP, or TIFF image by modifying the least-significant bits of selected color channels in a pseudorandom pixel sequence. The number of bits per channel (1–8) and the number of channels (R / R+G / R+G+B) are configurable, trading capacity for visual detectability. The hidden data is encrypted and authenticated, so the carrier image looks near-identical to the original while the payload is unreadable and tamper-evident without the correct password.
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/pableeee/steg.svg)](https://pkg.go.dev/github.com/pableeee/steg)
 [![CI](https://github.com/pableeee/steg/actions/workflows/release.yml/badge.svg)](https://github.com/pableeee/steg/actions/workflows/release.yml)
@@ -29,7 +29,10 @@
 - **Strong key derivation** — Argon2id (OWASP 2023 interactive profile: time=1, mem=64 MiB, threads=4) derives independent encryption and MAC keys from the password in a single call.
 - **Random nonce per encode** — `crypto/rand` generates a fresh 4-byte nonce on every encode, so encoding the same payload into the same image twice produces two different outputs.
 - **Password-keyed pixel traversal** — pixels are visited in a Fisher-Yates-shuffled order derived from the password; an observer without the password cannot locate which pixels carry data.
-- **3 bits per pixel** — R, G, and B channels are each modified by at most ±1; no pixel changes by more than 1 in any channel.
+- **Configurable capacity vs. detectability** — `--bits-per-channel` (1–8 LSBs per channel) and `--channels` (1=R, 2=R+G, 3=R+G+B) let you trade off payload capacity against visual impact. At 1 bit/channel no pixel changes by more than ±1.
+- **`capacity` command** — prints a table of usable byte capacity for every (channels × bits-per-channel) combination for a given image.
+- **`test-visual` command** — generates carrier images filled to capacity at every encoding intensity for side-by-side visual comparison.
+- **Multiple image formats** — PNG, BMP, and TIFF are supported as both input and output.
 - **Parallel mode** — a worker-pool implementation (`-P`) scales encode/decode across all available CPUs, giving up to 3.5× speedup on large images.
 - **Interoperable modes** — images encoded with the sequential path can be decoded with the parallel path and vice versa.
 
@@ -78,59 +81,105 @@ make build        # produces cmd/steg/steg
 
 ### Encode
 
-Hide a file inside a PNG image:
+Hide a file inside a carrier image:
 
 ```bash
 steg encode -i carrier.png -f secret.txt -o output.png -p "my passphrase"
 ```
 
-| Flag | Short | Description |
-|---|---|---|
-| `--input_image` | `-i` | Carrier (input) PNG image |
-| `--input_file` | `-f` | File to hide |
-| `--output_image` | `-o` | Output PNG containing the hidden data |
-| `--password` | `-p` | Passphrase (**required**) |
-| `--parallel` | `-P` | Use parallel worker pool (faster on large images) |
+| Flag | Short | Default | Description |
+|---|---|---|---|
+| `--input_image` | `-i` | — | Carrier image (PNG, BMP, or TIFF) |
+| `--input_file` | `-f` | — | File to hide |
+| `--output_image` | `-o` | — | Output image containing the hidden data |
+| `--password` | `-p` | — | Passphrase (**required**) |
+| `--bits-per-channel` | `-b` | `1` | Number of LSBs to use per color channel (1–8) |
+| `--channels` | `-c` | `3` | Color channels to use: 1=R, 2=R+G, 3=R+G+B |
+| `--parallel` | `-P` | off | Use parallel worker pool (faster on large images) |
 
 ### Decode
 
-Recover a hidden file from a PNG image:
+Recover a hidden file from a carrier image:
 
 ```bash
 steg decode -i output.png -o recovered.txt -p "my passphrase"
 ```
 
-| Flag | Short | Description |
-|---|---|---|
-| `--input_image` | `-i` | PNG image containing the hidden data |
-| `--output_file` | `-o` | Path for the recovered file |
-| `--password` | `-p` | Passphrase (**required**) |
-| `--parallel` | `-P` | Use parallel worker pool (faster on large images) |
+| Flag | Short | Default | Description |
+|---|---|---|---|
+| `--input_image` | `-i` | — | Image containing the hidden data |
+| `--output_file` | `-o` | — | Path for the recovered file |
+| `--password` | `-p` | — | Passphrase (**required**) |
+| `--bits-per-channel` | `-b` | `1` | Must match the value used during encode |
+| `--channels` | `-c` | `3` | Must match the value used during encode |
+| `--parallel` | `-P` | off | Use parallel worker pool (faster on large images) |
+
+### Capacity
+
+Show usable byte capacity for every (channels × bits-per-channel) combination:
+
+```bash
+steg capacity -i carrier.png
+```
+
+```
+carrier.png — 1920 × 1080 px
+
+                        1 bits/ch      2 bits/ch      4 bits/ch      8 bits/ch
+  1 channel  (R)       253.11 KB     506.23 KB       1.01 MB       2.01 MB
+  2 channels (R+G)     506.23 KB       1.01 MB       2.01 MB       4.01 MB
+  3 channels (R+G+B)   759.34 KB       1.49 MB       3.02 MB       6.03 MB
+
+Overhead: 40 B (4 nonce + 4 length + 32 HMAC).
+```
+
+### Test Visual
+
+Generate carrier images filled to capacity at every intensity for side-by-side comparison:
+
+```bash
+steg test-visual -i carrier.png -o ./visual/ -p "mypass"
+```
+
+Writes up to 12 PNGs (`visual_ch{1-3}_b{1,2,4,8}.png`) into the output directory.
 
 ### Example
 
 ```bash
-# Hide a document
+# Hide a document with default settings (3 channels, 1 bit/channel)
 steg encode -i photo.png -f report.pdf -o photo_steg.png -p "hunter2"
 
 # Recover it
 steg decode -i photo_steg.png -o report_recovered.pdf -p "hunter2"
 
+# Use 2 channels and 2 bits/channel for more capacity
+steg encode -c 2 -b 2 -i photo.png -f archive.tar.gz -o out.png -p "hunter2"
+steg decode -c 2 -b 2 -i out.png -o archive.tar.gz -p "hunter2"
+
 # Use parallel mode for large images
 steg encode -P -i 4k_photo.png -f big_archive.tar.gz -o out.png -p "hunter2"
+
+# Encode into a BMP carrier; decode back
+steg encode -i photo.bmp -f secret.txt -o out.bmp -p "hunter2"
+steg decode -i out.bmp -o recovered.txt -p "hunter2"
+
+# Check capacity before encoding
+steg capacity -i photo.png
 ```
 
 ---
 
 ## Capacity
 
-steg stores **3 bits per pixel** (1 LSB each from R, G, and B). The usable payload capacity of a carrier image is:
+The usable payload capacity depends on the image dimensions and the chosen `--channels` / `--bits-per-channel` settings:
 
 ```
-max_payload = floor( (width × height × 3 − 320) / 8 )  bytes
+max_payload = max(0, floor( width × height × channels × bitsPerChannel / 8 ) − 40)  bytes
 ```
 
-The 320-bit (40-byte) overhead covers: 4-byte nonce + 4-byte length + 32-byte HMAC tag.
+The 40-byte overhead covers: 4-byte nonce + 4-byte encrypted length + 32-byte encrypted HMAC tag.
+
+Default settings (3 channels, 1 bit/channel):
 
 | Image size | Pixels | Max payload |
 |---|---|---|
@@ -139,7 +188,7 @@ The 320-bit (40-byte) overhead covers: 4-byte nonce + 4-byte length + 32-byte HM
 | 1920 × 1080 (FHD) | 2,073,600 | ~759 KB |
 | 3840 × 2160 (4K) | 8,294,400 | ~2.97 MB |
 
-If the payload exceeds the image capacity, encode returns an error.
+Use `steg capacity -i <image>` to print a full table for all (channels × bits-per-channel) combinations at once. If the payload exceeds the image capacity, encode returns an error.
 
 ---
 
@@ -245,7 +294,7 @@ The cipher is seeked to bit offset 32 before encryption begins, keeping keystrea
 
 | Package | Responsibility |
 |---|---|
-| `cmd/steg` | Cobra CLI; PNG file I/O |
+| `cmd/steg` | Cobra CLI; PNG/BMP/TIFF file I/O; `encode`, `decode`, `capacity`, and `test-visual` subcommands |
 | `steg` | Encode/decode orchestration; Argon2id key derivation; parallel worker pool |
 | `steg/container` | Payload framing (length prefix + HMAC tag); constant-time tag verification |
 | `cursors` | `RNGCursor` (Fisher-Yates pixel traversal, write-back pixel cache), `CursorAdapter` (byte↔bit bridge), `CipherMiddleware` (transparent encrypt/decrypt) |
@@ -268,8 +317,14 @@ The cipher is seeked to bit offset 32 before encryption begins, keeping keystrea
 # Build the CLI binary
 make build
 
+# Install the binary to $GOPATH/bin (or $GOBIN)
+make install
+
 # Run all tests
 make test
+
+# Run tests with the race detector
+go test -race ./steg/
 
 # Run a single test
 go test ./steg/ -run TestEncodeRoundTrip
@@ -313,15 +368,15 @@ Every push to `master` triggers a GitHub Actions workflow that:
 | MAC-then-Encrypt ordering | Low | HMAC is computed over plaintext before encryption. Unconventional (Encrypt-then-MAC is preferred), but not exploitable in this threat model since the tag is inside the encrypted channel. |
 | Fixed application salt | Low | Per-image random Argon2id salt would marginally harden against targeted precomputation; not implemented to avoid bootstrapping complexity. |
 | No streaming decode | Medium | `ReadPayload` allocates the full payload in memory before returning. Very large payloads may cause high memory usage. |
-| PNG only | Medium | Only lossless PNG is supported. JPEG is lossy and destroys LSB data; other lossless formats (BMP, WebP lossless) could be added. |
+| Lossy formats unsupported | High | JPEG and other lossy formats destroy LSB data. Only lossless formats (PNG, BMP, TIFF) are supported. |
 | Nonce integrity | Low | The 4-byte plaintext nonce has no MAC. Flipping nonce bits changes the keystream, causing a MAC failure at decode — the correct outcome — but the error does not distinguish nonce tampering from a wrong password. |
-| Statistical steganalysis | Medium | Modifying the LSBs of R, G, and B channels across a pseudorandom pixel set produces a detectable statistical signature to an observer who analyses the carrier image's LSB distribution. |
+| Statistical steganalysis | Medium | Modifying the LSBs of color channels across a pseudorandom pixel set produces a detectable statistical signature to an observer who analyses the carrier image's LSB distribution. Higher bits-per-channel settings make this more pronounced. |
 
 ---
 
 ## Roadmap
 
 - **Per-image random Argon2id salt** — store a random salt in the plaintext header alongside the nonce to further harden against precomputation.
-- **Additional image formats** — BMP and lossless WebP support.
+- **Lossless WebP support** — extend format support beyond PNG, BMP, and TIFF.
 - **Streaming decode** — avoid loading the full payload into memory for large files.
-- **Multi-bit-depth support** — hide more bits per channel on 16-bit-depth images.
+- **16-bit image depth** — exploit the extra bits-per-channel available in 16-bit PNG/TIFF carriers.

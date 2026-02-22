@@ -65,13 +65,16 @@ shared mutable state is the underlying `draw.Image` pixel array.
 
 ### Pixel-safe chunk alignment
 
-With 3 bits/pixel and 8 bits/byte, a chunk boundary is pixel-safe only at byte
-offsets that are multiples of `lcm(8, 3) / 8 = 3 bytes` (= 8 pixels). All chunks
-except the last must be multiples of this alignment to prevent a worker from writing
-half a pixel that another worker is simultaneously reading or writing. The final chunk
-is exempt because no later worker follows it.
+A chunk boundary is pixel-safe only at byte offsets that are multiples of
+`lcm(8 bits/byte, channels × bitsPerChannel bits/pixel) / 8`. With the default
+settings (3 channels, 1 bit/channel) this is `lcm(8, 3) / 8 = 3 bytes` (= 8
+pixels). The formula generalises automatically for any `--channels` /
+`--bits-per-channel` combination. All chunks except the last must be multiples of
+this alignment to prevent a worker from writing half a pixel that another worker is
+simultaneously reading or writing. The final chunk is exempt because no later worker
+follows it.
 
-Default chunk size: `alignment × 1024 = 3072 bytes`.
+Default chunk size: `alignment × 1024` bytes.
 
 ### Worker count
 
@@ -108,10 +111,14 @@ finish. `hmac.Equal` provides constant-time comparison.
   a direct apples-to-apples comparison on a 1000×1000 image with a 100 KB payload.
 
 **Negative / risks:**
-- Concurrent writes to `draw.Image` pixels are safe only because each worker touches
-  a disjoint set of byte offsets within the image buffer. This relies on the alignment
-  invariant being maintained. If chunk sizes are changed, the alignment multiple (3
-  bytes) must be preserved.
+- Concurrent `img.At()` / `img.Set()` calls on the same `draw.Image` — even on
+  non-overlapping pixel indices — can be flagged as data races by the Go race
+  detector, because adjacent pixels (4 bytes each) share an 8-byte shadow word.
+  Fixed by adding an optional `*sync.Mutex` to `RNGCursor` (`WithImageMutex` option)
+  that is locked around every `img.At()` and `img.Set()` call. `EncodeParallel`
+  creates one shared mutex and passes it to all workers; cipher/AES work happens
+  outside the lock. `DecodeParallel` workers only read the image, so no mutex is
+  needed there.
 - The pixel-level refactor (Option 2) is deferred; if benchmarks show that goroutine
   overhead dominates, that refactor will be needed to see meaningful gains on smaller
   images.

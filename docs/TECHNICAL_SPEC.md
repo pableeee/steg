@@ -125,18 +125,27 @@ This shuffle is deterministic: the same seed always produces the same pixel orde
 
 ### Channel selection
 
-The cursor supports three 1-bit channels per pixel: red (bit 0x1), green (bit 0x2), and blue (bit 0x4). The encode/decode orchestration selects **green and blue** via `UseGreenBit()` and `UseBlueBit()`. Red is defined in the interface but not used.
+The cursor supports three channels per pixel: red (`R_Bit = 0x1`), green (`G_Bit = 0x2`), and blue (`B_Bit = 0x4`). The `channels` parameter on `Encode`/`Decode` controls which are active:
 
-With two channels per pixel, the bit cursor maps to image coordinates as:
+- `channels = 1` → R only (default `R_Bit`)
+- `channels = 2` → R + G (`UseGreenBit()` added)
+- `channels = 3` → R + G + B (`UseBlueBit()` added, the default CLI setting)
+
+The `cursorOptions(seed, bitsPerChannel, channels)` helper in `steg/steg.go` constructs this option slice.
+
+With `channels` active channels and `bitsPerChannel` bits per channel, the slot-to-image mapping is:
 
 ```
-pixelIndex   = cursorPosition / 2
-channelIndex = cursorPosition % 2     (0 → green, 1 → blue)
+bitsPerPixel = channels × bitsPerChannel
+pixelIndex   = cursorPosition / bitsPerPixel
+slotInPixel  = cursorPosition % bitsPerPixel
+channelIndex = slotInPixel / bitsPerChannel         (selects channel)
+bitInChannel = (bitsPerChannel − 1) − (slotInPixel % bitsPerChannel)  (MSB-first)
 ```
 
 ### Bit read/write
 
-Only the LSB (bit 0) of the selected channel's 8-bit value is read or written. The remaining 7 bits of each channel are untouched, limiting any single pixel's maximum observable change to ±1 per modified channel.
+`bitsPerChannel` LSBs (1–8) of each selected channel are read or written. Bits within a channel are ordered MSB-first. At the default of 1 bit/channel no pixel changes by more than ±1 per modified channel; higher settings increase the change magnitude and visual impact proportionally.
 
 ---
 
@@ -284,12 +293,13 @@ The nonce region is written before the cipher is initialized and read back befor
 ## 10. Encode Flow
 
 ```
-steg.Encode(img draw.Image, pass []byte, payload io.Reader)
+steg.Encode(img draw.Image, pass []byte, payload io.Reader, bitsPerChannel, channels int)
 
 1.  deriveKeys(pass) → seed, encKey, macKey
 
-2.  cur = NewRNGCursor(img, UseGreenBit(), UseBlueBit(), WithSeed(seed))
-        Generates Fisher-Yates-shuffled pixel sequence.
+2.  cur = NewRNGCursor(img, cursorOptions(seed, bitsPerChannel, channels)...)
+        Generates Fisher-Yates-shuffled pixel sequence with the configured channels
+        and bits per channel.
 
 3.  nonceBuf = crypto/rand.Read(4)
     nonce = BigEndian.Uint32(nonceBuf)
@@ -318,12 +328,13 @@ steg.Encode(img draw.Image, pass []byte, payload io.Reader)
 ## 11. Decode Flow
 
 ```
-steg.Decode(img draw.Image, pass []byte) → []byte
+steg.Decode(img draw.Image, pass []byte, bitsPerChannel, channels int) → []byte
 
 1.  deriveKeys(pass) → seed, encKey, macKey
 
-2.  cur = NewRNGCursor(img, UseGreenBit(), UseBlueBit(), WithSeed(seed))
-        Reproduces the identical shuffled pixel sequence.
+2.  cur = NewRNGCursor(img, cursorOptions(seed, bitsPerChannel, channels)...)
+        Reproduces the identical shuffled pixel sequence with identical channel/bit
+        configuration (must match the values used during encode).
 
 3.  rawAdapter = CursorAdapter(cur)
     io.ReadFull(rawAdapter, nonceBuf[0:4])
@@ -347,18 +358,20 @@ steg.Decode(img draw.Image, pass []byte) → []byte
 
 | Quantity | Formula |
 |----------|---------|
-| Total carrier bits | `W × H × 2` |
+| Total carrier bits | `W × H × channels × bitsPerChannel` |
 | Overhead (nonce + length + tag) | `32 + 32 + 256 = 320 bits = 40 bytes` |
-| Maximum payload | `floor((W × H × 2 − 320) / 8)` bytes |
+| Maximum payload | `max(0, floor(W × H × channels × bitsPerChannel / 8) − 40)` bytes |
 
-Example capacities:
+Example capacities at the default CLI settings (3 channels, 1 bit/channel):
 
 | Image | Pixels | Max payload |
 |-------|--------|-------------|
-| 100 × 100 | 10,000 | ~2,460 bytes (~2.4 KB) |
-| 500 × 500 | 250,000 | ~62,460 bytes (~61 KB) |
-| 1920 × 1080 | 2,073,600 | ~518,360 bytes (~506 KB) |
-| 3840 × 2160 | 8,294,400 | ~2,073,520 bytes (~1.98 MB) |
+| 100 × 100 | 10,000 | ~3,710 bytes (~3.6 KB) |
+| 500 × 500 | 250,000 | ~93,710 bytes (~91.5 KB) |
+| 1920 × 1080 | 2,073,600 | ~777,560 bytes (~759 KB) |
+| 3840 × 2160 | 8,294,400 | ~3,110,360 bytes (~2.97 MB) |
+
+The `steg capacity -i <image>` command prints a 3×4 table covering all channel and bits-per-channel combinations for a given image.
 
 ---
 
@@ -388,9 +401,11 @@ The tag is computed over the **plaintext** payload (MAC-then-Encrypt rather than
 
 A per-image random salt would marginally improve resistance to targeted precomputation (rainbow tables built for a specific candidate password). However, storing a random salt requires reading it before the cipher can be initialized — the same bootstrapping problem solved for the nonce. The current design places the 4-byte nonce first; adding a salt would require extending this plaintext header. The fixed salt `"github.com/pableeee/steg/v1"` serves as a domain separator: keys derived for this application cannot be reused against other Argon2id deployments using the same password.
 
-### Green and blue channels only
+### Configurable channels and bits-per-channel
 
-Red, green, and blue channels are defined in the cursor interface, but the orchestration layer activates only green and blue. This is an arbitrary choice that can be changed by passing different `Option` values to `NewRNGCursor`. Using all three channels would increase capacity by 50% at the cost of making single-channel modifications visible in the red channel as well.
+The `--channels` flag (1=R, 2=R+G, 3=R+G+B, default 3) and `--bits-per-channel` flag (1–8, default 1) give the user direct control over the capacity vs. detectability trade-off. Higher values increase the payload capacity but also increase the statistical deviation from a natural image's channel distribution, making the steganogram easier to detect.
+
+The `steg capacity` and `steg test-visual` commands let the user explore this trade-off empirically before committing to an encoding configuration.
 
 ### `math/rand` for the pixel shuffle
 
@@ -402,9 +417,9 @@ The Fisher-Yates shuffle uses Go's `math/rand` (a pseudo-random number generator
 
 | Issue | Severity | Notes |
 |-------|----------|-------|
-| Non-constant-time MAC comparison | Low | `container.go` uses a byte-loop comparison instead of `hmac.Equal`. The tag is inside an encrypted channel, so timing information is not directly observable by a network attacker, but this should be fixed. |
-| MAC-then-Encrypt ordering | Low | See §13. Unconventional but not exploitable in this threat model. |
+| MAC-then-Encrypt ordering | Low | HMAC is computed over plaintext before encryption. Unconventional (Encrypt-then-MAC is preferred), but not exploitable in this threat model since the tag is inside the encrypted channel. |
 | Fixed application salt | Low | A per-image random salt would be marginally stronger; not implemented to avoid header bootstrapping complexity. |
 | No streaming decode | Medium | `ReadPayload` allocates the full payload in memory before returning it. Very large payloads may cause high memory usage. |
-| PNG only | Medium | Only lossless PNG is supported. JPEG is lossy and would destroy the LSB data; other lossless formats (BMP, PNG variants) could be added. |
+| Lossy formats unsupported | High | JPEG and other lossy formats destroy LSB data. Only lossless formats (PNG, BMP, TIFF) are supported. |
 | No integrity check on the nonce | Low | The 4-byte nonce is stored in plaintext without any MAC. An active attacker who can flip bits in the nonce region would change the keystream used for decryption, causing a MAC failure rather than silent data corruption — the correct outcome — but the failure message does not distinguish nonce tampering from key error. |
+| Statistical steganalysis | Medium | Modifying the LSBs of color channels across a pseudorandom pixel set produces a detectable statistical signature. Higher `--bits-per-channel` settings increase the deviation from a natural image distribution. |
