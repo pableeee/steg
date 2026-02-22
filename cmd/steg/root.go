@@ -10,9 +10,12 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/pableeee/steg/steg"
 	"github.com/spf13/cobra"
+	"golang.org/x/image/bmp"
+	"golang.org/x/image/tiff"
 )
 
 var parallel bool
@@ -116,12 +119,12 @@ func init() {
 	decodeCmd.MarkFlagRequired("password")
 
 	capacityCmd.Flags().StringVarP(
-		&capacityFlags.inputImage, "input_image", "i", "", "PNG image to measure.",
+		&capacityFlags.inputImage, "input_image", "i", "", "Image to measure (PNG, BMP, TIFF).",
 	)
 	capacityCmd.MarkFlagRequired("input_image")
 
 	testVisualCmd.Flags().StringVarP(
-		&testVisualFlags.inputImage, "input_image", "i", "", "Carrier PNG image.",
+		&testVisualFlags.inputImage, "input_image", "i", "", "Carrier image (PNG, BMP, TIFF).",
 	)
 	testVisualCmd.Flags().StringVarP(
 		&testVisualFlags.outputDir, "output_dir", "o", "", "Directory to write output images into.",
@@ -146,6 +149,41 @@ func toDrawImage(src image.Image) draw.Image {
 	return cimg
 }
 
+// decodeImage opens path and decodes it as PNG, BMP, or TIFF based on extension.
+func decodeImage(path string) (image.Image, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	r := bufio.NewReader(f)
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".bmp":
+		return bmp.Decode(r)
+	case ".tif", ".tiff":
+		return tiff.Decode(r)
+	default:
+		return png.Decode(r)
+	}
+}
+
+// encodeImage writes img to path as PNG, BMP, or TIFF based on extension.
+func encodeImage(path string, img image.Image) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return fmt.Errorf("unable to create output file: %w", err)
+	}
+	defer f.Close()
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".bmp":
+		return bmp.Encode(f, img)
+	case ".tif", ".tiff":
+		return tiff.Encode(f, img, nil)
+	default:
+		return png.Encode(f, img)
+	}
+}
+
 func runEncode() error {
 	if bitsPerChannel < 1 || bitsPerChannel > 8 {
 		return fmt.Errorf("--bits-per-channel must be between 1 and 8, got %d", bitsPerChannel)
@@ -154,12 +192,7 @@ func runEncode() error {
 		return fmt.Errorf("--channels must be between 1 and 3, got %d", channels)
 	}
 
-	f, err := os.Open(encoderFlags.inputImage)
-	if err != nil {
-		return err
-	}
-
-	src, err := png.Decode(bufio.NewReader(f))
+	src, err := decodeImage(encoderFlags.inputImage)
 	if err != nil {
 		return err
 	}
@@ -170,12 +203,6 @@ func runEncode() error {
 		return err
 	}
 
-	out, err := os.Create(encoderFlags.outputImage)
-	if err != nil {
-		return fmt.Errorf("unable to create output file: %w", err)
-	}
-	defer out.Close()
-
 	if parallel {
 		err = steg.EncodeParallel(cimg, []byte(encoderFlags.key), bufio.NewReader(fmsg), bitsPerChannel, channels)
 	} else {
@@ -185,8 +212,7 @@ func runEncode() error {
 		return err
 	}
 
-	err = png.Encode(out, cimg)
-	if err != nil {
+	if err = encodeImage(encoderFlags.outputImage, cimg); err != nil {
 		log.Fatal(err)
 	}
 
@@ -201,12 +227,7 @@ func runDecode() error {
 		return fmt.Errorf("--channels must be between 1 and 3, got %d", channels)
 	}
 
-	f, err := os.Open(decoderFlags.inputFile)
-	if err != nil {
-		return err
-	}
-
-	src, err := png.Decode(bufio.NewReader(f))
+	src, err := decodeImage(decoderFlags.inputFile)
 	if err != nil {
 		return err
 	}
@@ -247,13 +268,7 @@ func imageCapacity(w, h, ch, bpc int) int {
 }
 
 func runCapacity() error {
-	f, err := os.Open(capacityFlags.inputImage)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	src, err := png.Decode(bufio.NewReader(f))
+	src, err := decodeImage(capacityFlags.inputImage)
 	if err != nil {
 		return err
 	}
@@ -315,14 +330,8 @@ func formatBytes(n int) string {
 }
 
 func runTestVisual() error {
-	// Open and decode the carrier image once; we'll copy it for each run.
-	f, err := os.Open(testVisualFlags.inputImage)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	src, err := png.Decode(bufio.NewReader(f))
+	// Decode the carrier image once; we'll copy it for each run.
+	src, err := decodeImage(testVisualFlags.inputImage)
 	if err != nil {
 		return err
 	}
@@ -365,15 +374,9 @@ func runTestVisual() error {
 				return fmt.Errorf("encode ch=%d bpc=%d: %w", ch, bpc, err)
 			}
 
-			outF, err := os.Create(outPath)
-			if err != nil {
-				return fmt.Errorf("create %s: %w", outPath, err)
+			if err = encodeImage(outPath, cimg); err != nil {
+				return fmt.Errorf("encode %s: %w", outPath, err)
 			}
-			if err = png.Encode(outF, cimg); err != nil {
-				outF.Close()
-				return fmt.Errorf("png encode %s: %w", outPath, err)
-			}
-			outF.Close()
 
 			fmt.Printf("  ch=%d  bpc=%d  →  %-26s (%s bytes)\n", ch, bpc, name, formatBytes(cap))
 			written++
