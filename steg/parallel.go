@@ -28,8 +28,10 @@ type decJob struct {
 
 // newWorkerStack creates a per-worker cipher+cursor stack seeked to the correct
 // byte offset. Each worker has its own independent cipher and cursor state.
+// imgMu, when non-nil, is shared across all concurrent workers to serialise
+// img.At() / img.Set() calls and eliminate data races on the shared draw.Image.
 func newWorkerStack(m draw.Image, nonce uint32, encKey []byte,
-	points []image.Point, bitsPerChannel, channels int) (io.ReadWriteSeeker, error) {
+	points []image.Point, bitsPerChannel, channels int, imgMu *sync.Mutex) (io.ReadWriteSeeker, error) {
 	opts := []cursors.Option{
 		cursors.WithSharedPoints(points),
 		cursors.WithBitsPerChannel(bitsPerChannel),
@@ -39,6 +41,9 @@ func newWorkerStack(m draw.Image, nonce uint32, encKey []byte,
 	}
 	if channels >= 3 {
 		opts = append(opts, cursors.UseBlueBit())
+	}
+	if imgMu != nil {
+		opts = append(opts, cursors.WithImageMutex(imgMu))
 	}
 	cur := cursors.NewRNGCursor(m, opts...)
 	c, err := cipher.NewCipher(nonce, encKey)
@@ -86,6 +91,11 @@ func EncodeParallel(m draw.Image, pass []byte, r io.Reader, bitsPerChannel, chan
 	// pixel in rawCur that hasn't been committed to the image yet.
 	rawCur.Flush()
 
+	// Shared mutex: serialises img.At()/img.Set() across concurrent workers so
+	// that adjacent-pixel writes (which share an 8-byte race-detector shadow word)
+	// are not flagged as data races. Cipher/CPU work happens outside the lock.
+	imgMu := &sync.Mutex{}
+
 	numWorkers := runtime.GOMAXPROCS(0)
 	jobChan := make(chan encJob, numWorkers*2)
 	errChan := make(chan error, numWorkers)
@@ -95,7 +105,7 @@ func EncodeParallel(m draw.Image, pass []byte, r io.Reader, bitsPerChannel, chan
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			adapter, werr := newWorkerStack(m, nonce, encKey, points, bitsPerChannel, channels)
+			adapter, werr := newWorkerStack(m, nonce, encKey, points, bitsPerChannel, channels, imgMu)
 			if werr != nil {
 				errChan <- werr
 				return
@@ -154,7 +164,8 @@ func EncodeParallel(m draw.Image, pass []byte, r io.Reader, bitsPerChannel, chan
 	}
 
 	// Post-parallel sequential writes: length field (byte 4) and HMAC tag.
-	seqAdapter, err := newWorkerStack(m, nonce, encKey, points, bitsPerChannel, channels)
+	// No imgMu needed — all concurrent workers have finished (wg.Wait returned).
+	seqAdapter, err := newWorkerStack(m, nonce, encKey, points, bitsPerChannel, channels, nil)
 	if err != nil {
 		return err
 	}
@@ -210,7 +221,7 @@ func DecodeParallel(m draw.Image, pass []byte, bitsPerChannel, channels int) ([]
 	nonce := binary.BigEndian.Uint32(nonceBuf)
 
 	// Read encrypted 4-byte length sequentially (cipher at byte offset 4).
-	seqAdapter, err := newWorkerStack(m, nonce, encKey, points, bitsPerChannel, channels)
+	seqAdapter, err := newWorkerStack(m, nonce, encKey, points, bitsPerChannel, channels, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -239,7 +250,8 @@ func DecodeParallel(m draw.Image, pass []byte, bitsPerChannel, channels int) ([]
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			adapter, werr := newWorkerStack(m, nonce, encKey, points, bitsPerChannel, channels)
+			// Decode workers only read the image; concurrent reads are race-free.
+			adapter, werr := newWorkerStack(m, nonce, encKey, points, bitsPerChannel, channels, nil)
 			if werr != nil {
 				errChan <- werr
 				return

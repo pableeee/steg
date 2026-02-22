@@ -7,6 +7,7 @@ import (
 	"image/draw"
 	"io"
 	"math/rand"
+	"sync"
 )
 
 func GenerateSequence(width, height int, seed int64) []image.Point {
@@ -42,6 +43,11 @@ type RNGCursor struct {
 	points          []image.Point
 	rng             *rand.Rand
 	maxBits         int64 // pre-computed capacity in bits
+
+	// imgMu, when non-nil, is locked around every img.At() and img.Set() call.
+	// Set via WithImageMutex to eliminate data races when multiple cursors share
+	// the same draw.Image (e.g. parallel encode workers).
+	imgMu *sync.Mutex
 
 	// pixel cache — amortises img.At() and img.Set() across the bits of one pixel.
 	// Write-back: img.Set() is deferred until the cursor leaves the current pixel
@@ -86,6 +92,13 @@ func WithBitsPerChannel(n int) Option {
 	return func(c *RNGCursor) { c.bitsPerChannel = n }
 }
 
+// WithImageMutex sets a shared mutex that will be locked around every img.At()
+// and img.Set() call. Pass the same *sync.Mutex to all cursors that share an
+// image to eliminate data races in parallel encode/decode scenarios.
+func WithImageMutex(mu *sync.Mutex) Option {
+	return func(c *RNGCursor) { c.imgMu = mu }
+}
+
 func NewRNGCursor(img draw.Image, options ...Option) *RNGCursor {
 	c := &RNGCursor{img: img, bitMask: R_Bit, bitsPerChannel: 1, rng: rand.New(rand.NewSource(0))}
 	for _, opt := range options {
@@ -117,7 +130,14 @@ func (c *RNGCursor) validateBounds(n int64) bool {
 // Must be called after the final WriteByte before the cursor is abandoned.
 func (c *RNGCursor) Flush() {
 	if c.dirty {
-		c.img.Set(c.cacheX, c.cacheY, color.RGBA{uint8(c.cacheR), uint8(c.cacheG), uint8(c.cacheB), uint8(c.cacheA)})
+		px := color.RGBA{uint8(c.cacheR), uint8(c.cacheG), uint8(c.cacheB), uint8(c.cacheA)}
+		if c.imgMu != nil {
+			c.imgMu.Lock()
+			c.img.Set(c.cacheX, c.cacheY, px)
+			c.imgMu.Unlock()
+		} else {
+			c.img.Set(c.cacheX, c.cacheY, px)
+		}
 		c.dirty = false
 	}
 }
@@ -126,7 +146,14 @@ func (c *RNGCursor) Flush() {
 func (c *RNGCursor) loadPixel(pixelIdx int64) {
 	c.Flush()
 	pt := c.points[pixelIdx]
-	r, g, b, a := c.img.At(pt.X, pt.Y).RGBA()
+	var r, g, b, a uint32
+	if c.imgMu != nil {
+		c.imgMu.Lock()
+		r, g, b, a = c.img.At(pt.X, pt.Y).RGBA()
+		c.imgMu.Unlock()
+	} else {
+		r, g, b, a = c.img.At(pt.X, pt.Y).RGBA()
+	}
 	c.cacheIdx = pixelIdx
 	c.cacheX, c.cacheY = pt.X, pt.Y
 	c.cacheR, c.cacheG, c.cacheB, c.cacheA = r, g, b, a
