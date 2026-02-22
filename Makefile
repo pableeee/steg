@@ -9,6 +9,10 @@ mocks:
 test:
 	@go test ./...
 
-
 build:
 	cd cmd/steg && go build
+
+## install: install the steg binary to $(GOPATH)/bin (or $GOBIN if set)
+.PHONY: install
+install:
+	go install ./cmd/steg
