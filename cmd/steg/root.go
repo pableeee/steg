@@ -278,13 +278,27 @@ func runCapacity() error {
 		fmt.Printf("  %s", chNames[ch-1])
 		for _, bpc := range bpcValues {
 			cap := imageCapacity(w, h, ch, bpc)
-			fmt.Printf("%*s", col, formatBytes(cap))
+			fmt.Printf("%*s", col, humanBytes(cap))
 		}
 		fmt.Println()
 	}
 
-	fmt.Println("\nAll values in bytes.  Overhead: 40 B (4 nonce + 4 length + 32 HMAC).")
+	fmt.Println("\nOverhead: 40 B (4 nonce + 4 length + 32 HMAC).")
 	return nil
+}
+
+// humanBytes formats n as a human-readable byte size (B, KB, MB, GB).
+func humanBytes(n int) string {
+	switch {
+	case n >= 1<<30:
+		return fmt.Sprintf("%.2f GB", float64(n)/float64(1<<30))
+	case n >= 1<<20:
+		return fmt.Sprintf("%.2f MB", float64(n)/float64(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.2f KB", float64(n)/float64(1<<10))
+	default:
+		return fmt.Sprintf("%d B", n)
+	}
 }
 
 // formatBytes formats an integer with thousands separators.
