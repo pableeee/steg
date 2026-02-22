@@ -29,10 +29,10 @@ func TestParallelRoundTrip(t *testing.T) {
 	payload := []byte("parallel round-trip test payload")
 	m := image.NewRGBA(image.Rect(0, 0, 500, 500))
 
-	err := steg.EncodeParallel(m, pass, bytes.NewReader(payload), 1)
+	err := steg.EncodeParallel(m, pass, bytes.NewReader(payload), 1, 3)
 	require.NoError(t, err)
 
-	got, err := steg.DecodeParallel(m, pass, 1)
+	got, err := steg.DecodeParallel(m, pass, 1, 3)
 	require.NoError(t, err)
 	require.Equal(t, payload, got)
 }
@@ -43,10 +43,10 @@ func TestParallelSequentialInterop(t *testing.T) {
 	payload := []byte("cross-mode interop test payload")
 	m := image.NewRGBA(image.Rect(0, 0, 500, 500))
 
-	err := steg.EncodeParallel(m, pass, bytes.NewReader(payload), 1)
+	err := steg.EncodeParallel(m, pass, bytes.NewReader(payload), 1, 3)
 	require.NoError(t, err)
 
-	got, err := steg.Decode(m, pass, 1)
+	got, err := steg.Decode(m, pass, 1, 3)
 	require.NoError(t, err)
 	require.Equal(t, payload, got)
 }
@@ -57,10 +57,10 @@ func TestSequentialParallelInterop(t *testing.T) {
 	payload := []byte("sequential encode, parallel decode")
 	m := image.NewRGBA(image.Rect(0, 0, 500, 500))
 
-	err := steg.Encode(m, pass, bytes.NewReader(payload), 1)
+	err := steg.Encode(m, pass, bytes.NewReader(payload), 1, 3)
 	require.NoError(t, err)
 
-	got, err := steg.DecodeParallel(m, pass, 1)
+	got, err := steg.DecodeParallel(m, pass, 1, 3)
 	require.NoError(t, err)
 	require.Equal(t, payload, got)
 }
@@ -73,7 +73,7 @@ func BenchmarkEncodeSequential(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		m := newTestImage()
-		if err := steg.Encode(m, pass, bytes.NewReader(payload), 1); err != nil {
+		if err := steg.Encode(m, pass, bytes.NewReader(payload), 1, 3); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -86,7 +86,7 @@ func BenchmarkEncodeParallel(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		m := newTestImage()
-		if err := steg.EncodeParallel(m, pass, bytes.NewReader(payload), 1); err != nil {
+		if err := steg.EncodeParallel(m, pass, bytes.NewReader(payload), 1, 3); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -97,12 +97,12 @@ func BenchmarkDecodeSequential(b *testing.B) {
 	pass := []byte("benchpass")
 	payload := testPayload()
 	m := newTestImage()
-	if err := steg.Encode(m, pass, bytes.NewReader(payload), 1); err != nil {
+	if err := steg.Encode(m, pass, bytes.NewReader(payload), 1, 3); err != nil {
 		b.Fatal(err)
 	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := steg.Decode(m, pass, 1); err != nil {
+		if _, err := steg.Decode(m, pass, 1, 3); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -113,12 +113,12 @@ func BenchmarkDecodeParallel(b *testing.B) {
 	pass := []byte("benchpass")
 	payload := testPayload()
 	m := newTestImage()
-	if err := steg.EncodeParallel(m, pass, bytes.NewReader(payload), 1); err != nil {
+	if err := steg.EncodeParallel(m, pass, bytes.NewReader(payload), 1, 3); err != nil {
 		b.Fatal(err)
 	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := steg.DecodeParallel(m, pass, 1); err != nil {
+		if _, err := steg.DecodeParallel(m, pass, 1, 3); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -153,7 +153,7 @@ func BenchmarkEncodeBySize(b *testing.B) {
 		b.Run(tc.name+"/seq", func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				m := image.NewRGBA(image.Rect(0, 0, tc.w, tc.h))
-				if err := steg.Encode(m, pass, bytes.NewReader(payload), 1); err != nil {
+				if err := steg.Encode(m, pass, bytes.NewReader(payload), 1, 3); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -161,7 +161,7 @@ func BenchmarkEncodeBySize(b *testing.B) {
 		b.Run(tc.name+"/par", func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				m := image.NewRGBA(image.Rect(0, 0, tc.w, tc.h))
-				if err := steg.EncodeParallel(m, pass, bytes.NewReader(payload), 1); err != nil {
+				if err := steg.EncodeParallel(m, pass, bytes.NewReader(payload), 1, 3); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -181,24 +181,24 @@ func BenchmarkDecodeBySize(b *testing.B) {
 
 		// Pre-encode so decode benchmarks measure only the decode path.
 		mSeq := image.NewRGBA(image.Rect(0, 0, tc.w, tc.h))
-		if err := steg.Encode(mSeq, pass, bytes.NewReader(payload), 1); err != nil {
+		if err := steg.Encode(mSeq, pass, bytes.NewReader(payload), 1, 3); err != nil {
 			b.Fatal(err)
 		}
 		mPar := image.NewRGBA(image.Rect(0, 0, tc.w, tc.h))
-		if err := steg.EncodeParallel(mPar, pass, bytes.NewReader(payload), 1); err != nil {
+		if err := steg.EncodeParallel(mPar, pass, bytes.NewReader(payload), 1, 3); err != nil {
 			b.Fatal(err)
 		}
 
 		b.Run(tc.name+"/seq", func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
-				if _, err := steg.Decode(mSeq, pass, 1); err != nil {
+				if _, err := steg.Decode(mSeq, pass, 1, 3); err != nil {
 					b.Fatal(err)
 				}
 			}
 		})
 		b.Run(tc.name+"/par", func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
-				if _, err := steg.DecodeParallel(mPar, pass, 1); err != nil {
+				if _, err := steg.DecodeParallel(mPar, pass, 1, 3); err != nil {
 					b.Fatal(err)
 				}
 			}

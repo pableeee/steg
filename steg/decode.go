@@ -12,19 +12,13 @@ import (
 	"github.com/pableeee/steg/steg/container"
 )
 
-func Decode(m draw.Image, pass []byte, bitsPerChannel int) ([]byte, error) {
+func Decode(m draw.Image, pass []byte, bitsPerChannel, channels int) ([]byte, error) {
 	seed, encKey, macKey, err := deriveKeys(pass)
 	if err != nil {
 		return nil, err
 	}
 
-	cur := cursors.NewRNGCursor(
-		m,
-		cursors.UseGreenBit(),
-		cursors.UseBlueBit(),
-		cursors.WithSeed(seed),
-		cursors.WithBitsPerChannel(bitsPerChannel),
-	)
+	cur := cursors.NewRNGCursor(m, cursorOptions(seed, bitsPerChannel, channels)...)
 
 	// Read the same 4 nonce bytes from the same pixel positions used during encode.
 	rawAdapter := cursors.CursorAdapter(cur)

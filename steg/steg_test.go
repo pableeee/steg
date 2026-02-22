@@ -15,10 +15,10 @@ func TestEncodeDecode(t *testing.T) {
 
 	t.Run("should be able to retrieve the payload from the encoded image", func(t *testing.T) {
 		img := image.NewRGBA(image.Rect(0, 0, 100, 50))
-		err := Encode(img, pass, bytes.NewReader(payload), 1)
+		err := Encode(img, pass, bytes.NewReader(payload), 1, 3)
 		require.NoError(t, err)
 
-		decoded, err := Decode(img, pass, 1)
+		decoded, err := Decode(img, pass, 1, 3)
 		require.NoError(t, err)
 
 		assert.Equal(t, payload, decoded)
@@ -26,16 +26,16 @@ func TestEncodeDecode(t *testing.T) {
 
 	t.Run("should fail to retrieve the payload on a wrong password", func(t *testing.T) {
 		img := image.NewRGBA(image.Rect(0, 0, 100, 50))
-		err := Encode(img, pass, bytes.NewReader(payload), 1)
+		err := Encode(img, pass, bytes.NewReader(payload), 1, 3)
 		require.NoError(t, err)
 
-		_, err = Decode(img, []byte("wrong pass"), 1)
+		_, err = Decode(img, []byte("wrong pass"), 1, 3)
 		require.Error(t, err)
 	})
 
 	t.Run("should fail to write the payload on a small image", func(t *testing.T) {
 		img := image.NewRGBA(image.Rect(0, 0, 1, 5))
-		err := Encode(img, pass, bytes.NewReader(payload), 1)
+		err := Encode(img, pass, bytes.NewReader(payload), 1, 3)
 		require.Error(t, err)
 	})
 }
@@ -50,10 +50,10 @@ func TestMultiBitRoundTrip(t *testing.T) {
 		n := n
 		t.Run("roundtrip", func(t *testing.T) {
 			img := image.NewRGBA(image.Rect(0, 0, 100, 100))
-			err := Encode(img, pass, bytes.NewReader(payload), n)
+			err := Encode(img, pass, bytes.NewReader(payload), n, 3)
 			require.NoError(t, err)
 
-			got, err := Decode(img, pass, n)
+			got, err := Decode(img, pass, n, 3)
 			require.NoError(t, err)
 			assert.Equal(t, payload, got)
 		})
@@ -61,10 +61,10 @@ func TestMultiBitRoundTrip(t *testing.T) {
 
 	t.Run("wrong bitsPerChannel is detectable", func(t *testing.T) {
 		img := image.NewRGBA(image.Rect(0, 0, 100, 100))
-		err := Encode(img, pass, bytes.NewReader(payload), 2)
+		err := Encode(img, pass, bytes.NewReader(payload), 2, 3)
 		require.NoError(t, err)
 
-		_, err = Decode(img, pass, 1)
+		_, err = Decode(img, pass, 1, 3)
 		require.Error(t, err, "decoding with wrong bitsPerChannel should fail MAC verification")
 	})
 }

@@ -13,19 +13,13 @@ import (
 	"github.com/pableeee/steg/steg/container"
 )
 
-func Encode(m draw.Image, pass []byte, r io.Reader, bitsPerChannel int) error {
+func Encode(m draw.Image, pass []byte, r io.Reader, bitsPerChannel, channels int) error {
 	seed, encKey, macKey, err := deriveKeys(pass)
 	if err != nil {
 		return err
 	}
 
-	cur := cursors.NewRNGCursor(
-		m,
-		cursors.UseGreenBit(),
-		cursors.UseBlueBit(),
-		cursors.WithSeed(seed),
-		cursors.WithBitsPerChannel(bitsPerChannel),
-	)
+	cur := cursors.NewRNGCursor(m, cursorOptions(seed, bitsPerChannel, channels)...)
 
 	// Generate a cryptographically random nonce and write it as the first 4
 	// bytes (32 bits) of the pixel sequence in plaintext. Decode reads these

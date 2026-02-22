@@ -29,13 +29,18 @@ type decJob struct {
 // newWorkerStack creates a per-worker cipher+cursor stack seeked to the correct
 // byte offset. Each worker has its own independent cipher and cursor state.
 func newWorkerStack(m draw.Image, nonce uint32, encKey []byte,
-	points []image.Point, bitsPerChannel int) (io.ReadWriteSeeker, error) {
-	cur := cursors.NewRNGCursor(m,
-		cursors.UseGreenBit(),
-		cursors.UseBlueBit(),
+	points []image.Point, bitsPerChannel, channels int) (io.ReadWriteSeeker, error) {
+	opts := []cursors.Option{
 		cursors.WithSharedPoints(points),
 		cursors.WithBitsPerChannel(bitsPerChannel),
-	)
+	}
+	if channels >= 2 {
+		opts = append(opts, cursors.UseGreenBit())
+	}
+	if channels >= 3 {
+		opts = append(opts, cursors.UseBlueBit())
+	}
+	cur := cursors.NewRNGCursor(m, opts...)
 	c, err := cipher.NewCipher(nonce, encKey)
 	if err != nil {
 		return nil, err
@@ -46,7 +51,7 @@ func newWorkerStack(m draw.Image, nonce uint32, encKey []byte,
 // EncodeParallel encodes r into m using a parallel worker pool.
 // The on-image layout is identical to Encode, so DecodeParallel and Decode
 // can both decode images written by EncodeParallel (and vice-versa).
-func EncodeParallel(m draw.Image, pass []byte, r io.Reader, bitsPerChannel int) error {
+func EncodeParallel(m draw.Image, pass []byte, r io.Reader, bitsPerChannel, channels int) error {
 	seed, encKey, macKey, err := deriveKeys(pass)
 	if err != nil {
 		return err
@@ -55,17 +60,19 @@ func EncodeParallel(m draw.Image, pass []byte, r io.Reader, bitsPerChannel int) 
 	bounds := m.Bounds()
 	points := cursors.GenerateSequence(bounds.Max.X, bounds.Max.Y, seed)
 
-	// Minimum chunk alignment: lcm(8 bits/byte, bitCount*bitsPerChannel bits/pixel) / 8 bytes.
-	alignment := lcmBytes(8, 3*bitsPerChannel)
+	// Minimum chunk alignment: lcm(8 bits/byte, channels*bitsPerChannel bits/pixel) / 8 bytes.
+	alignment := lcmBytes(8, channels*bitsPerChannel)
 	chunkSize := alignment * 1024
 
 	// Write 4-byte nonce plaintext via raw (unencrypted) cursor.
-	rawCur := cursors.NewRNGCursor(m,
-		cursors.UseGreenBit(),
-		cursors.UseBlueBit(),
-		cursors.WithSharedPoints(points),
-		cursors.WithBitsPerChannel(bitsPerChannel),
-	)
+	rawOpts := []cursors.Option{cursors.WithSharedPoints(points), cursors.WithBitsPerChannel(bitsPerChannel)}
+	if channels >= 2 {
+		rawOpts = append(rawOpts, cursors.UseGreenBit())
+	}
+	if channels >= 3 {
+		rawOpts = append(rawOpts, cursors.UseBlueBit())
+	}
+	rawCur := cursors.NewRNGCursor(m, rawOpts...)
 	nonceBuf := make([]byte, 4)
 	if _, err = rand.Read(nonceBuf); err != nil {
 		return err
@@ -88,7 +95,7 @@ func EncodeParallel(m draw.Image, pass []byte, r io.Reader, bitsPerChannel int) 
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			adapter, werr := newWorkerStack(m, nonce, encKey, points, bitsPerChannel)
+			adapter, werr := newWorkerStack(m, nonce, encKey, points, bitsPerChannel, channels)
 			if werr != nil {
 				errChan <- werr
 				return
@@ -147,7 +154,7 @@ func EncodeParallel(m draw.Image, pass []byte, r io.Reader, bitsPerChannel int) 
 	}
 
 	// Post-parallel sequential writes: length field (byte 4) and HMAC tag.
-	seqAdapter, err := newWorkerStack(m, nonce, encKey, points, bitsPerChannel)
+	seqAdapter, err := newWorkerStack(m, nonce, encKey, points, bitsPerChannel, channels)
 	if err != nil {
 		return err
 	}
@@ -177,7 +184,7 @@ func EncodeParallel(m draw.Image, pass []byte, r io.Reader, bitsPerChannel int) 
 
 // DecodeParallel decodes a message from m using a parallel worker pool.
 // Images encoded by Encode (sequential) are fully compatible.
-func DecodeParallel(m draw.Image, pass []byte, bitsPerChannel int) ([]byte, error) {
+func DecodeParallel(m draw.Image, pass []byte, bitsPerChannel, channels int) ([]byte, error) {
 	seed, encKey, macKey, err := deriveKeys(pass)
 	if err != nil {
 		return nil, err
@@ -187,12 +194,14 @@ func DecodeParallel(m draw.Image, pass []byte, bitsPerChannel int) ([]byte, erro
 	points := cursors.GenerateSequence(bounds.Max.X, bounds.Max.Y, seed)
 
 	// Read 4-byte nonce plaintext via raw cursor.
-	rawCur := cursors.NewRNGCursor(m,
-		cursors.UseGreenBit(),
-		cursors.UseBlueBit(),
-		cursors.WithSharedPoints(points),
-		cursors.WithBitsPerChannel(bitsPerChannel),
-	)
+	rawOpts := []cursors.Option{cursors.WithSharedPoints(points), cursors.WithBitsPerChannel(bitsPerChannel)}
+	if channels >= 2 {
+		rawOpts = append(rawOpts, cursors.UseGreenBit())
+	}
+	if channels >= 3 {
+		rawOpts = append(rawOpts, cursors.UseBlueBit())
+	}
+	rawCur := cursors.NewRNGCursor(m, rawOpts...)
 	rawAdapter := cursors.CursorAdapter(rawCur)
 	nonceBuf := make([]byte, 4)
 	if _, err = io.ReadFull(rawAdapter, nonceBuf); err != nil {
@@ -201,7 +210,7 @@ func DecodeParallel(m draw.Image, pass []byte, bitsPerChannel int) ([]byte, erro
 	nonce := binary.BigEndian.Uint32(nonceBuf)
 
 	// Read encrypted 4-byte length sequentially (cipher at byte offset 4).
-	seqAdapter, err := newWorkerStack(m, nonce, encKey, points, bitsPerChannel)
+	seqAdapter, err := newWorkerStack(m, nonce, encKey, points, bitsPerChannel, channels)
 	if err != nil {
 		return nil, err
 	}
@@ -218,7 +227,7 @@ func DecodeParallel(m draw.Image, pass []byte, bitsPerChannel int) ([]byte, erro
 	totalRemaining := payloadLen + 32
 	decryptedBuf := make([]byte, totalRemaining)
 
-	alignment := lcmBytes(8, 3*bitsPerChannel)
+	alignment := lcmBytes(8, channels*bitsPerChannel)
 	chunkSize := int64(alignment * 1024)
 
 	numWorkers := runtime.GOMAXPROCS(0)
@@ -230,7 +239,7 @@ func DecodeParallel(m draw.Image, pass []byte, bitsPerChannel int) ([]byte, erro
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			adapter, werr := newWorkerStack(m, nonce, encKey, points, bitsPerChannel)
+			adapter, werr := newWorkerStack(m, nonce, encKey, points, bitsPerChannel, channels)
 			if werr != nil {
 				errChan <- werr
 				return

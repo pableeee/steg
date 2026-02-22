@@ -4,12 +4,29 @@ import (
 	"encoding/binary"
 	"fmt"
 
+	"github.com/pableeee/steg/cursors"
 	"golang.org/x/crypto/argon2"
 )
 
 // appSalt is a fixed domain separator. Argon2id's memory-hardness
 // provides key-stretching even with a fixed salt.
 var appSalt = []byte("github.com/pableeee/steg/v1")
+
+// cursorOptions builds the RNGCursor option slice for the given configuration.
+// channels: 1 = R only, 2 = R+G, 3 = R+G+B.
+func cursorOptions(seed int64, bitsPerChannel, channels int) []cursors.Option {
+	opts := []cursors.Option{
+		cursors.WithSeed(seed),
+		cursors.WithBitsPerChannel(bitsPerChannel),
+	}
+	if channels >= 2 {
+		opts = append(opts, cursors.UseGreenBit())
+	}
+	if channels >= 3 {
+		opts = append(opts, cursors.UseBlueBit())
+	}
+	return opts
+}
 
 func gcd(a, b int) int {
 	for b != 0 {
