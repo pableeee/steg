@@ -62,3 +62,13 @@ Decoding reverses the pipeline: reads the 4-byte nonce plaintext, reconstructs t
 The `cursorOptions(seed, bitsPerChannel, channels)` helper in `steg/steg.go` builds the option slice used by `Encode`, `Decode`, `EncodeParallel`, and `DecodeParallel`.
 
 Chunk alignment for parallel operation: `lcm(8 bits/byte, channels × bitsPerChannel bits/pixel) / 8` bytes per aligned chunk boundary. With defaults (3 channels, 1 bit/ch) this is 3 bytes = 8 pixels; values change with different settings.
+
+## Pending security work
+
+### 2. Plaintext nonce as a stego presence marker
+The 4-byte nonce is written plaintext to the first 4 cursor positions (specific pixels determined by the Fisher-Yates shuffle seeded from the password). These bytes come from `crypto/rand` and are uncorrelated with image content. An attacker who knows the code and suspects steganography could test: "do the LSBs at these known-position pixels look uniformly random?" as a cheap presence test — even without the password.
+**Mitigation**: derive the nonce from the Argon2id output (add a 4-byte nonce slice) instead of storing a plaintext random nonce. This removes the one fixed-position plaintext anchor entirely.
+
+### 3. Full-image LSB disturbance for large payloads
+For large payloads, the Fisher-Yates shuffle touches most or all pixels, globally disturbing the LSB distribution across the image. Statistical detectors (chi-square, RS analysis, SPA) become more effective as payload size approaches capacity.
+**Mitigation**: pad the payload to full capacity so the LSB distribution is uniformly and consistently disturbed regardless of actual payload size (removes the payload-size signal).

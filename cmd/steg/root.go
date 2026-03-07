@@ -139,6 +139,7 @@ func init() {
 	rootCmd.AddCommand(decodeCmd)
 	rootCmd.AddCommand(capacityCmd)
 	rootCmd.AddCommand(testVisualCmd)
+	rootCmd.AddCommand(detectCmd)
 }
 
 func toDrawImage(src image.Image) draw.Image {

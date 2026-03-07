@@ -20,6 +20,7 @@
 - [Development](#development)
 - [Known limitations](#known-limitations)
 - [Roadmap](#roadmap)
+- [Steganalysis](#steganalysis)
 
 ---
 
@@ -32,6 +33,7 @@
 - **Configurable capacity vs. detectability** — `--bits-per-channel` (1–8 LSBs per channel) and `--channels` (1=R, 2=R+G, 3=R+G+B) let you trade off payload capacity against visual impact. At 1 bit/channel no pixel changes by more than ±1.
 - **`capacity` command** — prints a table of usable byte capacity for every (channels × bits-per-channel) combination for a given image.
 - **`test-visual` command** — generates carrier images filled to capacity at every encoding intensity for side-by-side visual comparison.
+- **`detect` command** — runs chi-square and RS steganalysis on any image and reports a per-channel verdict (`CLEAN` / `SUSPICIOUS` / `LIKELY_STEGO`).
 - **Multiple image formats** — PNG, BMP, and TIFF are supported as both input and output.
 - **Parallel mode** — a worker-pool implementation (`-P`) scales encode/decode across all available CPUs, giving up to ~2.5× speedup on large images.
 - **Interoperable modes** — images encoded with the sequential path can be decoded with the parallel path and vice versa.
@@ -143,6 +145,34 @@ steg test-visual -i carrier.png -o ./visual/ -p "mypass"
 
 Writes up to 12 PNGs (`visual_ch{1-3}_b{1,2,4,8}.png`) into the output directory.
 
+### Detect
+
+Run steganalysis on an image to check for LSB steganography:
+
+```bash
+steg detect -i image.png
+```
+
+| Flag | Short | Description |
+|---|---|---|
+| `--input_image` | `-i` | Image to analyse (PNG, BMP, TIFF) |
+
+Example output:
+
+```
+Chi-square analysis (high p-value = suspicious):
+  R: χ²=127.17      p=0.4790  [SUSPICIOUS]
+  G: χ²=1583.51     p=0.0000  [CLEAN]
+  B: χ²=2274.04     p=0.0000  [CLEAN]
+
+RS analysis (positive asymmetry = suspicious):
+  R: Rm=0.4992  Sm=0.5008  R-m=0.5440  S-m=0.4560  asymmetry=-0.0448  [CLEAN]
+  G: Rm=0.5206  Sm=0.4794  R-m=0.5223  S-m=0.4777  asymmetry=-0.0017  [CLEAN]
+  B: Rm=0.5191  Sm=0.4809  R-m=0.5246  S-m=0.4754  asymmetry=-0.0055  [CLEAN]
+
+Verdict: SUSPICIOUS
+```
+
 ### Example
 
 ```bash
@@ -165,6 +195,10 @@ steg decode -i out.bmp -o recovered.txt -p "hunter2"
 
 # Check capacity before encoding
 steg capacity -i photo.png
+
+# Analyse an image for signs of LSB steganography
+steg detect -i photo.png
+steg detect -i suspected_steg.png
 ```
 
 ---
@@ -294,11 +328,12 @@ The cipher is seeked to bit offset 32 before encryption begins, keeping keystrea
 
 | Package | Responsibility |
 |---|---|
-| `cmd/steg` | Cobra CLI; PNG/BMP/TIFF file I/O; `encode`, `decode`, `capacity`, and `test-visual` subcommands |
+| `cmd/steg` | Cobra CLI; PNG/BMP/TIFF file I/O; `encode`, `decode`, `capacity`, `test-visual`, and `detect` subcommands |
 | `steg` | Encode/decode orchestration; Argon2id key derivation; parallel worker pool |
 | `steg/container` | Payload framing (length prefix + HMAC tag); constant-time tag verification |
 | `cursors` | `RNGCursor` (Fisher-Yates pixel traversal, write-back pixel cache), `CursorAdapter` (byte↔bit bridge), `CipherMiddleware` (transparent encrypt/decrypt) |
 | `cipher` | AES-128 CTR stream cipher; bit- and byte-addressable keystream; seekable |
+| `steg/analysis` | Chi-square and RS steganalysis detectors; `Analyze()` returns a combined verdict |
 | `mocks` | Auto-generated gomock mocks for `Cursor` and `StreamCipherBlock` interfaces |
 | `testutil` | `MemReadWriteSeeker` in-memory helper for tests |
 
@@ -347,6 +382,7 @@ go test ./steg/ -bench=BenchmarkDecodeBySize -benchtime=3s -benchmem
 ├── docs/            # Technical spec, ADRs, release notes
 ├── mocks/           # Auto-generated gomock mocks
 ├── steg/            # Encode/decode orchestration, container framing
+│   ├── analysis/    # Chi-square and RS steganalysis detectors
 │   └── container/
 └── testutil/        # Shared test helpers
 ```
@@ -370,7 +406,35 @@ Every push to `master` triggers a GitHub Actions workflow that:
 | No streaming decode | Medium | `ReadPayload` allocates the full payload in memory before returning. Very large payloads may cause high memory usage. |
 | Lossy formats unsupported | High | JPEG and other lossy formats destroy LSB data. Only lossless formats (PNG, BMP, TIFF) are supported. |
 | Nonce integrity | Low | The 4-byte plaintext nonce has no MAC. Flipping nonce bits changes the keystream, causing a MAC failure at decode — the correct outcome — but the error does not distinguish nonce tampering from a wrong password. |
-| Statistical steganalysis | Medium | Modifying the LSBs of color channels across a pseudorandom pixel set produces a detectable statistical signature to an observer who analyses the carrier image's LSB distribution. Higher bits-per-channel settings make this more pronounced. |
+| Statistical steganalysis | Medium | Modifying the LSBs of color channels across a pseudorandom pixel set produces a detectable statistical signature. The built-in `detect` command uses chi-square and RS analysis to surface this. Chi-square reliably detects full-fill encoding; RS analysis effectiveness varies with the carrier image's natural LSB distribution. Higher bits-per-channel settings make signatures more pronounced. |
+
+---
+
+## Steganalysis
+
+The `detect` command runs two complementary statistical tests against the image's LSB distribution.
+
+### Chi-square test
+
+Compares the histogram of pixel value pairs `(2k, 2k+1)` per channel. In a natural image these pairs are unequal; LSB embedding equalises them. A high p-value (> 0.05) for a channel is flagged as suspicious.
+
+**Performance:** correctly identifies which channels were written to. On a real photo encoded at full capacity with R+G+B, all three channels are flagged; untouched channels remain at p ≈ 0.0000.
+
+### RS analysis
+
+Measures local pixel smoothness using regular (`R`) and singular (`S`) group fractions under a positive and a negative flipping mask. LSB embedding biases `Rm` above `Rnm`; a positive asymmetry (`Rm − Rnm > 0.01`) is flagged as suspicious.
+
+**Performance:** reliable on natural photographs where the clean baseline asymmetry is near zero. On images whose natural LSB distribution is already skewed (e.g. heavily processed or synthetic images), the clean asymmetry may be deeply negative and encoding moves it toward zero rather than above the threshold — in which case chi-square remains the primary signal.
+
+### Verdict thresholds
+
+| Suspicious count | Verdict |
+|---|---|
+| 0 | `CLEAN` |
+| 1 – (n−1) | `SUSPICIOUS` |
+| all n | `LIKELY_STEGO` |
+
+`n` = number of test×channel combinations (6 for a 3-channel image).
 
 ---
 
