@@ -1,7 +1,7 @@
 # Steg — Technical Specification
 
-**Version:** v1 (post `fix/security`)
-**Date:** 2026-02-21
+**Version:** v2 (post security hardening)
+**Date:** 2026-03-07
 
 ---
 
@@ -76,11 +76,12 @@ All layers below `steg.Encode/Decode` are unaware of each other's existence and 
 A single Argon2id call produces all cryptographic material from the password:
 
 ```
-derived = Argon2id(password, appSalt, time=1, memory=64 MiB, threads=4, length=56)
+derived = Argon2id(password, appSalt, time=1, memory=64 MiB, threads=4, length=60)
 
-seed   = int64( BigEndian(derived[0:8]) )   // RNG cursor seed
-encKey = derived[8:24]                       // 16-byte AES-128 key
-macKey = derived[24:56]                      // 32-byte HMAC-SHA256 key
+seed      = int64( BigEndian(derived[0:8])  )  // RNG cursor seed
+encKey    = derived[8:24]                       // 16-byte AES-128 key
+macKey    = derived[24:56]                      // 32-byte HMAC-SHA256 key
+kdfNonce  = BigEndian.Uint32(derived[56:60])   // bootstrap cipher nonce
 ```
 
 **Parameters:**
@@ -92,9 +93,9 @@ macKey = derived[24:56]                      // 32-byte HMAC-SHA256 key
 | Memory | 64 MiB | Memory-hardness as the primary brute-force deterrent |
 | Parallelism | 4 | Matches common core counts; increases attacker cost |
 | Salt | `"github.com/pableeee/steg/v1"` (fixed) | Domain separator; memory-hardness compensates for the lack of randomness |
-| Output length | 56 bytes | 8 (seed) + 16 (AES key) + 32 (MAC key) |
+| Output length | 60 bytes | 8 (seed) + 16 (AES key) + 32 (MAC key) + 4 (bootstrap nonce) |
 
-The seed, encryption key, and MAC key are derived from the same password in a single pass, so they are cryptographically independent — learning one gives no information about the others.
+All four values are derived from the same password in a single pass and are cryptographically independent — learning one gives no information about the others.
 
 ---
 
@@ -190,7 +191,7 @@ Note: within each keystream byte, bits are consumed LSB-first.
 
 ### Seeking
 
-`Seek` computes the target block counter from the requested bit position and refreshes the block if necessary. This allows the orchestration layer to skip over the plaintext nonce bytes by seeking the cipher to bit 32 before beginning encryption, keeping the cipher position synchronized with the cursor position.
+`Seek` computes the target block counter from the requested bit position and refreshes the block if necessary. This allows the orchestration layer to position the cipher at bit 32 after the bootstrap write so that the payload cipher's keystream byte 0 aligns with on-image byte 4 (the first byte of the container length field).
 
 ---
 
@@ -276,17 +277,31 @@ The `hashFn` parameter is `hash.Hash`. During encode and decode this is always `
 Bits are stored in the order the `RNGCursor` produces them (pseudorandom pixel sequence, green channel before blue channel within each pixel).
 
 ```
-Bit offset    Size        Encryption   Content
-──────────────────────────────────────────────────────────────────────
-0             32 bits     Plaintext    Nonce (uint32, big-endian)
-32            32 bits     AES-128-CTR  Payload length (uint32, little-endian)
-64            N×8 bits    AES-128-CTR  Payload bytes
-64 + N×8      256 bits    AES-128-CTR  HMAC-SHA256 tag (32 bytes)
+Bit offset           Size        Cipher                  Content
+────────────────────────────────────────────────────────────────────────────────
+0                    32 bits     AES-128-CTR (bootstrap) Per-encode random nonce
+32                   32 bits     AES-128-CTR (payload)   Container length (uint32, LE)
+64                   32 bits     AES-128-CTR (payload)   Real payload length (uint32, LE)
+96                   N×8 bits    AES-128-CTR (payload)   Real payload bytes
+96 + N×8             P×8 bits    AES-128-CTR (payload)   Random padding (fills to capacity)
+96 + (N+P)×8         256 bits    AES-128-CTR (payload)   HMAC-SHA256 tag (32 bytes)
 ```
 
-**Total bits used:** `32 + 32 + N×8 + 256 = 320 + N×8`
+**Total bits used:** always exactly `W × H × channels × bitsPerChannel` — the full image
+capacity is written on every encode regardless of payload size.
 
-The nonce region is written before the cipher is initialized and read back before the cipher is initialized during decode. The cipher is then seeked past bit 32, so that keystream bit 0 corresponds to on-image bit 32 (the first bit of the encrypted length field). The cipher and cursor positions remain synchronized throughout.
+Two AES-128-CTR cipher instances are used:
+
+- **Bootstrap cipher** — `AES-CTR(encKey, kdfNonce)` encrypts only the 4-byte random
+  nonce at bits 0–31. `kdfNonce` is fixed per password (KDF-derived). No plaintext
+  appears at any position.
+- **Payload cipher** — `AES-CTR(encKey, randomNonce)` encrypts everything from bit 32
+  onwards. `randomNonce` is `crypto/rand`-generated and differs on every encode,
+  giving a unique keystream even when the same password and carrier are reused.
+
+The payload cipher is seeked to bit 32 before the container layer begins, so payload
+cipher keystream byte 0 aligns with on-image byte 4. The cipher and cursor positions
+remain synchronized throughout.
 
 ---
 
@@ -295,32 +310,37 @@ The nonce region is written before the cipher is initialized and read back befor
 ```
 steg.Encode(img draw.Image, pass []byte, payload io.Reader, bitsPerChannel, channels int)
 
-1.  deriveKeys(pass) → seed, encKey, macKey
+1.  deriveKeys(pass) → seed, encKey, macKey, kdfNonce
 
-2.  cur = NewRNGCursor(img, cursorOptions(seed, bitsPerChannel, channels)...)
-        Generates Fisher-Yates-shuffled pixel sequence with the configured channels
-        and bits per channel.
+2.  realPayload = io.ReadAll(payload)
+    padded = buildPaddedPayload(img, realPayload, bitsPerChannel, channels)
+        Layout: [4B real-length LE][real-payload][crypto/rand padding]
+        Size:   imageCapacity + 4 bytes (fills the image to capacity)
 
-3.  nonceBuf = crypto/rand.Read(4)
-    nonce = BigEndian.Uint32(nonceBuf)
+3.  cur = NewRNGCursor(img, cursorOptions(seed, bitsPerChannel, channels)...)
 
-4.  rawAdapter = CursorAdapter(cur)
-    rawAdapter.Write(nonceBuf)
-        Writes 4 bytes (32 bits) of nonce into the first pixel positions
-        of the shuffled sequence, in plaintext.
+4.  randomNonce = crypto/rand.Read(4)
+    bootstrapCipher = cipher.NewCipher(kdfNonce, encKey)
+    bootstrapAdapter = CursorAdapter(CipherMiddleware(cur, bootstrapCipher))
+    bootstrapAdapter.Write(randomNonce)
+        Encrypts randomNonce with the bootstrap cipher and writes the 4-byte
+        ciphertext to image bytes 0–3. No plaintext appears on the image.
 
-5.  c = cipher.NewCipher(nonce, encKey)
-    cm = CipherMiddleware(cur, c)
-    cm.Seek(32, SeekStart)
-        Advances both cipher and cursor past the 32 nonce bits so
-        keystream position 0 aligns with on-image bit 32.
+5.  payloadCipher = cipher.NewCipher(randomNonce, encKey)
+    payloadCM = CipherMiddleware(cur, payloadCipher)
+    payloadCM.Seek(32, SeekStart)
+        Advances cursor to bit 32 (byte 4) and aligns payloadCipher
+        keystream so byte 0 of the cipher corresponds to on-image byte 4.
 
-6.  adapter = CursorAdapter(cm)
+6.  adapter = CursorAdapter(payloadCM)
     mac = hmac.New(sha256.New, macKey)
-    container.WritePayload(adapter, payload, mac)
-        Writes: [encrypted length][encrypted payload][encrypted HMAC tag]
+    container.WritePayload(adapter, bytes.NewReader(padded), mac)
+        Writes: [encrypted container-length][encrypted padded block][encrypted HMAC]
+        container-length field lands at on-image bytes 4–7.
+        padded block starts at on-image byte 8.
 
-7.  png.Encode(outputFile, img)
+7.  cur.Flush()
+    png.Encode(outputFile, img)
 ```
 
 ---
@@ -330,26 +350,33 @@ steg.Encode(img draw.Image, pass []byte, payload io.Reader, bitsPerChannel, chan
 ```
 steg.Decode(img draw.Image, pass []byte, bitsPerChannel, channels int) → []byte
 
-1.  deriveKeys(pass) → seed, encKey, macKey
+1.  deriveKeys(pass) → seed, encKey, macKey, kdfNonce
 
 2.  cur = NewRNGCursor(img, cursorOptions(seed, bitsPerChannel, channels)...)
         Reproduces the identical shuffled pixel sequence with identical channel/bit
         configuration (must match the values used during encode).
 
-3.  rawAdapter = CursorAdapter(cur)
-    io.ReadFull(rawAdapter, nonceBuf[0:4])
-    nonce = BigEndian.Uint32(nonceBuf)
-        Reads the 4 plaintext nonce bytes from the same first pixel positions.
+3.  bootstrapCipher = cipher.NewCipher(kdfNonce, encKey)
+    bootstrapAdapter = CursorAdapter(CipherMiddleware(cur, bootstrapCipher))
+    io.ReadFull(bootstrapAdapter, rawNonce[0:4])
+    randomNonce = BigEndian.Uint32(rawNonce)
+        Decrypts on-image bytes 0–3 with the bootstrap cipher to recover
+        the per-encode random nonce.
 
-4.  c = cipher.NewCipher(nonce, encKey)
-    cm = CipherMiddleware(cur, c)
-    cm.Seek(32, SeekStart)
+4.  payloadCipher = cipher.NewCipher(randomNonce, encKey)
+    payloadCM = CipherMiddleware(cur, payloadCipher)
+    payloadCM.Seek(32, SeekStart)
 
-5.  adapter = CursorAdapter(cm)
+5.  adapter = CursorAdapter(payloadCM)
     mac = hmac.New(sha256.New, macKey)
-    container.ReadPayload(adapter, mac)
-        Reads and decrypts length, payload, and tag; verifies HMAC.
-        Returns error if tag does not match (wrong password or tampering).
+    padded = container.ReadPayload(adapter, mac)
+        Reads and decrypts container-length, padded block, and HMAC tag;
+        verifies HMAC. Returns error if tag does not match (wrong password
+        or any tampering).
+
+6.  return extractRealPayload(padded)
+        Reads the 4-byte real-length prefix from padded, returns
+        padded[4 : 4+realLen]. Padding is discarded.
 ```
 
 ---
@@ -359,19 +386,21 @@ steg.Decode(img draw.Image, pass []byte, bitsPerChannel, channels int) → []byt
 | Quantity | Formula |
 |----------|---------|
 | Total carrier bits | `W × H × channels × bitsPerChannel` |
-| Overhead (nonce + length + tag) | `32 + 32 + 256 = 320 bits = 40 bytes` |
-| Maximum payload | `max(0, floor(W × H × channels × bitsPerChannel / 8) − 40)` bytes |
+| Total carrier bytes | `W × H × channels × bitsPerChannel / 8` |
+| Overhead | 44 bytes: 4 (enc nonce) + 4 (container length) + 4 (real-length prefix) + 32 (HMAC) |
+| Maximum real payload | `max(0, floor(W × H × channels × bitsPerChannel / 8) − 44)` bytes |
 
 Example capacities at the default CLI settings (3 channels, 1 bit/channel):
 
 | Image | Pixels | Max payload |
 |-------|--------|-------------|
-| 100 × 100 | 10,000 | ~3,710 bytes (~3.6 KB) |
-| 500 × 500 | 250,000 | ~93,710 bytes (~91.5 KB) |
-| 1920 × 1080 | 2,073,600 | ~777,560 bytes (~759 KB) |
-| 3840 × 2160 | 8,294,400 | ~3,110,360 bytes (~2.97 MB) |
+| 100 × 100 | 10,000 | ~3,706 bytes (~3.6 KB) |
+| 500 × 500 | 250,000 | ~93,706 bytes (~91.5 KB) |
+| 1920 × 1080 | 2,073,600 | ~777,556 bytes (~759 KB) |
+| 3840 × 2160 | 8,294,400 | ~3,110,356 bytes (~2.97 MB) |
 
-The `steg capacity -i <image>` command prints a 3×4 table covering all channel and bits-per-channel combinations for a given image.
+The `steg capacity -i <image>` command prints a 3×4 table covering all channel and
+bits-per-channel combinations for a given image.
 
 ---
 
@@ -381,15 +410,40 @@ The `steg capacity -i <image>` command prints a 3×4 table covering all channel 
 
 Using the password-derived seed as the RNG seed means an attacker who does not know the password cannot locate which pixels carry data. This is security-through-obscurity and is not a cryptographic guarantee, but it does raise the practical bar: even if AES were broken, the attacker would need to brute-force the seed before they could read anything.
 
-### Nonce from `crypto/rand`, stored in plaintext
+### Encrypted nonce — two-cipher bootstrap scheme
 
-The nonce must be recoverable at decode time without out-of-band communication. Storing it in plaintext in the first 32 bits of the pixel sequence is the simplest solution. Because `crypto/rand` is used, each encode operation produces a unique nonce even when the same carrier and password are reused, preventing keystream reuse.
+The per-encode nonce must be recoverable at decode time without out-of-band communication.
+Writing it in plaintext (earlier design) created a fixed-position anchor detectable by
+statistical analysis, and was replaced by the following scheme:
 
-A consequence is that encoding the same payload into the same carrier twice produces two different output images (nonces differ), which is the correct behavior.
+1. A KDF-derived `kdfNonce` (bytes 56–59 of Argon2id output) is fixed per password.
+2. A `crypto/rand` `randomNonce` is generated on every encode.
+3. `randomNonce` is encrypted with `AES-CTR(encKey, kdfNonce)` and written to image
+   bytes 0–3. This looks identical to any other ciphertext on the image.
+4. The payload cipher uses `AES-CTR(encKey, randomNonce)` — unique per encode.
 
-### Three-way key split from a single Argon2id call
+On decode, the bootstrap cipher (`kdfNonce`) decrypts bytes 0–3 to recover `randomNonce`,
+then the payload cipher is reconstructed from it.
 
-Argon2id is memory-hard and slow by design, so calling it three times (once per derived value) would triple the key-derivation cost for the legitimate user. Producing 56 bytes in a single call and slicing them into seed, encryption key, and MAC key is standard practice and does not weaken the derivation.
+This design provides:
+- **No plaintext on the image** — even the nonce is encrypted.
+- **Per-encode keystream uniqueness** — `randomNonce` differs every time, so two encodes
+  with the same password never share a keystream.
+- **No stego marker** — the 4 encrypted nonce bytes are indistinguishable from the rest
+  of the ciphertext.
+
+The bootstrap cipher's keystream bytes 0–3 are fixed per password, but they always
+encrypt a different `crypto/rand` value, so the ciphertext changes on every encode.
+
+A consequence is that encoding the same payload into the same carrier twice produces two
+different output images (nonces differ), which is the correct behavior.
+
+### Four-way key split from a single Argon2id call
+
+Argon2id is memory-hard and slow by design, so calling it once per derived value would
+multiply the key-derivation cost for the legitimate user. Producing 60 bytes in a single
+call and slicing them into seed, encryption key, MAC key, and bootstrap nonce is standard
+practice and does not weaken the derivation.
 
 ### HMAC-SHA256 as the authentication tag
 
@@ -421,5 +475,6 @@ The Fisher-Yates shuffle uses Go's `math/rand` (a pseudo-random number generator
 | Fixed application salt | Low | A per-image random salt would be marginally stronger; not implemented to avoid header bootstrapping complexity. |
 | No streaming decode | Medium | `ReadPayload` allocates the full payload in memory before returning it. Very large payloads may cause high memory usage. |
 | Lossy formats unsupported | High | JPEG and other lossy formats destroy LSB data. Only lossless formats (PNG, BMP, TIFF) are supported. |
-| No integrity check on the nonce | Low | The 4-byte nonce is stored in plaintext without any MAC. An active attacker who can flip bits in the nonce region would change the keystream used for decryption, causing a MAC failure rather than silent data corruption — the correct outcome — but the failure message does not distinguish nonce tampering from key error. |
-| Statistical steganalysis | Medium | Modifying the LSBs of color channels across a pseudorandom pixel set produces a detectable statistical signature. Higher `--bits-per-channel` settings increase the deviation from a natural image distribution. |
+| Bootstrap cipher keystream reuse | Info | The bootstrap cipher uses `(encKey, kdfNonce)` — fixed per password — consuming keystream bytes 0–3 on every encode. Since the plaintext (crypto/rand) is different each time, the ciphertext differs; no information about the nonce or key is exposed. |
+| Nonce tampering | Low | Flipping bits in the encrypted nonce region (bytes 0–3) corrupts the recovered `randomNonce`, causing the payload cipher to differ from encode, which cascades to an HMAC failure. The correct outcome — tampering is detected — but the error message does not distinguish nonce tampering from a wrong password. |
+| Statistical steganalysis | Low (mitigated) | Every encode writes the full image capacity regardless of payload size, making payload-size estimation from statistical analysis infeasible. The built-in `steg detect` command implements chi-square and RS analysis to surface residual LSB signatures. Higher `--bits-per-channel` settings increase the statistical deviation. |
