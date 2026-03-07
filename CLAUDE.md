@@ -25,27 +25,27 @@ make mocks
 ### Core pipeline (encode direction)
 
 ```
-Password → Argon2id → seed (8 B) + encKey (16 B) + macKey (32 B)
+Password → Argon2id → seed (8 B) + encKey (16 B) + macKey (32 B) + nonce (4 B)
                 ↓
         seed → RNGCursor (Fisher-Yates shuffled pixel order)
                 ↓
-        crypto/rand → 4-byte nonce written plaintext to first pixel positions
-                ↓
-        CipherMiddleware (AES-128 CTR, nonce + encKey, cursor seeked past nonce bytes)
+        CipherMiddleware (AES-128 CTR, KDF-derived nonce + encKey; starts at bit 0)
                 ↓
         CursorAdapter (bit-level cursor → io.ReadWriteSeeker)
                 ↓
-        container.WritePayload → [encrypted length][encrypted payload][encrypted HMAC-SHA256(macKey)]
+        buildPaddedPayload → [4B real-length][real-payload][random padding] (fills image capacity)
+                ↓
+        container.WritePayload → [encrypted container-length][encrypted padded block][encrypted HMAC-SHA256(macKey)]
 ```
 
-On-image layout: `[4-byte nonce (plaintext)] [encrypted 4-byte length] [encrypted payload] [encrypted 32-byte HMAC-SHA256 tag]`
+On-image layout: `[encrypted 4-byte container-length] [encrypted 4-byte real-length] [encrypted real-payload] [encrypted padding] [encrypted 32-byte HMAC-SHA256 tag]`
 
-Decoding reverses the pipeline: reads the 4-byte nonce plaintext, reconstructs the same cursor/cipher stack, then reads and verifies the payload via `container.ReadPayload`.
+Decoding reverses the pipeline: reconstructs the cursor/cipher stack entirely from KDF output (no plaintext on the image), reads and verifies the padded block via `container.ReadPayload`, then strips the 4-byte real-length prefix via `extractRealPayload`.
 
 ### Package responsibilities
 
-- **`steg/`** — Top-level encode/decode orchestration; `steg.go` derives a deterministic `int64` seed, 16-byte AES key, and 32-byte MAC key from the password via Argon2id (`deriveKeys`).
-- **`steg/container/`** — Payload framing. Writes `[encrypted 4-byte length][encrypted payload][encrypted HMAC-SHA256 tag]` after the plaintext nonce. On read, verifies the HMAC-SHA256 tag keyed with `macKey`; a wrong password causes tag verification failure.
+- **`steg/`** — Top-level encode/decode orchestration; `steg.go` derives seed, encKey, macKey, and nonce from Argon2id (`deriveKeys`); `buildPaddedPayload` / `extractRealPayload` handle full-capacity padding.
+- **`steg/container/`** — Payload framing. Writes `[encrypted 4-byte length][encrypted data][encrypted HMAC-SHA256 tag]`. On read, verifies the HMAC-SHA256 tag keyed with `macKey`; a wrong password causes tag verification failure.
 - **`cursors/`** — Three components that compose:
   - `rng_cursor.go`: Fisher-Yates shuffled pixel traversal using the seed; exposes bit-level `Read/WriteBit`.
   - `adapter.go`: Converts the bit-level `Cursor` interface into `io.ReadWriteSeeker` (bytes, MSB-first).
@@ -63,12 +63,3 @@ The `cursorOptions(seed, bitsPerChannel, channels)` helper in `steg/steg.go` bui
 
 Chunk alignment for parallel operation: `lcm(8 bits/byte, channels × bitsPerChannel bits/pixel) / 8` bytes per aligned chunk boundary. With defaults (3 channels, 1 bit/ch) this is 3 bytes = 8 pixels; values change with different settings.
 
-## Pending security work
-
-### 2. Plaintext nonce as a stego presence marker
-The 4-byte nonce is written plaintext to the first 4 cursor positions (specific pixels determined by the Fisher-Yates shuffle seeded from the password). These bytes come from `crypto/rand` and are uncorrelated with image content. An attacker who knows the code and suspects steganography could test: "do the LSBs at these known-position pixels look uniformly random?" as a cheap presence test — even without the password.
-**Mitigation**: derive the nonce from the Argon2id output (add a 4-byte nonce slice) instead of storing a plaintext random nonce. This removes the one fixed-position plaintext anchor entirely.
-
-### 3. Full-image LSB disturbance for large payloads
-For large payloads, the Fisher-Yates shuffle touches most or all pixels, globally disturbing the LSB distribution across the image. Statistical detectors (chi-square, RS analysis, SPA) become more effective as payload size approaches capacity.
-**Mitigation**: pad the payload to full capacity so the LSB distribution is uniformly and consistently disturbed regardless of actual payload size (removes the payload-size signal).

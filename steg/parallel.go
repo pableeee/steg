@@ -2,7 +2,6 @@ package steg
 
 import (
 	"crypto/hmac"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
@@ -57,7 +56,18 @@ func newWorkerStack(m draw.Image, nonce uint32, encKey []byte,
 // The on-image layout is identical to Encode, so DecodeParallel and Decode
 // can both decode images written by EncodeParallel (and vice-versa).
 func EncodeParallel(m draw.Image, pass []byte, r io.Reader, bitsPerChannel, channels int) error {
-	seed, encKey, macKey, err := deriveKeys(pass)
+	seed, encKey, macKey, nonce, err := deriveKeys(pass)
+	if err != nil {
+		return err
+	}
+
+	// Buffer the full payload to build the padded block. Padding must be known
+	// before dispatch so every encode writes the full image capacity.
+	realPayload, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	padded, err := buildPaddedPayload(m, realPayload, bitsPerChannel, channels)
 	if err != nil {
 		return err
 	}
@@ -65,35 +75,15 @@ func EncodeParallel(m draw.Image, pass []byte, r io.Reader, bitsPerChannel, chan
 	bounds := m.Bounds()
 	points := cursors.GenerateSequence(bounds.Max.X, bounds.Max.Y, seed)
 
-	// Minimum chunk alignment: lcm(8 bits/byte, channels*bitsPerChannel bits/pixel) / 8 bytes.
 	alignment := lcmBytes(8, channels*bitsPerChannel)
 	chunkSize := alignment * 1024
 
-	// Write 4-byte nonce plaintext via raw (unencrypted) cursor.
-	rawOpts := []cursors.Option{cursors.WithSharedPoints(points), cursors.WithBitsPerChannel(bitsPerChannel)}
-	if channels >= 2 {
-		rawOpts = append(rawOpts, cursors.UseGreenBit())
-	}
-	if channels >= 3 {
-		rawOpts = append(rawOpts, cursors.UseBlueBit())
-	}
-	rawCur := cursors.NewRNGCursor(m, rawOpts...)
-	nonceBuf := make([]byte, 4)
-	if _, err = rand.Read(nonceBuf); err != nil {
-		return err
-	}
-	nonce := binary.BigEndian.Uint32(nonceBuf)
-	rawAdapter := cursors.CursorAdapter(rawCur)
-	if _, err = rawAdapter.Write(nonceBuf); err != nil {
-		return err
-	}
-	// Flush write-back cache: the nonce write may have left a partially-modified
-	// pixel in rawCur that hasn't been committed to the image yet.
-	rawCur.Flush()
+	// Pre-compute HMAC over the full padded block before dispatching workers.
+	hashFn := hmac.New(sha256.New, macKey)
+	hashFn.Write(padded)
+	tag := hashFn.Sum(nil)
 
-	// Shared mutex: serialises img.At()/img.Set() across concurrent workers so
-	// that adjacent-pixel writes (which share an 8-byte race-detector shadow word)
-	// are not flagged as data races. Cipher/CPU work happens outside the lock.
+	// Shared mutex serialises img.At()/img.Set() across concurrent workers.
 	imgMu := &sync.Mutex{}
 
 	numWorkers := runtime.GOMAXPROCS(0)
@@ -120,58 +110,43 @@ func EncodeParallel(m draw.Image, pass []byte, r io.Reader, bitsPerChannel, chan
 					return
 				}
 			}
-			// Flush write-back cache: last job may have left a dirty pixel.
-			// Seek(0) flushes via RNGCursor.Seek without disturbing other workers.
+			// Flush write-back cache via a no-op seek.
 			if _, ferr := adapter.Seek(0, io.SeekStart); ferr != nil {
 				errChan <- ferr
 			}
 		}()
 	}
 
-	// Stream input, feed workers, accumulate HMAC.
-	hashFn := hmac.New(sha256.New, macKey)
-	var totalLen int64
-	buf := make([]byte, chunkSize)
-	var dispatchErr error
-	for {
-		n, readErr := io.ReadFull(r, buf)
-		if n > 0 {
-			hashFn.Write(buf[:n])
-			chunk := make([]byte, n)
-			copy(chunk, buf[:n])
-			// streamOffset: skip 4-byte nonce + 4-byte length = byte 8.
-			jobChan <- encJob{streamOffset: 8 + totalLen, data: chunk}
-			totalLen += int64(n)
+	// Dispatch padded data in aligned chunks. streamOffset skips the 4-byte
+	// container length field, which is written in the sequential post-pass.
+	totalLen := int64(len(padded))
+	var offset int64
+	for offset < totalLen {
+		end := offset + int64(chunkSize)
+		if end > totalLen {
+			end = totalLen
 		}
-		if readErr == io.EOF || readErr == io.ErrUnexpectedEOF {
-			break
-		}
-		if readErr != nil {
-			dispatchErr = readErr
-			break
-		}
+		chunk := make([]byte, end-offset)
+		copy(chunk, padded[offset:end])
+		jobChan <- encJob{streamOffset: 4 + offset, data: chunk}
+		offset = end
 	}
 	close(jobChan)
 	wg.Wait()
 
-	if dispatchErr != nil {
-		return dispatchErr
-	}
 	select {
 	case werr := <-errChan:
 		return werr
 	default:
 	}
 
-	// Post-parallel sequential writes: length field (byte 4) and HMAC tag.
-	// No imgMu needed — all concurrent workers have finished (wg.Wait returned).
+	// Post-parallel sequential writes: length field (byte 0) and HMAC tag.
 	seqAdapter, err := newWorkerStack(m, nonce, encKey, points, bitsPerChannel, channels, nil)
 	if err != nil {
 		return err
 	}
 
-	// Write encrypted 4-byte LE length at byte offset 4.
-	if _, err = seqAdapter.Seek(4, io.SeekStart); err != nil {
+	if _, err = seqAdapter.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
 	lenBuf := make([]byte, 4)
@@ -180,15 +155,12 @@ func EncodeParallel(m draw.Image, pass []byte, r io.Reader, bitsPerChannel, chan
 		return err
 	}
 
-	// Write encrypted 32-byte HMAC tag immediately after payload.
-	if _, err = seqAdapter.Seek(8+totalLen, io.SeekStart); err != nil {
+	if _, err = seqAdapter.Seek(4+totalLen, io.SeekStart); err != nil {
 		return err
 	}
-	tag := hashFn.Sum(nil)
 	if _, err = seqAdapter.Write(tag); err != nil {
 		return err
 	}
-	// Flush write-back cache on seqAdapter via a no-op seek.
 	_, err = seqAdapter.Seek(0, io.SeekStart)
 	return err
 }
@@ -196,7 +168,7 @@ func EncodeParallel(m draw.Image, pass []byte, r io.Reader, bitsPerChannel, chan
 // DecodeParallel decodes a message from m using a parallel worker pool.
 // Images encoded by Encode (sequential) are fully compatible.
 func DecodeParallel(m draw.Image, pass []byte, bitsPerChannel, channels int) ([]byte, error) {
-	seed, encKey, macKey, err := deriveKeys(pass)
+	seed, encKey, macKey, nonce, err := deriveKeys(pass)
 	if err != nil {
 		return nil, err
 	}
@@ -204,28 +176,12 @@ func DecodeParallel(m draw.Image, pass []byte, bitsPerChannel, channels int) ([]
 	bounds := m.Bounds()
 	points := cursors.GenerateSequence(bounds.Max.X, bounds.Max.Y, seed)
 
-	// Read 4-byte nonce plaintext via raw cursor.
-	rawOpts := []cursors.Option{cursors.WithSharedPoints(points), cursors.WithBitsPerChannel(bitsPerChannel)}
-	if channels >= 2 {
-		rawOpts = append(rawOpts, cursors.UseGreenBit())
-	}
-	if channels >= 3 {
-		rawOpts = append(rawOpts, cursors.UseBlueBit())
-	}
-	rawCur := cursors.NewRNGCursor(m, rawOpts...)
-	rawAdapter := cursors.CursorAdapter(rawCur)
-	nonceBuf := make([]byte, 4)
-	if _, err = io.ReadFull(rawAdapter, nonceBuf); err != nil {
-		return nil, err
-	}
-	nonce := binary.BigEndian.Uint32(nonceBuf)
-
-	// Read encrypted 4-byte length sequentially (cipher at byte offset 4).
+	// Read the 4-byte container length field at byte offset 0.
 	seqAdapter, err := newWorkerStack(m, nonce, encKey, points, bitsPerChannel, channels, nil)
 	if err != nil {
 		return nil, err
 	}
-	if _, err = seqAdapter.Seek(4, io.SeekStart); err != nil {
+	if _, err = seqAdapter.Seek(0, io.SeekStart); err != nil {
 		return nil, err
 	}
 	lenBuf := make([]byte, 4)
@@ -234,7 +190,7 @@ func DecodeParallel(m draw.Image, pass []byte, bitsPerChannel, channels int) ([]
 	}
 	payloadLen := int64(binary.LittleEndian.Uint32(lenBuf))
 
-	// Allocate buffer for payload + HMAC tag.
+	// Allocate buffer for padded data + HMAC tag.
 	totalRemaining := payloadLen + 32
 	decryptedBuf := make([]byte, totalRemaining)
 
@@ -269,7 +225,7 @@ func DecodeParallel(m draw.Image, pass []byte, bitsPerChannel, channels int) ([]
 		}()
 	}
 
-	// Dispatch aligned chunks (all but last must be multiple of alignment bytes).
+	// Dispatch aligned chunks; streamOffset skips the 4-byte length field.
 	var offset int64
 	for offset < totalRemaining {
 		size := chunkSize
@@ -277,7 +233,7 @@ func DecodeParallel(m draw.Image, pass []byte, bitsPerChannel, channels int) ([]
 			size = totalRemaining - offset
 		}
 		dest := decryptedBuf[offset : offset+size]
-		jobChan <- decJob{streamOffset: 8 + offset, dest: dest}
+		jobChan <- decJob{streamOffset: 4 + offset, dest: dest}
 		offset += size
 	}
 	close(jobChan)
@@ -289,13 +245,13 @@ func DecodeParallel(m draw.Image, pass []byte, bitsPerChannel, channels int) ([]
 	default:
 	}
 
-	// Verify HMAC tag.
-	hashFn := hmac.New(sha256.New, macKey)
-	hashFn.Write(decryptedBuf[:payloadLen])
-	expected := hashFn.Sum(nil)
+	// Verify HMAC over the full padded block.
+	mac := hmac.New(sha256.New, macKey)
+	mac.Write(decryptedBuf[:payloadLen])
+	expected := mac.Sum(nil)
 	if !hmac.Equal(expected, decryptedBuf[payloadLen:]) {
 		return nil, fmt.Errorf("checksum validation failed")
 	}
 
-	return decryptedBuf[:payloadLen], nil
+	return extractRealPayload(decryptedBuf[:payloadLen])
 }

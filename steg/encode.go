@@ -1,10 +1,9 @@
 package steg
 
 import (
+	"bytes"
 	"crypto/hmac"
-	"crypto/rand"
 	"crypto/sha256"
-	"encoding/binary"
 	"image/draw"
 	"io"
 
@@ -14,46 +13,38 @@ import (
 )
 
 func Encode(m draw.Image, pass []byte, r io.Reader, bitsPerChannel, channels int) error {
-	seed, encKey, macKey, err := deriveKeys(pass)
+	seed, encKey, macKey, nonce, err := deriveKeys(pass)
+	if err != nil {
+		return err
+	}
+
+	// Buffer the full payload to build the padded data block. Padding fills the
+	// image to capacity on every encode, removing the payload-size signal from
+	// LSB statistics.
+	realPayload, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	padded, err := buildPaddedPayload(m, realPayload, bitsPerChannel, channels)
 	if err != nil {
 		return err
 	}
 
 	cur := cursors.NewRNGCursor(m, cursorOptions(seed, bitsPerChannel, channels)...)
 
-	// Generate a cryptographically random nonce and write it as the first 4
-	// bytes (32 bits) of the pixel sequence in plaintext. Decode reads these
-	// same bits to reconstruct the nonce, so each encode with the same carrier
-	// and password produces a unique keystream.
-	nonceBuf := make([]byte, 4)
-	if _, err = rand.Read(nonceBuf); err != nil {
-		return err
-	}
-	nonce := binary.BigEndian.Uint32(nonceBuf)
-
-	rawAdapter := cursors.CursorAdapter(cur)
-	if _, err = rawAdapter.Write(nonceBuf); err != nil {
-		return err
-	}
-
+	// Nonce is derived from the KDF output — no plaintext bytes are written to
+	// the image before the cipher starts.
 	c, err := cipher.NewCipher(nonce, encKey)
 	if err != nil {
 		return err
 	}
 
-	// Wrap the same cursor in cipher middleware and sync cipher counter to bit 32.
 	cm := cursors.CipherMiddleware(cur, c)
-	if _, err = cm.Seek(32, io.SeekStart); err != nil {
-		return err
-	}
-
 	adapter := cursors.CursorAdapter(cm)
 	mac := hmac.New(sha256.New, macKey)
-	if err = container.WritePayload(adapter, r, mac); err != nil {
+	if err = container.WritePayload(adapter, bytes.NewReader(padded), mac); err != nil {
 		return err
 	}
-	// Flush the write-back pixel cache: the last pixel modified by WritePayload
-	// may not have been committed to the image yet.
 	cur.Flush()
 	return nil
 }
