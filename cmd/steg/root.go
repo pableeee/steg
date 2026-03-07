@@ -254,14 +254,15 @@ func runDecode() error {
 }
 
 // imageCapacity returns the usable byte capacity for the given image dimensions,
-// channel count, and bits per channel. The 40-byte overhead covers the 4-byte
-// container-length field, 4-byte embedded real-length prefix, and 32-byte HMAC tag.
+// channel count, and bits per channel. The 44-byte overhead covers the 4-byte
+// encrypted nonce, 4-byte container-length, 4-byte real-length prefix, and
+// 32-byte HMAC tag.
 func imageCapacity(w, h, ch, bpc int) int {
 	total := w * h * ch * bpc / 8
-	if total <= 40 {
+	if total <= 44 {
 		return 0
 	}
-	return total - 40
+	return total - 44
 }
 
 func runCapacity() error {
@@ -295,7 +296,7 @@ func runCapacity() error {
 		fmt.Println()
 	}
 
-	fmt.Println("\nOverhead: 40 B (4 container-length + 4 real-length + 32 HMAC).")
+	fmt.Println("\nOverhead: 44 B (4 enc-nonce + 4 container-length + 4 real-length + 32 HMAC).")
 	return nil
 }
 

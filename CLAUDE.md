@@ -38,9 +38,9 @@ Password → Argon2id → seed (8 B) + encKey (16 B) + macKey (32 B) + nonce (4 
         container.WritePayload → [encrypted container-length][encrypted padded block][encrypted HMAC-SHA256(macKey)]
 ```
 
-On-image layout: `[encrypted 4-byte container-length] [encrypted 4-byte real-length] [encrypted real-payload] [encrypted padding] [encrypted 32-byte HMAC-SHA256 tag]`
+On-image layout: `[encrypted 4-byte nonce] [encrypted 4-byte container-length] [encrypted 4-byte real-length] [encrypted real-payload] [encrypted padding] [encrypted 32-byte HMAC-SHA256 tag]`
 
-Decoding reverses the pipeline: reconstructs the cursor/cipher stack entirely from KDF output (no plaintext on the image), reads and verifies the padded block via `container.ReadPayload`, then strips the 4-byte real-length prefix via `extractRealPayload`.
+Decoding reverses the pipeline: decrypts the 4-byte nonce with the bootstrap cipher (KDF-derived nonce), reconstructs the payload cipher with the recovered random nonce, reads and verifies the padded block via `container.ReadPayload`, then strips the 4-byte real-length prefix via `extractRealPayload`.
 
 ### Package responsibilities
 

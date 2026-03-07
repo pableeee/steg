@@ -60,12 +60,12 @@ func deriveKeys(pass []byte) (seed int64, encKey []byte, macKey []byte, nonce ui
 }
 
 // imageCapacityBytes returns the maximum real payload size for the given image and
-// encoding settings. Overhead is 40 bytes: 4 (container length) + 4 (embedded
-// real-length prefix) + 32 (HMAC-SHA256 tag).
+// encoding settings. Overhead is 44 bytes: 4 (encrypted nonce) + 4 (container
+// length) + 4 (embedded real-length prefix) + 32 (HMAC-SHA256 tag).
 func imageCapacityBytes(m draw.Image, bitsPerChannel, channels int) int {
 	b := m.Bounds()
 	total := b.Dx() * b.Dy() * channels * bitsPerChannel / 8
-	const overhead = 40
+	const overhead = 44
 	if total <= overhead {
 		return 0
 	}

@@ -132,7 +132,7 @@ carrier.png — 1920 × 1080 px
   2 channels (R+G)     506.23 KB       1.01 MB       2.01 MB       4.01 MB
   3 channels (R+G+B)   759.34 KB       1.49 MB       3.02 MB       6.03 MB
 
-Overhead: 40 B (4 nonce + 4 length + 32 HMAC).
+Overhead: 44 B (4 enc-nonce + 4 container-length + 4 real-length + 32 HMAC).
 ```
 
 ### Test Visual
@@ -258,14 +258,15 @@ go test ./steg/ -bench=BenchmarkDecodeBySize -benchtime=3s -benchmem
 | MAC key | Bytes 24–55 of KDF output | 32-byte HMAC-SHA256 key |
 | Stream cipher | AES-128-CTR | Custom bit-addressable CTR; seekable keystream |
 | Authentication | HMAC-SHA256 | Keyed with independent MAC key; constant-time comparison |
-| Nonce | Last 4 bytes of KDF output | Derived alongside the keys; never stored on the image |
+| Per-encode nonce | `crypto/rand` (4 bytes) | Encrypted with bootstrap cipher before writing to image; never stored as plaintext |
+| Bootstrap nonce | Last 4 bytes of KDF output | Fixed per password; used only to encrypt the 4-byte random nonce |
 
 ### Threat model
 
 - **Confidentiality** — AES-128-CTR with a strong KDF-derived key. An attacker without the password sees only pseudorandom bits across a pseudorandomly-ordered set of pixels.
 - **Integrity / authentication** — HMAC-SHA256 over the plaintext payload, encrypted alongside it. A wrong password or any bit-flip in the encrypted region produces a MAC failure; no plaintext is returned.
 - **Resistance to brute force** — Argon2id with 64 MiB memory requirement makes offline dictionary attacks expensive, even on GPU hardware.
-- **Keystream uniqueness** — The nonce is KDF-derived and deterministic for a given password. Keystream reuse is only possible if the same password encodes into the same carrier (typical stego usage rotates the carrier).
+- **Keystream uniqueness** — A fresh `crypto/rand` nonce is generated on every encode and encrypted with the bootstrap cipher before being written to the image. Each encode produces a unique payload keystream, even with the same password and carrier image.
 - **Pixel deniability** — Without the password, an attacker cannot determine which pixels carry data (the traversal order is derived from the password via Argon2id).
 
 ### What steg does not protect against
@@ -280,16 +281,17 @@ go test ./steg/ -bench=BenchmarkDecodeBySize -benchtime=3s -benchmem
 Bits are stored in the shuffled pixel sequence, green channel before blue within each pixel:
 
 ```
-Bit offset           Size        Encryption     Field
-──────────────────────────────────────────────────────────────────────────
-0                    32 bits     AES-128-CTR    Container length (uint32, little-endian)
-32                   32 bits     AES-128-CTR    Real payload length (uint32, little-endian)
-64                   N×8 bits    AES-128-CTR    Real payload bytes
-64 + N×8             P×8 bits    AES-128-CTR    Random padding (fills image to capacity)
-64 + (N+P)×8         256 bits    AES-128-CTR    HMAC-SHA256 tag
+Bit offset           Size        Cipher                  Field
+────────────────────────────────────────────────────────────────────────────────
+0                    32 bits     AES-128-CTR (bootstrap) Per-encode random nonce
+32                   32 bits     AES-128-CTR (payload)   Container length (uint32, LE)
+64                   32 bits     AES-128-CTR (payload)   Real payload length (uint32, LE)
+96                   N×8 bits    AES-128-CTR (payload)   Real payload bytes
+96 + N×8             P×8 bits    AES-128-CTR (payload)   Random padding (fills to capacity)
+96 + (N+P)×8         256 bits    AES-128-CTR (payload)   HMAC-SHA256 tag
 ```
 
-The cipher starts at bit offset 0; the nonce is derived from the Argon2id KDF output and never written to the image. Every encode writes the full image capacity, so the LSB distribution is uniformly disturbed regardless of payload size.
+Two AES-128-CTR cipher instances are used. The **bootstrap cipher** (`AES-CTR(encKey, kdfNonce)`) encrypts only the 4-byte random nonce at bits 0–31 — no plaintext ever appears on the image. The **payload cipher** (`AES-CTR(encKey, randomNonce)`) encrypts everything else starting at bit 32. Every encode generates a fresh `crypto/rand` nonce, giving a unique keystream even when the same password and carrier are reused. Every encode writes the full image capacity, so the LSB distribution is uniformly disturbed regardless of payload size.
 
 ---
 
@@ -406,7 +408,7 @@ Every push to `master` triggers a GitHub Actions workflow that:
 | Fixed application salt | Low | Per-image random Argon2id salt would marginally harden against targeted precomputation; not implemented to avoid bootstrapping complexity. |
 | No streaming decode | Medium | `ReadPayload` allocates the full payload in memory before returning. Very large payloads may cause high memory usage. |
 | Lossy formats unsupported | High | JPEG and other lossy formats destroy LSB data. Only lossless formats (PNG, BMP, TIFF) are supported. |
-| Keystream reuse | Low | The nonce is deterministic for a given (password, KDF-salt) pair. Encoding two different payloads into the same carrier with the same password reuses the keystream. For typical usage (carrier is replaced per message) this is not a concern. |
+| Bootstrap cipher reuse | Info | The bootstrap cipher uses `(encKey, kdfNonce)` — fixed per password — to encrypt the 4-byte random nonce. Its keystream bytes 0–3 are reused across encodes, but always against a different `crypto/rand` plaintext so no useful information is exposed. |
 | Statistical steganalysis | Medium | Modifying the LSBs of color channels across a pseudorandom pixel set produces a detectable statistical signature. The built-in `detect` command uses chi-square and RS analysis to surface this. Chi-square reliably detects full-fill encoding; RS analysis effectiveness varies with the carrier image's natural LSB distribution. Higher bits-per-channel settings make signatures more pronounced. |
 
 ---
