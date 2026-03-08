@@ -47,14 +47,14 @@ func naturalImage(w, h int) *image.RGBA {
 }
 
 // capacity returns the usable byte capacity of a w×h image encoded with 3
-// channels and 1 bit per channel (default steg settings), minus the 44-byte
-// overhead (4 enc-nonce + 4 container-length + 4 real-length + 32 HMAC).
+// channels and 1 bit per channel (default steg settings), minus the 56-byte
+// overhead (16 enc-salt + 4 container-length + 4 real-length + 32 HMAC).
 func capacity(w, h int) int {
 	total := w * h * 3 / 8
-	if total <= 44 {
+	if total <= 56 {
 		return 0
 	}
-	return total - 44
+	return total - 56
 }
 
 // encodeAtFillRate returns a fresh copy of src with a payload encoded at

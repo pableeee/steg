@@ -42,7 +42,7 @@ func TestEncodeDecode(t *testing.T) {
 
 func TestMultiBitRoundTrip(t *testing.T) {
 	pass := []byte("multibit-pass")
-	// 100×100 image: capacity = 100*100*3*N bits / 8 bytes - 40 overhead
+	// 100×100 image: capacity = 100*100*3*N bits / 8 bytes - 56 overhead
 	// At N=1: 3750-40=3710 bytes. 12 bytes fits easily for all N.
 	payload := []byte("hello, world!")
 

@@ -56,7 +56,7 @@ func newWorkerStack(m draw.Image, nonce uint32, encKey []byte,
 // The on-image layout is identical to Encode, so DecodeParallel and Decode
 // can both decode images written by EncodeParallel (and vice-versa).
 func EncodeParallel(m draw.Image, pass []byte, r io.Reader, bitsPerChannel, channels int) error {
-	seed, encKey, macKey, kdfNonce, err := deriveKeys(pass)
+	bsSeed, bsEncKey, bsNonce, err := deriveBootstrapKeys(pass)
 	if err != nil {
 		return err
 	}
@@ -71,9 +71,9 @@ func EncodeParallel(m draw.Image, pass []byte, r io.Reader, bitsPerChannel, chan
 	}
 
 	bounds := m.Bounds()
-	points := cursors.GenerateSequence(bounds.Max.X, bounds.Max.Y, seed)
+	points := cursors.GenerateSequence(bounds.Max.X, bounds.Max.Y, bsSeed)
 
-	// Write encrypted nonce to image bytes 0–3 via the bootstrap cipher.
+	// Write encrypted salt (16 bytes) to image bytes 0–15 via the bootstrap cipher.
 	// This must happen before workers start so they begin at the correct offset.
 	rawOpts := []cursors.Option{cursors.WithSharedPoints(points), cursors.WithBitsPerChannel(bitsPerChannel)}
 	if channels >= 2 {
@@ -83,21 +83,25 @@ func EncodeParallel(m draw.Image, pass []byte, r io.Reader, bitsPerChannel, chan
 		rawOpts = append(rawOpts, cursors.UseBlueBit())
 	}
 	rawCur := cursors.NewRNGCursor(m, rawOpts...)
-	var rawNonce [4]byte
-	if _, err = rand.Read(rawNonce[:]); err != nil {
+	var randomSalt [16]byte
+	if _, err = rand.Read(randomSalt[:]); err != nil {
 		return err
 	}
-	bootstrapCipher, err := cipher.NewCipher(kdfNonce, encKey)
+	bootstrapCipher, err := cipher.NewCipher(bsNonce, bsEncKey)
 	if err != nil {
 		return err
 	}
 	bootstrapAdapter := cursors.CursorAdapter(cursors.CipherMiddleware(rawCur, bootstrapCipher))
-	if _, err = bootstrapAdapter.Write(rawNonce[:]); err != nil {
+	if _, err = bootstrapAdapter.Write(randomSalt[:]); err != nil {
 		return err
 	}
 	rawCur.Flush()
 
-	randomNonce := binary.BigEndian.Uint32(rawNonce[:])
+	// Derive main keys from the random salt.
+	encKey, macKey, payloadNonce, err := deriveMainKeys(pass, randomSalt[:])
+	if err != nil {
+		return err
+	}
 
 	alignment := lcmBytes(8, channels*bitsPerChannel)
 	chunkSize := alignment * 1024
@@ -119,7 +123,7 @@ func EncodeParallel(m draw.Image, pass []byte, r io.Reader, bitsPerChannel, chan
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			adapter, werr := newWorkerStack(m, randomNonce, encKey, points, bitsPerChannel, channels, imgMu)
+			adapter, werr := newWorkerStack(m, payloadNonce, encKey, points, bitsPerChannel, channels, imgMu)
 			if werr != nil {
 				errChan <- werr
 				return
@@ -140,8 +144,8 @@ func EncodeParallel(m draw.Image, pass []byte, r io.Reader, bitsPerChannel, chan
 		}()
 	}
 
-	// Dispatch padded data in aligned chunks. streamOffset skips 4 bytes of
-	// encrypted nonce + 4 bytes of container length field = byte 8.
+	// Dispatch padded data in aligned chunks. streamOffset skips 16 bytes of
+	// encrypted salt + 4 bytes of container length field = byte 20.
 	totalLen := int64(len(padded))
 	var offset int64
 	for offset < totalLen {
@@ -151,7 +155,7 @@ func EncodeParallel(m draw.Image, pass []byte, r io.Reader, bitsPerChannel, chan
 		}
 		chunk := make([]byte, end-offset)
 		copy(chunk, padded[offset:end])
-		jobChan <- encJob{streamOffset: 8 + offset, data: chunk}
+		jobChan <- encJob{streamOffset: 20 + offset, data: chunk}
 		offset = end
 	}
 	close(jobChan)
@@ -163,14 +167,14 @@ func EncodeParallel(m draw.Image, pass []byte, r io.Reader, bitsPerChannel, chan
 	default:
 	}
 
-	// Post-parallel sequential writes: container length field (byte 4) and HMAC.
-	// Workers use randomNonce; the nonce region (bytes 0–3) is already written.
-	seqAdapter, err := newWorkerStack(m, randomNonce, encKey, points, bitsPerChannel, channels, nil)
+	// Post-parallel sequential writes: container length field (byte 16) and HMAC.
+	// Workers use payloadNonce; the salt region (bytes 0–15) is already written.
+	seqAdapter, err := newWorkerStack(m, payloadNonce, encKey, points, bitsPerChannel, channels, nil)
 	if err != nil {
 		return err
 	}
 
-	if _, err = seqAdapter.Seek(4, io.SeekStart); err != nil {
+	if _, err = seqAdapter.Seek(16, io.SeekStart); err != nil {
 		return err
 	}
 	lenBuf := make([]byte, 4)
@@ -179,7 +183,7 @@ func EncodeParallel(m draw.Image, pass []byte, r io.Reader, bitsPerChannel, chan
 		return err
 	}
 
-	if _, err = seqAdapter.Seek(8+totalLen, io.SeekStart); err != nil {
+	if _, err = seqAdapter.Seek(20+totalLen, io.SeekStart); err != nil {
 		return err
 	}
 	if _, err = seqAdapter.Write(tag); err != nil {
@@ -192,15 +196,15 @@ func EncodeParallel(m draw.Image, pass []byte, r io.Reader, bitsPerChannel, chan
 // DecodeParallel decodes a message from m using a parallel worker pool.
 // Images encoded by Encode (sequential) are fully compatible.
 func DecodeParallel(m draw.Image, pass []byte, bitsPerChannel, channels int) ([]byte, error) {
-	seed, encKey, macKey, kdfNonce, err := deriveKeys(pass)
+	bsSeed, bsEncKey, bsNonce, err := deriveBootstrapKeys(pass)
 	if err != nil {
 		return nil, err
 	}
 
 	bounds := m.Bounds()
-	points := cursors.GenerateSequence(bounds.Max.X, bounds.Max.Y, seed)
+	points := cursors.GenerateSequence(bounds.Max.X, bounds.Max.Y, bsSeed)
 
-	// Decrypt the encrypted nonce from image bytes 0–3.
+	// Decrypt the 16-byte salt from image bytes 0–15 using the bootstrap cipher.
 	rawOpts := []cursors.Option{cursors.WithSharedPoints(points), cursors.WithBitsPerChannel(bitsPerChannel)}
 	if channels >= 2 {
 		rawOpts = append(rawOpts, cursors.UseGreenBit())
@@ -209,23 +213,28 @@ func DecodeParallel(m draw.Image, pass []byte, bitsPerChannel, channels int) ([]
 		rawOpts = append(rawOpts, cursors.UseBlueBit())
 	}
 	rawCur := cursors.NewRNGCursor(m, rawOpts...)
-	bootstrapCipher, err := cipher.NewCipher(kdfNonce, encKey)
+	bootstrapCipher, err := cipher.NewCipher(bsNonce, bsEncKey)
 	if err != nil {
 		return nil, err
 	}
 	bootstrapAdapter := cursors.CursorAdapter(cursors.CipherMiddleware(rawCur, bootstrapCipher))
-	var rawNonce [4]byte
-	if _, err = io.ReadFull(bootstrapAdapter, rawNonce[:]); err != nil {
+	var randomSalt [16]byte
+	if _, err = io.ReadFull(bootstrapAdapter, randomSalt[:]); err != nil {
 		return nil, err
 	}
-	randomNonce := binary.BigEndian.Uint32(rawNonce[:])
 
-	// Read the 4-byte container length field at byte 4 (after the encrypted nonce).
-	seqAdapter, err := newWorkerStack(m, randomNonce, encKey, points, bitsPerChannel, channels, nil)
+	// Derive main keys from the recovered salt.
+	encKey, macKey, payloadNonce, err := deriveMainKeys(pass, randomSalt[:])
 	if err != nil {
 		return nil, err
 	}
-	if _, err = seqAdapter.Seek(4, io.SeekStart); err != nil {
+
+	// Read the 4-byte container length field at byte 16 (after the encrypted salt).
+	seqAdapter, err := newWorkerStack(m, payloadNonce, encKey, points, bitsPerChannel, channels, nil)
+	if err != nil {
+		return nil, err
+	}
+	if _, err = seqAdapter.Seek(16, io.SeekStart); err != nil {
 		return nil, err
 	}
 	lenBuf := make([]byte, 4)
@@ -250,7 +259,7 @@ func DecodeParallel(m draw.Image, pass []byte, bitsPerChannel, channels int) ([]
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			adapter, werr := newWorkerStack(m, randomNonce, encKey, points, bitsPerChannel, channels, nil)
+			adapter, werr := newWorkerStack(m, payloadNonce, encKey, points, bitsPerChannel, channels, nil)
 			if werr != nil {
 				errChan <- werr
 				return
@@ -268,7 +277,7 @@ func DecodeParallel(m draw.Image, pass []byte, bitsPerChannel, channels int) ([]
 		}()
 	}
 
-	// Dispatch aligned chunks; streamOffset skips 4 (enc nonce) + 4 (length) = byte 8.
+	// Dispatch aligned chunks; streamOffset skips 16 (enc salt) + 4 (length) = byte 20.
 	var offset int64
 	for offset < totalRemaining {
 		size := chunkSize
@@ -276,7 +285,7 @@ func DecodeParallel(m draw.Image, pass []byte, bitsPerChannel, channels int) ([]
 			size = totalRemaining - offset
 		}
 		dest := decryptedBuf[offset : offset+size]
-		jobChan <- decJob{streamOffset: 8 + offset, dest: dest}
+		jobChan <- decJob{streamOffset: 20 + offset, dest: dest}
 		offset += size
 	}
 	close(jobChan)

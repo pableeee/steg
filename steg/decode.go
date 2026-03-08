@@ -3,7 +3,6 @@ package steg
 import (
 	"crypto/hmac"
 	"crypto/sha256"
-	"encoding/binary"
 	"image/draw"
 	"io"
 
@@ -13,33 +12,35 @@ import (
 )
 
 func Decode(m draw.Image, pass []byte, bitsPerChannel, channels int) ([]byte, error) {
-	seed, encKey, macKey, kdfNonce, err := deriveKeys(pass)
+	bsSeed, bsEncKey, bsNonce, err := deriveBootstrapKeys(pass)
 	if err != nil {
 		return nil, err
 	}
 
-	cur := cursors.NewRNGCursor(m, cursorOptions(seed, bitsPerChannel, channels)...)
+	cur := cursors.NewRNGCursor(m, cursorOptions(bsSeed, bitsPerChannel, channels)...)
 
-	// Decrypt the encrypted nonce from image bytes 0–3 using the bootstrap cipher.
-	bootstrapCipher, err := cipher.NewCipher(kdfNonce, encKey)
+	// Decrypt the 16-byte salt from image bytes 0–15 using the bootstrap cipher.
+	bootstrapCipher, err := cipher.NewCipher(bsNonce, bsEncKey)
 	if err != nil {
 		return nil, err
 	}
 	bootstrapAdapter := cursors.CursorAdapter(cursors.CipherMiddleware(cur, bootstrapCipher))
-	var rawNonce [4]byte
-	if _, err = io.ReadFull(bootstrapAdapter, rawNonce[:]); err != nil {
+	var randomSalt [16]byte
+	if _, err = io.ReadFull(bootstrapAdapter, randomSalt[:]); err != nil {
 		return nil, err
 	}
 
-	// Reconstruct the payload cipher with the recovered random nonce; seek
-	// cursor and cipher past the 4 encrypted nonce bytes (bit 32).
-	randomNonce := binary.BigEndian.Uint32(rawNonce[:])
-	payloadCipher, err := cipher.NewCipher(randomNonce, encKey)
+	// Derive main keys from the recovered salt; seek cursor and cipher to bit 128.
+	encKey, macKey, payloadNonce, err := deriveMainKeys(pass, randomSalt[:])
+	if err != nil {
+		return nil, err
+	}
+	payloadCipher, err := cipher.NewCipher(payloadNonce, encKey)
 	if err != nil {
 		return nil, err
 	}
 	payloadCM := cursors.CipherMiddleware(cur, payloadCipher)
-	if _, err = payloadCM.Seek(32, io.SeekStart); err != nil {
+	if _, err = payloadCM.Seek(128, io.SeekStart); err != nil {
 		return nil, err
 	}
 

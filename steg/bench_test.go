@@ -125,7 +125,7 @@ func BenchmarkDecodeParallel(b *testing.B) {
 }
 
 // sizeCases drives the cross-size benchmarks below.
-// Capacity = w*h*3 bits / 8 bytes; payloadBytes must fit with 40 bytes of framing overhead.
+// Capacity = w*h*3 bits / 8 bytes; payloadBytes must fit with 56 bytes of framing overhead.
 //
 //	100×100  → 3,750 B capacity  → 1 KB payload
 //	500×500  → 93,750 B capacity → 50 KB payload
