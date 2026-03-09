@@ -2,6 +2,7 @@ package steg
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"image/draw"
@@ -9,10 +10,6 @@ import (
 	"github.com/pableeee/steg/cursors"
 	"golang.org/x/crypto/argon2"
 )
-
-// appSalt is a fixed domain separator. Argon2id's memory-hardness
-// provides key-stretching even with a fixed salt.
-var appSalt = []byte("github.com/pableeee/steg/v1")
 
 // cursorOptions builds the RNGCursor option slice for the given configuration.
 // channels: 1 = R only, 2 = R+G, 3 = R+G+B.
@@ -40,26 +37,23 @@ func gcd(a, b int) int {
 func lcm(a, b int) int         { return a / gcd(a, b) * b }
 func lcmBytes(bpb, bc int) int { return lcm(bpb, bc) / bpb }
 
-// deriveBootstrapKeys stretches pass using Argon2id with the fixed application salt.
-// Returns bsSeed (RNG cursor seed), bsEncKey (16-byte AES-128 key), bsNonce (4-byte CTR nonce).
-// 28 bytes: 8 (RNG seed) + 16 (AES-128 enc key) + 4 (cipher nonce).
-func deriveBootstrapKeys(pass []byte) (bsSeed int64, bsEncKey []byte, bsNonce uint32, err error) {
+// deriveSeed returns the Fisher-Yates pixel-traversal seed for the given password.
+// SHA-256 is sufficient here: the seed only determines which pixels carry data,
+// not any cryptographic secret. An attacker who knows the password can already
+// decode; one who does not cannot determine the traversal order.
+func deriveSeed(pass []byte) (int64, error) {
 	if len(pass) == 0 {
-		return 0, nil, 0, fmt.Errorf("password must not be empty")
+		return 0, fmt.Errorf("password must not be empty")
 	}
-	// OWASP 2023 interactive parameters: time=1, memory=64 MiB, threads=4
-	derived := argon2.IDKey(pass, appSalt, 1, 64*1024, 4, 28)
-	bsSeed = int64(binary.BigEndian.Uint64(derived[0:8]))
-	bsEncKey = derived[8:24]
-	bsNonce = binary.BigEndian.Uint32(derived[24:28])
-	return bsSeed, bsEncKey, bsNonce, nil
+	h := sha256.Sum256(pass)
+	return int64(binary.BigEndian.Uint64(h[:8])), nil
 }
 
 // deriveMainKeys stretches pass using Argon2id with a per-image random salt.
 // Returns encKey (16-byte AES-128 key), macKey (32-byte HMAC-SHA256 key), payloadNonce (4-byte CTR nonce).
 // 52 bytes: 16 (AES-128 enc key) + 32 (HMAC-SHA256 mac key) + 4 (cipher nonce).
 func deriveMainKeys(pass, salt []byte) (encKey, macKey []byte, payloadNonce uint32, err error) {
-	derived := argon2.IDKey(pass, salt, 1, 64*1024, 4, 52)
+	derived := argon2.IDKey(pass, salt, 2, 64*1024, 4, 52)
 	encKey = derived[0:16]
 	macKey = derived[16:48]
 	payloadNonce = binary.BigEndian.Uint32(derived[48:52])
@@ -67,7 +61,7 @@ func deriveMainKeys(pass, salt []byte) (encKey, macKey []byte, payloadNonce uint
 }
 
 // imageCapacityBytes returns the maximum real payload size for the given image and
-// encoding settings. Overhead is 56 bytes: 16 (encrypted salt) + 4 (container
+// encoding settings. Overhead is 56 bytes: 16 (plaintext salt) + 4 (container
 // length) + 4 (embedded real-length prefix) + 32 (HMAC-SHA256 tag).
 func imageCapacityBytes(m draw.Image, bitsPerChannel, channels int) int {
 	b := m.Bounds()

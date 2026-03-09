@@ -56,7 +56,7 @@ func newWorkerStack(m draw.Image, nonce uint32, encKey []byte,
 // The on-image layout is identical to Encode, so DecodeParallel and Decode
 // can both decode images written by EncodeParallel (and vice-versa).
 func EncodeParallel(m draw.Image, pass []byte, r io.Reader, bitsPerChannel, channels int) error {
-	bsSeed, bsEncKey, bsNonce, err := deriveBootstrapKeys(pass)
+	seed, err := deriveSeed(pass)
 	if err != nil {
 		return err
 	}
@@ -71,10 +71,9 @@ func EncodeParallel(m draw.Image, pass []byte, r io.Reader, bitsPerChannel, chan
 	}
 
 	bounds := m.Bounds()
-	points := cursors.GenerateSequence(bounds.Max.X, bounds.Max.Y, bsSeed)
+	points := cursors.GenerateSequence(bounds.Max.X, bounds.Max.Y, seed)
 
-	// Write encrypted salt (16 bytes) to image bytes 0–15 via the bootstrap cipher.
-	// This must happen before workers start so they begin at the correct offset.
+	// Write plaintext salt (16 bytes) to image bytes 0–15 before workers start.
 	rawOpts := []cursors.Option{cursors.WithSharedPoints(points), cursors.WithBitsPerChannel(bitsPerChannel)}
 	if channels >= 2 {
 		rawOpts = append(rawOpts, cursors.UseGreenBit())
@@ -87,12 +86,8 @@ func EncodeParallel(m draw.Image, pass []byte, r io.Reader, bitsPerChannel, chan
 	if _, err = rand.Read(randomSalt[:]); err != nil {
 		return err
 	}
-	bootstrapCipher, err := cipher.NewCipher(bsNonce, bsEncKey)
-	if err != nil {
-		return err
-	}
-	bootstrapAdapter := cursors.CursorAdapter(cursors.CipherMiddleware(rawCur, bootstrapCipher))
-	if _, err = bootstrapAdapter.Write(randomSalt[:]); err != nil {
+	saltAdapter := cursors.CursorAdapter(rawCur)
+	if _, err = saltAdapter.Write(randomSalt[:]); err != nil {
 		return err
 	}
 	rawCur.Flush()
@@ -196,15 +191,15 @@ func EncodeParallel(m draw.Image, pass []byte, r io.Reader, bitsPerChannel, chan
 // DecodeParallel decodes a message from m using a parallel worker pool.
 // Images encoded by Encode (sequential) are fully compatible.
 func DecodeParallel(m draw.Image, pass []byte, bitsPerChannel, channels int) ([]byte, error) {
-	bsSeed, bsEncKey, bsNonce, err := deriveBootstrapKeys(pass)
+	seed, err := deriveSeed(pass)
 	if err != nil {
 		return nil, err
 	}
 
 	bounds := m.Bounds()
-	points := cursors.GenerateSequence(bounds.Max.X, bounds.Max.Y, bsSeed)
+	points := cursors.GenerateSequence(bounds.Max.X, bounds.Max.Y, seed)
 
-	// Decrypt the 16-byte salt from image bytes 0–15 using the bootstrap cipher.
+	// Read the 16-byte random salt from image bytes 0–15 (stored in plaintext).
 	rawOpts := []cursors.Option{cursors.WithSharedPoints(points), cursors.WithBitsPerChannel(bitsPerChannel)}
 	if channels >= 2 {
 		rawOpts = append(rawOpts, cursors.UseGreenBit())
@@ -213,13 +208,9 @@ func DecodeParallel(m draw.Image, pass []byte, bitsPerChannel, channels int) ([]
 		rawOpts = append(rawOpts, cursors.UseBlueBit())
 	}
 	rawCur := cursors.NewRNGCursor(m, rawOpts...)
-	bootstrapCipher, err := cipher.NewCipher(bsNonce, bsEncKey)
-	if err != nil {
-		return nil, err
-	}
-	bootstrapAdapter := cursors.CursorAdapter(cursors.CipherMiddleware(rawCur, bootstrapCipher))
+	saltAdapter := cursors.CursorAdapter(rawCur)
 	var randomSalt [16]byte
-	if _, err = io.ReadFull(bootstrapAdapter, randomSalt[:]); err != nil {
+	if _, err = io.ReadFull(saltAdapter, randomSalt[:]); err != nil {
 		return nil, err
 	}
 

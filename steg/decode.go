@@ -12,21 +12,17 @@ import (
 )
 
 func Decode(m draw.Image, pass []byte, bitsPerChannel, channels int) ([]byte, error) {
-	bsSeed, bsEncKey, bsNonce, err := deriveBootstrapKeys(pass)
+	seed, err := deriveSeed(pass)
 	if err != nil {
 		return nil, err
 	}
 
-	cur := cursors.NewRNGCursor(m, cursorOptions(bsSeed, bitsPerChannel, channels)...)
+	cur := cursors.NewRNGCursor(m, cursorOptions(seed, bitsPerChannel, channels)...)
 
-	// Decrypt the 16-byte salt from image bytes 0–15 using the bootstrap cipher.
-	bootstrapCipher, err := cipher.NewCipher(bsNonce, bsEncKey)
-	if err != nil {
-		return nil, err
-	}
-	bootstrapAdapter := cursors.CursorAdapter(cursors.CipherMiddleware(cur, bootstrapCipher))
+	// Read the 16-byte random salt from image bytes 0–15 (stored in plaintext).
+	saltAdapter := cursors.CursorAdapter(cur)
 	var randomSalt [16]byte
-	if _, err = io.ReadFull(bootstrapAdapter, randomSalt[:]); err != nil {
+	if _, err = io.ReadFull(saltAdapter, randomSalt[:]); err != nil {
 		return nil, err
 	}
 

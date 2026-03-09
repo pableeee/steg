@@ -25,11 +25,15 @@ make mocks
 ### Core pipeline (encode direction)
 
 ```
-Password → Argon2id → seed (8 B) + encKey (16 B) + macKey (32 B) + nonce (4 B)
+Password → SHA-256 → seed (8 B)
                 ↓
         seed → RNGCursor (Fisher-Yates shuffled pixel order)
                 ↓
-        CipherMiddleware (AES-128 CTR, KDF-derived nonce + encKey; starts at bit 0)
+        crypto/rand → randomSalt (16 B) → written in plaintext to bits 0–127
+                ↓
+        Password + randomSalt → Argon2id(t=2, m=64MiB) → encKey (16 B) + macKey (32 B) + nonce (4 B)
+                ↓
+        CipherMiddleware (AES-128 CTR, encKey + nonce; starts at bit 128)
                 ↓
         CursorAdapter (bit-level cursor → io.ReadWriteSeeker)
                 ↓
@@ -38,13 +42,22 @@ Password → Argon2id → seed (8 B) + encKey (16 B) + macKey (32 B) + nonce (4 
         container.WritePayload → [encrypted container-length][encrypted padded block][encrypted HMAC-SHA256(macKey)]
 ```
 
-On-image layout: `[encrypted 4-byte nonce] [encrypted 4-byte container-length] [encrypted 4-byte real-length] [encrypted real-payload] [encrypted padding] [encrypted 32-byte HMAC-SHA256 tag]`
+On-image layout (in Fisher-Yates pixel bit order):
 
-Decoding reverses the pipeline: decrypts the 4-byte nonce with the bootstrap cipher (KDF-derived nonce), reconstructs the payload cipher with the recovered random nonce, reads and verifies the padded block via `container.ReadPayload`, then strips the 4-byte real-length prefix via `extractRealPayload`.
+| Bits | Size | Cipher | Field |
+|------|------|--------|-------|
+| 0–127 | 16 B | none (plaintext) | randomSalt |
+| 128–159 | 4 B | AES-CTR payload | container length (LE uint32) |
+| 160–191 | 4 B | AES-CTR payload | real payload length (LE uint32) |
+| 192–… | N B | AES-CTR payload | real payload bytes |
+| …–… | P B | AES-CTR payload | random padding (fills capacity) |
+| …–(…+256) | 32 B | AES-CTR payload | HMAC-SHA256 tag |
+
+Decoding reverses the pipeline: derives seed via SHA-256(pass), reads the 16-byte plaintext salt from bits 0–127, runs Argon2id(pass, salt) to recover all keys, then decrypts and verifies the payload via `container.ReadPayload`, and strips the real-length prefix via `extractRealPayload`.
 
 ### Package responsibilities
 
-- **`steg/`** — Top-level encode/decode orchestration; `steg.go` derives seed, encKey, macKey, and nonce from Argon2id (`deriveKeys`); `buildPaddedPayload` / `extractRealPayload` handle full-capacity padding.
+- **`steg/`** — Top-level encode/decode orchestration; `steg.go` derives the pixel-traversal seed via `deriveSeed` (SHA-256) and all crypto keys via `deriveMainKeys` (Argon2id); `buildPaddedPayload` / `extractRealPayload` handle full-capacity padding.
 - **`steg/container/`** — Payload framing. Writes `[encrypted 4-byte length][encrypted data][encrypted HMAC-SHA256 tag]`. On read, verifies the HMAC-SHA256 tag keyed with `macKey`; a wrong password causes tag verification failure.
 - **`cursors/`** — Three components that compose:
   - `rng_cursor.go`: Fisher-Yates shuffled pixel traversal using the seed; exposes bit-level `Read/WriteBit`.

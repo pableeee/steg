@@ -14,7 +14,7 @@ import (
 )
 
 func Encode(m draw.Image, pass []byte, r io.Reader, bitsPerChannel, channels int) error {
-	bsSeed, bsEncKey, bsNonce, err := deriveBootstrapKeys(pass)
+	seed, err := deriveSeed(pass)
 	if err != nil {
 		return err
 	}
@@ -28,21 +28,17 @@ func Encode(m draw.Image, pass []byte, r io.Reader, bitsPerChannel, channels int
 		return err
 	}
 
-	cur := cursors.NewRNGCursor(m, cursorOptions(bsSeed, bitsPerChannel, channels)...)
+	cur := cursors.NewRNGCursor(m, cursorOptions(seed, bitsPerChannel, channels)...)
 
-	// Generate a random per-encode salt and write it encrypted to image bytes
-	// 0–15 (bits 0–127) using the bootstrap cipher. This ensures each encode
-	// uses unique main keys even if the same password is reused.
+	// Generate a random per-encode salt and write it in plaintext to image bytes
+	// 0–15 (bits 0–127). The salt does not need to be secret; its purpose is
+	// uniqueness so that each encode derives independent main keys.
 	var randomSalt [16]byte
 	if _, err = rand.Read(randomSalt[:]); err != nil {
 		return err
 	}
-	bootstrapCipher, err := cipher.NewCipher(bsNonce, bsEncKey)
-	if err != nil {
-		return err
-	}
-	bootstrapAdapter := cursors.CursorAdapter(cursors.CipherMiddleware(cur, bootstrapCipher))
-	if _, err = bootstrapAdapter.Write(randomSalt[:]); err != nil {
+	saltAdapter := cursors.CursorAdapter(cur)
+	if _, err = saltAdapter.Write(randomSalt[:]); err != nil {
 		return err
 	}
 
