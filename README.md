@@ -27,8 +27,8 @@
 ## Features
 
 - **Authenticated encryption** — AES-128-CTR encryption with HMAC-SHA256; a wrong password returns an error, never garbled data.
-- **Strong key derivation** — Argon2id (OWASP 2023 interactive profile: time=1, mem=64 MiB, threads=4) derives independent encryption and MAC keys from the password in a single call.
-- **Random nonce per encode** — `crypto/rand` generates a fresh 4-byte nonce on every encode, so encoding the same payload into the same image twice produces two different outputs.
+- **Strong key derivation** — Argon2id (time=2, mem=64 MiB, threads=4) derives independent encryption and MAC keys plus the cipher nonce from the password and per-image random salt in a single call.
+- **Random salt per encode** — `crypto/rand` generates a fresh 16-byte salt on every encode, stored in plaintext in the image header; Argon2id derives all crypto keys and the cipher nonce from the password and this salt, so each encode produces a unique keystream even with the same password and carrier.
 - **Password-keyed pixel traversal** — pixels are visited in a Fisher-Yates-shuffled order derived from the password; an observer without the password cannot locate which pixels carry data.
 - **Configurable capacity vs. detectability** — `--bits-per-channel` (1–8 LSBs per channel) and `--channels` (1=R, 2=R+G, 3=R+G+B) let you trade off payload capacity against visual impact. At 1 bit/channel no pixel changes by more than ±1.
 - **`capacity` command** — prints a table of usable byte capacity for every (channels × bits-per-channel) combination for a given image.
@@ -132,7 +132,7 @@ carrier.png — 1920 × 1080 px
   2 channels (R+G)     506.23 KB       1.01 MB       2.01 MB       4.01 MB
   3 channels (R+G+B)   759.34 KB       1.49 MB       3.02 MB       6.03 MB
 
-Overhead: 44 B (4 enc-nonce + 4 container-length + 4 real-length + 32 HMAC).
+Overhead: 56 B (16 plaintext-salt + 4 container-length + 4 real-length + 32 HMAC).
 ```
 
 ### Test Visual
@@ -211,7 +211,7 @@ The usable payload capacity depends on the image dimensions and the chosen `--ch
 max_payload = max(0, floor( width × height × channels × bitsPerChannel / 8 ) − 40)  bytes
 ```
 
-The 40-byte overhead covers: 4-byte nonce + 4-byte encrypted length + 32-byte encrypted HMAC tag.
+The 56-byte overhead covers: 16-byte plaintext salt + 4-byte encrypted container length + 4-byte encrypted real-length prefix + 32-byte encrypted HMAC tag.
 
 Default settings (3 channels, 1 bit/channel):
 
@@ -252,27 +252,26 @@ go test ./steg/ -bench=BenchmarkDecodeBySize -benchtime=3s -benchmem
 
 | Component | Algorithm | Notes |
 |---|---|---|
-| Key derivation | Argon2id | time=1, mem=64 MiB, threads=4 (OWASP 2023 interactive) |
-| RNG seed | First 8 bytes of KDF output | Drives pixel-order shuffle |
-| Encryption key | Bytes 8–23 of KDF output | 16-byte AES-128 key |
-| MAC key | Bytes 24–55 of KDF output | 32-byte HMAC-SHA256 key |
+| Pixel-traversal seed | SHA-256(password), first 8 bytes | Not a crypto secret — determines which pixels carry data |
+| Per-image salt | `crypto/rand` (16 bytes) | Stored in plaintext at image bits 0–127; unique per encode |
+| Key derivation | Argon2id | time=2, mem=64 MiB, threads=4; keyed with password + randomSalt |
+| Encryption key | KDF output bytes 0–15 | 16-byte AES-128 key |
+| MAC key | KDF output bytes 16–47 | 32-byte HMAC-SHA256 key |
+| Payload nonce | KDF output bytes 48–51 | 4-byte AES-CTR nonce; unique per encode via random salt |
 | Stream cipher | AES-128-CTR | Custom bit-addressable CTR; seekable keystream |
 | Authentication | HMAC-SHA256 | Keyed with independent MAC key; constant-time comparison |
-| Per-encode nonce | `crypto/rand` (4 bytes) | Encrypted with bootstrap cipher before writing to image; never stored as plaintext |
-| Bootstrap nonce | Last 4 bytes of KDF output | Fixed per password; used only to encrypt the 4-byte random nonce |
 
 ### Threat model
 
 - **Confidentiality** — AES-128-CTR with a strong KDF-derived key. An attacker without the password sees only pseudorandom bits across a pseudorandomly-ordered set of pixels.
 - **Integrity / authentication** — HMAC-SHA256 over the plaintext payload, encrypted alongside it. A wrong password or any bit-flip in the encrypted region produces a MAC failure; no plaintext is returned.
 - **Resistance to brute force** — Argon2id with 64 MiB memory requirement makes offline dictionary attacks expensive, even on GPU hardware.
-- **Keystream uniqueness** — A fresh `crypto/rand` nonce is generated on every encode and encrypted with the bootstrap cipher before being written to the image. Each encode produces a unique payload keystream, even with the same password and carrier image.
-- **Pixel deniability** — Without the password, an attacker cannot determine which pixels carry data (the traversal order is derived from the password via Argon2id).
+- **Keystream uniqueness** — A fresh `crypto/rand` 16-byte salt is generated on every encode and stored in plaintext in the image header. Argon2id derives the cipher nonce from the password and this salt, so each encode produces a unique payload keystream even when the same password and carrier are reused.
+- **Pixel deniability** — Without the password, an attacker cannot determine which pixels carry data (the traversal order is derived from SHA-256 of the password).
 
 ### What steg does not protect against
 
 - An attacker who can compare the carrier and the steg image pixel-by-pixel will observe that the LSBs of R, G, and B channels differ from a typical natural image distribution (statistical steganalysis).
-- The Argon2id salt is a fixed domain separator (`"github.com/pableeee/steg/v1"`), not a per-image random value. This makes targeted precomputation marginally cheaper than with a random salt, though the memory-hardness of Argon2id still provides strong protection in practice.
 
 ---
 
@@ -283,15 +282,15 @@ Bits are stored in the shuffled pixel sequence, green channel before blue within
 ```
 Bit offset           Size        Cipher                  Field
 ────────────────────────────────────────────────────────────────────────────────
-0                    32 bits     AES-128-CTR (bootstrap) Per-encode random nonce
-32                   32 bits     AES-128-CTR (payload)   Container length (uint32, LE)
-64                   32 bits     AES-128-CTR (payload)   Real payload length (uint32, LE)
-96                   N×8 bits    AES-128-CTR (payload)   Real payload bytes
-96 + N×8             P×8 bits    AES-128-CTR (payload)   Random padding (fills to capacity)
-96 + (N+P)×8         256 bits    AES-128-CTR (payload)   HMAC-SHA256 tag
+0                    128 bits    none (plaintext)        Per-encode random salt
+128                  32 bits     AES-128-CTR (payload)   Container length (uint32, LE)
+160                  32 bits     AES-128-CTR (payload)   Real payload length (uint32, LE)
+192                  N×8 bits    AES-128-CTR (payload)   Real payload bytes
+192 + N×8            P×8 bits    AES-128-CTR (payload)   Random padding (fills to capacity)
+192 + (N+P)×8        256 bits    AES-128-CTR (payload)   HMAC-SHA256 tag
 ```
 
-Two AES-128-CTR cipher instances are used. The **bootstrap cipher** (`AES-CTR(encKey, kdfNonce)`) encrypts only the 4-byte random nonce at bits 0–31 — no plaintext ever appears on the image. The **payload cipher** (`AES-CTR(encKey, randomNonce)`) encrypts everything else starting at bit 32. Every encode generates a fresh `crypto/rand` nonce, giving a unique keystream even when the same password and carrier are reused. Every encode writes the full image capacity, so the LSB distribution is uniformly disturbed regardless of payload size.
+A single AES-128-CTR payload cipher (`AES-CTR(encKey, payloadNonce)`) encrypts everything from bit 128 onward. The 16-byte `randomSalt` at bits 0–127 is stored in plaintext — an attacker who sees it still cannot derive any keys without the password. Argon2id takes the password and `randomSalt` and produces all key material (encKey, macKey, payloadNonce) in a single call, so no bootstrap cipher is needed. Every encode writes the full image capacity, so the LSB distribution is uniformly disturbed regardless of payload size.
 
 ---
 
@@ -405,10 +404,8 @@ Every push to `master` triggers a GitHub Actions workflow that:
 | Issue | Severity | Notes |
 |---|---|---|
 | MAC-then-Encrypt ordering | Low | HMAC is computed over plaintext before encryption. Unconventional (Encrypt-then-MAC is preferred), but not exploitable in this threat model since the tag is inside the encrypted channel. |
-| Fixed application salt | Low | Per-image random Argon2id salt would marginally harden against targeted precomputation; not implemented to avoid bootstrapping complexity. |
 | No streaming decode | Medium | `ReadPayload` allocates the full payload in memory before returning. Very large payloads may cause high memory usage. |
 | Lossy formats unsupported | High | JPEG and other lossy formats destroy LSB data. Only lossless formats (PNG, BMP, TIFF) are supported. |
-| Bootstrap cipher reuse | Info | The bootstrap cipher uses `(encKey, kdfNonce)` — fixed per password — to encrypt the 4-byte random nonce. Its keystream bytes 0–3 are reused across encodes, but always against a different `crypto/rand` plaintext so no useful information is exposed. |
 | Statistical steganalysis | Medium | Modifying the LSBs of color channels across a pseudorandom pixel set produces a detectable statistical signature. The built-in `detect` command uses chi-square and RS analysis to surface this. Chi-square reliably detects full-fill encoding; RS analysis effectiveness varies with the carrier image's natural LSB distribution. Higher bits-per-channel settings make signatures more pronounced. |
 
 ---
@@ -443,7 +440,6 @@ Measures local pixel smoothness using regular (`R`) and singular (`S`) group fra
 
 ## Roadmap
 
-- **Per-image random Argon2id salt** — store a random salt in the plaintext header alongside the nonce to further harden against precomputation.
 - **Lossless WebP support** — extend format support beyond PNG, BMP, and TIFF.
 - **Streaming decode** — avoid loading the full payload into memory for large files.
 - **16-bit image depth** — exploit the extra bits-per-channel available in 16-bit PNG/TIFF carriers.
