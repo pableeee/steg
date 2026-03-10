@@ -9,11 +9,9 @@ import (
 )
 
 // StreamCipherBlock represents a block cipher in stream mode that supports
-// seeking and bitwise encryption and decryption.
+// seeking and byte-level encryption and decryption.
 type StreamCipherBlock interface {
 	Seek(offset int64, whence int) (int64, error)
-	EncryptBit(bit uint8) (uint8, error)
-	DecryptBit(bit uint8) (uint8, error)
 	EncryptByte(b uint8) (uint8, error)
 	DecryptByte(b uint8) (uint8, error)
 }
@@ -115,24 +113,6 @@ func (s *streamCipherImpl) Seek(n int64, whence int) (int64, error) {
 	s.index = n
 
 	return s.index, nil
-}
-
-// EncryptBit encrypts a single bit using the current position of the cipher.
-//
-// bichi: The bit to encrypt.
-//
-// Returns the encrypted bit and an error if any.
-func (s *streamCipherImpl) EncryptBit(bichi uint8) (uint8, error) {
-	return s.processBit(bichi)
-}
-
-// DecryptBit decrypts a single bit using the current position of the cipher.
-//
-// bichi: The bit to decrypt.
-//
-// Returns the decrypted bit and an error if any.
-func (s *streamCipherImpl) DecryptBit(bichi uint8) (uint8, error) {
-	return s.processBit(bichi)
 }
 
 // EncryptByte encrypts all 8 bits of b in one call, MSB first.

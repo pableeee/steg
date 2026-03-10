@@ -35,7 +35,7 @@ Password → SHA-256 → seed (8 B)
                 ↓
         CipherMiddleware (AES-128 CTR, encKey + nonce; starts at bit 128)
                 ↓
-        CursorAdapter (bit-level cursor → io.ReadWriteSeeker)
+        CursorAdapter (Cursor → io.ReadWriteSeeker)
                 ↓
         buildPaddedPayload → [4B real-length][real-payload][random padding] (fills image capacity)
                 ↓
@@ -60,10 +60,10 @@ Decoding reverses the pipeline: derives seed via SHA-256(pass), reads the 16-byt
 - **`steg/`** — Top-level encode/decode orchestration; `steg.go` derives the pixel-traversal seed via `deriveSeed` (SHA-256) and all crypto keys via `deriveMainKeys` (Argon2id); `buildPaddedPayload` / `extractRealPayload` handle full-capacity padding.
 - **`steg/container/`** — Payload framing. Writes `[encrypted 4-byte length][encrypted data][encrypted HMAC-SHA256 tag]`. On read, verifies the HMAC-SHA256 tag keyed with `macKey`; a wrong password causes tag verification failure.
 - **`cursors/`** — Three components that compose:
-  - `rng_cursor.go`: Fisher-Yates shuffled pixel traversal using the seed; exposes bit-level `Read/WriteBit`.
-  - `adapter.go`: Converts the bit-level `Cursor` interface into `io.ReadWriteSeeker` (bytes, MSB-first).
-  - `middleware.go`: Decorator that transparently encrypts/decrypts bits passing through the cursor.
-- **`cipher/`** — AES-128 counter-mode stream cipher operating at the bit level; supports `Seek()` for random access within the keystream. Accepts a pre-derived 16-byte `encKey` and a 4-byte nonce; returns an error if key setup fails.
+  - `rng_cursor.go`: Fisher-Yates shuffled pixel traversal using the seed; exposes byte-level `ReadByte/WriteByte`.
+  - `adapter.go`: Wraps the `Cursor` interface into `io.ReadWriteSeeker`.
+  - `middleware.go`: Decorator that transparently encrypts/decrypts bytes passing through the cursor via `cipher.EncryptByte`/`DecryptByte`.
+- **`cipher/`** — AES-128 counter-mode stream cipher; exposes `EncryptByte`/`DecryptByte` and `Seek()` for random access within the keystream. Bit-level XOR is an internal implementation detail of `processBit`, not exposed in the `StreamCipherBlock` interface. Accepts a pre-derived 16-byte `encKey` and a 4-byte nonce; returns an error if key setup fails.
 - **`cmd/steg/`** — Cobra CLI with `encode`, `decode`, `capacity`, and `test-visual` subcommands; handles PNG, BMP, and TIFF I/O.
 - **`mocks/`** — Generated mocks for `cipher.StreamCipherBlock` and `cursors.Cursor` interfaces.
 - **`testutil/`** — `MemReadWriteSeeker`: in-memory `io.ReadWriteSeeker` used in tests.

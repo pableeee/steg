@@ -35,20 +35,20 @@ func Test_StreamCipherPrimitive(t *testing.T) {
 		require.NoError(t, err)
 
 		funcs := []func(uint8) (uint8, error){
-			c.DecryptBit,
-			c.EncryptBit,
+			c.DecryptByte,
+			c.EncryptByte,
 		}
 
 		for _, fn := range funcs {
 			for i := 0; i < 2; i++ {
-				// seek at the begining of a block
+				// seek at the beginning of a block (in bits)
 				_, err := c.Seek(int64(i*b.BlockSize()*8), io.SeekStart)
 				require.NoError(t, err)
 
 				currentBlock := make([]byte, len(c.currentBlock))
 				copy(currentBlock, c.currentBlock)
-				// move across the same block, until reaching end.
-				for e := 0; e < b.BlockSize()*8; e++ {
+				// move across the same block one byte at a time, until reaching end.
+				for e := 0; e < b.BlockSize(); e++ {
 					_, err = fn(1)
 					require.NoError(t, err)
 					assert.Equal(t, currentBlock, c.currentBlock)
