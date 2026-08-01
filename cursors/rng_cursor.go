@@ -34,15 +34,21 @@ func generateSequence(width, height int, rng *rand.Rand) []image.Point {
 }
 
 type RNGCursor struct {
-	img             draw.Image
-	cursor          int64
-	bitMask         BitColor
-	bitCount        uint
-	bitsPerChannel  int
-	useBits         []BitColor
-	points          []image.Point
-	rng             *rand.Rand
-	maxBits         int64 // pre-computed capacity in bits
+	img            draw.Image
+	cursor         int64
+	bitMask        BitColor
+	bitCount       uint
+	bitsPerChannel int
+	useBits        []BitColor
+	points         []image.Point
+	rng            *rand.Rand
+	maxBits        int64 // pre-computed capacity in bits
+
+	// min is the image's origin. points are generated in the range
+	// [0,Dx)×[0,Dy) and offset by min on access, so sub-images whose bounds do
+	// not start at (0,0) address their own pixels rather than falling outside
+	// the image and silently reading zeroes.
+	min image.Point
 
 	// imgMu, when non-nil, is locked around every img.At() and img.Set() call.
 	// Set via WithImageMutex to eliminate data races when multiple cursors share
@@ -105,8 +111,10 @@ func NewRNGCursor(img draw.Image, options ...Option) *RNGCursor {
 		opt(c)
 	}
 
+	b := img.Bounds()
+	c.min = b.Min
 	if c.points == nil {
-		c.points = generateSequence(img.Bounds().Max.X, img.Bounds().Max.Y, c.rng)
+		c.points = generateSequence(b.Dx(), b.Dy(), c.rng)
 	}
 	for _, color := range Colors {
 		if c.bitMask&color == color {
@@ -114,7 +122,7 @@ func NewRNGCursor(img draw.Image, options ...Option) *RNGCursor {
 			c.useBits = append(c.useBits, color)
 		}
 	}
-	c.maxBits = int64(img.Bounds().Max.X) * int64(img.Bounds().Max.Y) * int64(c.bitCount) * int64(c.bitsPerChannel)
+	c.maxBits = int64(b.Dx()) * int64(b.Dy()) * int64(c.bitCount) * int64(c.bitsPerChannel)
 	return c
 }
 
@@ -145,7 +153,7 @@ func (c *RNGCursor) Flush() {
 // loadPixel flushes the current dirty pixel (if any) then loads pixelIdx into cache.
 func (c *RNGCursor) loadPixel(pixelIdx int64) {
 	c.Flush()
-	pt := c.points[pixelIdx]
+	pt := c.points[pixelIdx].Add(c.min)
 	var r, g, b, a uint32
 	if c.imgMu != nil {
 		c.imgMu.Lock()
@@ -193,7 +201,7 @@ func (c *RNGCursor) Seek(n int64, whence int) (int64, error) {
 // Slot arithmetic accounts for bitsPerChannel: each pixel holds
 // bitCount*bitsPerChannel bit slots, ordered by channel then by bit
 // position within the channel (MSB-first within each channel's N bits).
-func (c *RNGCursor) ReadByte() (uint8, error) {
+func (c *RNGCursor) ReadByte() (byte, error) {
 	bitsPerPixel := int64(c.bitCount) * int64(c.bitsPerChannel)
 	pixelIdx := c.cursor / bitsPerPixel
 	slotInPixel := int(c.cursor % bitsPerPixel)
@@ -234,7 +242,7 @@ func (c *RNGCursor) ReadByte() (uint8, error) {
 // Slot arithmetic accounts for bitsPerChannel: each pixel holds
 // bitCount*bitsPerChannel bit slots, ordered by channel then by bit
 // position within the channel (MSB-first within each channel's N bits).
-func (c *RNGCursor) WriteByte(b uint8) error {
+func (c *RNGCursor) WriteByte(b byte) error {
 	bitsPerPixel := int64(c.bitCount) * int64(c.bitsPerChannel)
 	pixelIdx := c.cursor / bitsPerPixel
 	slotInPixel := int(c.cursor % bitsPerPixel)

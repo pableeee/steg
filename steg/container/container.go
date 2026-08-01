@@ -9,8 +9,9 @@ import (
 )
 
 func WritePayload(w io.WriteSeeker, payload io.Reader, hashFn hash.Hash) error {
-	// Capture current position. When called from encode, basePos=4 (after nonce).
-	// When called directly (container tests), basePos=0. Behavior identical in both cases.
+	// Capture current position. When called from encode, basePos=16 (after the
+	// plaintext salt). When called directly (container tests), basePos=0.
+	// Behavior is identical in both cases.
 	basePos, err := w.Seek(0, io.SeekCurrent)
 	if err != nil {
 		return err
@@ -55,7 +56,15 @@ func WritePayload(w io.WriteSeeker, payload io.Reader, hashFn hash.Hash) error {
 	return err
 }
 
-func ReadPayload(r io.ReadWriteSeeker, hashFn hash.Hash) ([]byte, error) {
+// ReadPayload reads a framed payload written by WritePayload and verifies its
+// MAC.
+//
+// maxPayload bounds the length field. That field is decrypted but not yet
+// authenticated when it is read, so a wrong password yields an essentially
+// random uint32 — up to 4 GiB. Rejecting anything larger than the carrier could
+// possibly hold turns a huge speculative allocation into an immediate error.
+// A non-positive maxPayload disables the check.
+func ReadPayload(r io.ReadWriteSeeker, hashFn hash.Hash, maxPayload int) ([]byte, error) {
 	sizeBytes := make([]byte, 4)
 	_, err := io.ReadFull(r, sizeBytes)
 	if err != nil {
@@ -63,6 +72,11 @@ func ReadPayload(r io.ReadWriteSeeker, hashFn hash.Hash) ([]byte, error) {
 	}
 
 	length := binary.LittleEndian.Uint32(sizeBytes)
+	if maxPayload > 0 && int64(length) > int64(maxPayload) {
+		return nil, fmt.Errorf(
+			"payload length %d exceeds maximum %d: wrong password or corrupt image",
+			length, maxPayload)
+	}
 	payload := make([]byte, length)
 	_, err = io.ReadFull(r, payload)
 	if err != nil {

@@ -34,10 +34,10 @@ func (m *MockCursor) EXPECT() *MockCursorMockRecorder {
 }
 
 // ReadByte mocks base method.
-func (m *MockCursor) ReadByte() (uint8, error) {
+func (m *MockCursor) ReadByte() (byte, error) {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "ReadByte")
-	ret0, _ := ret[0].(uint8)
+	ret0, _ := ret[0].(byte)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
@@ -64,7 +64,7 @@ func (mr *MockCursorMockRecorder) Seek(offset, whence interface{}) *gomock.Call 
 }
 
 // WriteByte mocks base method.
-func (m *MockCursor) WriteByte(arg0 uint8) error {
+func (m *MockCursor) WriteByte(arg0 byte) error {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "WriteByte", arg0)
 	ret0, _ := ret[0].(error)

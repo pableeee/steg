@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
+	"image"
 	"image/draw"
 
 	"github.com/pableeee/steg/cursors"
@@ -60,17 +61,31 @@ func deriveMainKeys(pass, salt []byte) (encKey, macKey []byte, payloadNonce uint
 	return encKey, macKey, payloadNonce, nil
 }
 
-// imageCapacityBytes returns the maximum real payload size for the given image and
-// encoding settings. Overhead is 56 bytes: 16 (plaintext salt) + 4 (container
-// length) + 4 (embedded real-length prefix) + 32 (HMAC-SHA256 tag).
-func imageCapacityBytes(m draw.Image, bitsPerChannel, channels int) int {
+// Overhead is the number of bytes every encoded image spends on framing:
+// 16 (plaintext salt) + 4 (container length) + 4 (embedded real-length prefix)
+// + 32 (HMAC-SHA256 tag).
+const Overhead = 56
+
+// CapacityBytes returns the maximum real payload size, in bytes, that m can
+// hold with the given encoding settings. It returns 0 for images too small to
+// hold the framing overhead.
+//
+// This is the single source of truth for capacity; callers must not reimplement
+// the arithmetic, or they will drift from the encoder and produce payloads it
+// rejects.
+func CapacityBytes(m image.Image, bitsPerChannel, channels int) int {
 	b := m.Bounds()
-	total := b.Dx() * b.Dy() * channels * bitsPerChannel / 8
-	const overhead = 56
-	if total <= overhead {
+	return CapacityForDims(b.Dx(), b.Dy(), bitsPerChannel, channels)
+}
+
+// CapacityForDims is CapacityBytes for an image whose dimensions are known but
+// which has not been decoded yet.
+func CapacityForDims(w, h, bitsPerChannel, channels int) int {
+	total := w * h * channels * bitsPerChannel / 8
+	if total <= Overhead {
 		return 0
 	}
-	return total - overhead
+	return total - Overhead
 }
 
 // buildPaddedPayload prepends a 4-byte LE real-length prefix and appends random
@@ -78,7 +93,7 @@ func imageCapacityBytes(m draw.Image, bitsPerChannel, channels int) int {
 // payload-size signal from LSB statistics regardless of actual payload size.
 // The returned slice is passed directly to container.WritePayload.
 func buildPaddedPayload(m draw.Image, payload []byte, bitsPerChannel, channels int) ([]byte, error) {
-	cap := imageCapacityBytes(m, bitsPerChannel, channels)
+	cap := CapacityBytes(m, bitsPerChannel, channels)
 	if cap <= 0 {
 		return nil, fmt.Errorf("steg: image too small to hold any payload")
 	}

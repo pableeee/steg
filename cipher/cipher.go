@@ -25,7 +25,7 @@ type streamCipherImpl struct {
 
 	currentBlock []byte
 	index        int64
-	mixIndex     int64
+	minIndex     int64
 	maxIndex     int64
 
 	block     std_cipher.Block
@@ -82,7 +82,7 @@ func (s *streamCipherImpl) refreshCipherBlock() {
 	payload := append(nonceBytes, counterBytes...)
 	s.currentBlock = make([]byte, s.blockSize)
 	s.block.Encrypt(s.currentBlock, payload)
-	s.mixIndex = int64(s.blockSize * s.counter * 8)
+	s.minIndex = int64(s.blockSize * s.counter * 8)
 	s.maxIndex = int64((s.counter + 1) * s.blockSize * 8)
 }
 
@@ -106,7 +106,7 @@ func (s *streamCipherImpl) Seek(n int64, whence int) (int64, error) {
 		return 0, fmt.Errorf("not implemented")
 	}
 
-	if n > s.maxIndex || n < s.mixIndex {
+	if n > s.maxIndex || n < s.minIndex {
 		s.counter = uint32(n / int64(s.blockSize*8))
 		s.refreshCipherBlock()
 	}
@@ -135,7 +135,7 @@ func (s *streamCipherImpl) DecryptByte(b uint8) (uint8, error) {
 
 // processBit processes a single bit for encryption or decryption.
 func (s *streamCipherImpl) processBit(bichi uint8) (uint8, error) {
-	if s.index >= s.maxIndex || s.index < s.mixIndex {
+	if s.index >= s.maxIndex || s.index < s.minIndex {
 		s.counter = uint32(s.index / int64(s.blockSize*8))
 		s.refreshCipherBlock()
 	}
