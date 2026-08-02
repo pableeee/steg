@@ -1,7 +1,7 @@
 // Package analysis_test verifies the chi-square and RS steganalysis detectors
 // using images produced by the steg encoder.
 //
-// Test image notes
+// # Test image notes
 //
 // naturalImage generates a synthetic image where all channel values are even
 // (LSB = 0). This gives chi-square a clear clean baseline: pairs (2k, 2k+1)

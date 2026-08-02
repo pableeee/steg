@@ -16,6 +16,36 @@ import (
 	"github.com/pableeee/steg/cursors"
 )
 
+// payloadStreamOffset is the stream byte offset at which the padded payload
+// begins: 16 bytes of plaintext salt followed by the 4-byte container length.
+const payloadStreamOffset = 20
+
+// firstChunkShift returns how many extra bytes the first worker chunk must carry
+// so that every subsequent chunk boundary lands on a pixel boundary.
+//
+// Workers read-modify-write whole pixels: a cursor loads a pixel with img.At(),
+// updates the bits it owns, and stores it back with img.Set(). If a boundary
+// falls mid-pixel, the workers on either side both load, modify, and store that
+// pixel, and whichever stores last silently discards the other's bits — the
+// image then fails MAC verification on decode. A shared mutex does not help,
+// because each individual At and Set is already serialised; it is the
+// load-modify-store sequence that must not interleave.
+//
+// Chunk sizes are already multiples of lcm(8, bitsPerPixel)/8 bytes, so the only
+// misalignment comes from the header: the payload starts at bit
+// payloadStreamOffset*8 = 160, and 160 is not a multiple of bitsPerPixel
+// whenever bitsPerPixel is a multiple of 3 (the default is 3). Shifting the
+// first chunk by the smallest such remainder realigns every later boundary.
+func firstChunkShift(bitsPerPixel int) int64 {
+	const headerBits = payloadStreamOffset * 8
+	for r := int64(0); r < int64(bitsPerPixel); r++ {
+		if (headerBits+r*8)%int64(bitsPerPixel) == 0 {
+			return r
+		}
+	}
+	return 0 // unreachable: gcd(8, bitsPerPixel) always divides 160
+}
+
 type encJob struct {
 	streamOffset int64
 	data         []byte
@@ -73,7 +103,7 @@ func EncodeParallel(m draw.Image, pass []byte, r io.Reader, bitsPerChannel, chan
 	bounds := m.Bounds()
 	points := cursors.GenerateSequence(bounds.Max.X, bounds.Max.Y, seed)
 
-	// Write plaintext salt (16 bytes) to image bytes 0–15 before workers start.
+	// Write the plaintext salt (16 bytes) to image bytes 0–15 before workers start.
 	rawOpts := []cursors.Option{cursors.WithSharedPoints(points), cursors.WithBitsPerChannel(bitsPerChannel)}
 	if channels >= 2 {
 		rawOpts = append(rawOpts, cursors.UseGreenBit())
@@ -113,6 +143,15 @@ func EncodeParallel(m draw.Image, pass []byte, r io.Reader, bitsPerChannel, chan
 	jobChan := make(chan encJob, numWorkers*2)
 	errChan := make(chan error, numWorkers)
 
+	// abort is closed by the first worker to fail, so the dispatch loop below
+	// cannot block forever writing to jobChan after every worker has exited.
+	abort := make(chan struct{})
+	var abortOnce sync.Once
+	fail := func(err error) {
+		errChan <- err
+		abortOnce.Do(func() { close(abort) })
+	}
+
 	var wg sync.WaitGroup
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
@@ -120,38 +159,48 @@ func EncodeParallel(m draw.Image, pass []byte, r io.Reader, bitsPerChannel, chan
 			defer wg.Done()
 			adapter, werr := newWorkerStack(m, payloadNonce, encKey, points, bitsPerChannel, channels, imgMu)
 			if werr != nil {
-				errChan <- werr
+				fail(werr)
 				return
 			}
 			for job := range jobChan {
 				if _, serr := adapter.Seek(job.streamOffset, io.SeekStart); serr != nil {
-					errChan <- serr
+					fail(serr)
 					return
 				}
 				if _, werr2 := adapter.Write(job.data); werr2 != nil {
-					errChan <- werr2
+					fail(werr2)
 					return
 				}
 			}
 			if _, ferr := adapter.Seek(0, io.SeekStart); ferr != nil {
-				errChan <- ferr
+				fail(ferr)
 			}
 		}()
 	}
 
-	// Dispatch padded data in aligned chunks. streamOffset skips 16 bytes of
-	// encrypted salt + 4 bytes of container length field = byte 20.
+	// Dispatch the padded block in pixel-aligned chunks, starting at the byte
+	// where the payload begins. The first chunk absorbs the header's
+	// misalignment so no two workers ever share a pixel.
 	totalLen := int64(len(padded))
+	shift := firstChunkShift(channels * bitsPerChannel)
 	var offset int64
+dispatch:
 	for offset < totalLen {
-		end := offset + int64(chunkSize)
-		if end > totalLen {
-			end = totalLen
+		size := int64(chunkSize)
+		if offset == 0 {
+			size += shift
 		}
-		chunk := make([]byte, end-offset)
-		copy(chunk, padded[offset:end])
-		jobChan <- encJob{streamOffset: 20 + offset, data: chunk}
-		offset = end
+		if offset+size > totalLen {
+			size = totalLen - offset
+		}
+		chunk := make([]byte, size)
+		copy(chunk, padded[offset:offset+size])
+		select {
+		case jobChan <- encJob{streamOffset: payloadStreamOffset + offset, data: chunk}:
+			offset += size
+		case <-abort:
+			break dispatch
+		}
 	}
 	close(jobChan)
 	wg.Wait()
@@ -163,6 +212,8 @@ func EncodeParallel(m draw.Image, pass []byte, r io.Reader, bitsPerChannel, chan
 	}
 
 	// Post-parallel sequential writes: container length field (byte 16) and HMAC.
+	// Both run after wg.Wait(), so although each may share a pixel with the
+	// payload region, no concurrent writer can clobber it.
 	// Workers use payloadNonce; the salt region (bytes 0–15) is already written.
 	seqAdapter, err := newWorkerStack(m, payloadNonce, encKey, points, bitsPerChannel, channels, nil)
 	if err != nil {
@@ -178,7 +229,7 @@ func EncodeParallel(m draw.Image, pass []byte, r io.Reader, bitsPerChannel, chan
 		return err
 	}
 
-	if _, err = seqAdapter.Seek(20+totalLen, io.SeekStart); err != nil {
+	if _, err = seqAdapter.Seek(payloadStreamOffset+totalLen, io.SeekStart); err != nil {
 		return err
 	}
 	if _, err = seqAdapter.Write(tag); err != nil {
@@ -220,7 +271,7 @@ func DecodeParallel(m draw.Image, pass []byte, bitsPerChannel, channels int) ([]
 		return nil, err
 	}
 
-	// Read the 4-byte container length field at byte 16 (after the encrypted salt).
+	// Read the 4-byte container length field at byte 16 (after the plaintext salt).
 	seqAdapter, err := newWorkerStack(m, payloadNonce, encKey, points, bitsPerChannel, channels, nil)
 	if err != nil {
 		return nil, err
@@ -234,6 +285,16 @@ func DecodeParallel(m draw.Image, pass []byte, bitsPerChannel, channels int) ([]
 	}
 	payloadLen := int64(binary.LittleEndian.Uint32(lenBuf))
 
+	// The length field is decrypted but not yet authenticated, so a wrong
+	// password yields an essentially random uint32. Reject anything the carrier
+	// could not hold rather than allocating up to 4 GiB on it.
+	maxPadded := int64(CapacityBytes(m, bitsPerChannel, channels)) + 4
+	if payloadLen > maxPadded {
+		return nil, fmt.Errorf(
+			"payload length %d exceeds maximum %d: wrong password or corrupt image",
+			payloadLen, maxPadded)
+	}
+
 	// Allocate buffer for padded data + HMAC tag.
 	totalRemaining := payloadLen + 32
 	decryptedBuf := make([]byte, totalRemaining)
@@ -245,6 +306,13 @@ func DecodeParallel(m draw.Image, pass []byte, bitsPerChannel, channels int) ([]
 	jobChan := make(chan decJob, numWorkers*2)
 	errChan := make(chan error, numWorkers)
 
+	abort := make(chan struct{})
+	var abortOnce sync.Once
+	fail := func(err error) {
+		errChan <- err
+		abortOnce.Do(func() { close(abort) })
+	}
+
 	var wg sync.WaitGroup
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
@@ -252,32 +320,44 @@ func DecodeParallel(m draw.Image, pass []byte, bitsPerChannel, channels int) ([]
 			defer wg.Done()
 			adapter, werr := newWorkerStack(m, payloadNonce, encKey, points, bitsPerChannel, channels, nil)
 			if werr != nil {
-				errChan <- werr
+				fail(werr)
 				return
 			}
 			for job := range jobChan {
 				if _, serr := adapter.Seek(job.streamOffset, io.SeekStart); serr != nil {
-					errChan <- serr
+					fail(serr)
 					return
 				}
 				if _, rerr := io.ReadFull(adapter, job.dest); rerr != nil {
-					errChan <- rerr
+					fail(rerr)
 					return
 				}
 			}
 		}()
 	}
 
-	// Dispatch aligned chunks; streamOffset skips 16 (enc salt) + 4 (length) = byte 20.
+	// Dispatch chunks starting at the byte where the payload begins: 16
+	// (plaintext salt) + 4 (length field). Decode workers only read, so they
+	// cannot clobber each other, but the same shift as EncodeParallel keeps the
+	// two dispatch loops symmetric.
+	shift := firstChunkShift(channels * bitsPerChannel)
 	var offset int64
+dispatch:
 	for offset < totalRemaining {
 		size := chunkSize
+		if offset == 0 {
+			size += shift
+		}
 		if offset+size > totalRemaining {
 			size = totalRemaining - offset
 		}
 		dest := decryptedBuf[offset : offset+size]
-		jobChan <- decJob{streamOffset: 20 + offset, dest: dest}
-		offset += size
+		select {
+		case jobChan <- decJob{streamOffset: payloadStreamOffset + offset, dest: dest}:
+			offset += size
+		case <-abort:
+			break dispatch
+		}
 	}
 	close(jobChan)
 	wg.Wait()

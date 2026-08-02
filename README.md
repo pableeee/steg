@@ -3,7 +3,8 @@
 **steg** is a command-line steganography tool written in Go. It hides an arbitrary file inside a PNG, BMP, or TIFF image by modifying the least-significant bits of selected color channels in a pseudorandom pixel sequence. The number of bits per channel (1–8) and the number of channels (R / R+G / R+G+B) are configurable, trading capacity for visual detectability. The hidden data is encrypted and authenticated, so the carrier image looks near-identical to the original while the payload is unreadable and tamper-evident without the correct password.
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/pableeee/steg.svg)](https://pkg.go.dev/github.com/pableeee/steg)
-[![CI](https://github.com/pableeee/steg/actions/workflows/release.yml/badge.svg)](https://github.com/pableeee/steg/actions/workflows/release.yml)
+[![Test](https://github.com/pableeee/steg/actions/workflows/test.yml/badge.svg)](https://github.com/pableeee/steg/actions/workflows/test.yml)
+[![Release](https://github.com/pableeee/steg/actions/workflows/release.yml/badge.svg)](https://github.com/pableeee/steg/actions/workflows/release.yml)
 
 ---
 
@@ -12,6 +13,7 @@
 - [Features](#features)
 - [Installation](#installation)
 - [Usage](#usage)
+  - [Supplying the password](#supplying-the-password)
 - [Capacity](#capacity)
 - [Performance](#performance)
 - [Security design](#security-design)
@@ -63,7 +65,7 @@ sudo mv steg-linux-amd64 /usr/local/bin/steg
 
 ### Build from source
 
-Requires Go 1.24+.
+Requires Go 1.25+.
 
 ```bash
 go install github.com/pableeee/steg/cmd/steg@latest
@@ -81,6 +83,25 @@ make build        # produces cmd/steg/steg
 
 ## Usage
 
+### Supplying the password
+
+Every command that needs a passphrase resolves it in this order:
+
+1. **`--password` / `-p`** — convenient, but the value is visible to every other
+   user on the machine via the process table (`ps aux`) and is written to your
+   shell history. Prefer it only in scripts where neither matters.
+2. **`STEG_PASSWORD` environment variable** — better for scripting and CI.
+3. **Interactive prompt** — used when neither of the above is set and stdin is a
+   terminal. `encode` asks for confirmation; `decode` does not.
+
+If no password is available and stdin is not a terminal, the command fails
+rather than proceeding with an empty passphrase.
+
+```bash
+steg encode -i carrier.png -f secret.txt -o output.png   # prompts
+STEG_PASSWORD="my passphrase" steg decode -i output.png -o recovered.txt
+```
+
 ### Encode
 
 Hide a file inside a carrier image:
@@ -94,7 +115,7 @@ steg encode -i carrier.png -f secret.txt -o output.png -p "my passphrase"
 | `--input_image` | `-i` | — | Carrier image (PNG, BMP, or TIFF) |
 | `--input_file` | `-f` | — | File to hide |
 | `--output_image` | `-o` | — | Output image containing the hidden data |
-| `--password` | `-p` | — | Passphrase (**required**) |
+| `--password` | `-p` | prompt | Passphrase; see [Supplying the password](#supplying-the-password) |
 | `--bits-per-channel` | `-b` | `1` | Number of LSBs to use per color channel (1–8) |
 | `--channels` | `-c` | `3` | Color channels to use: 1=R, 2=R+G, 3=R+G+B |
 | `--parallel` | `-P` | off | Use parallel worker pool (faster on large images) |
@@ -111,7 +132,7 @@ steg decode -i output.png -o recovered.txt -p "my passphrase"
 |---|---|---|---|
 | `--input_image` | `-i` | — | Image containing the hidden data |
 | `--output_file` | `-o` | — | Path for the recovered file |
-| `--password` | `-p` | — | Passphrase (**required**) |
+| `--password` | `-p` | prompt | Passphrase; see [Supplying the password](#supplying-the-password) |
 | `--bits-per-channel` | `-b` | `1` | Must match the value used during encode |
 | `--channels` | `-c` | `3` | Must match the value used during encode |
 | `--parallel` | `-P` | off | Use parallel worker pool (faster on large images) |
@@ -345,7 +366,7 @@ A single AES-128-CTR payload cipher (`AES-CTR(encKey, payloadNonce)`) encrypts e
 
 ### Prerequisites
 
-- Go 1.24+
+- Go 1.25+
 - `make`
 
 ### Commands
@@ -359,6 +380,9 @@ make install
 
 # Run all tests
 make test
+
+# Vet hand-written packages (generated mocks are excluded)
+make vet
 
 # Run tests with the race detector
 go test -race ./steg/
@@ -391,7 +415,16 @@ go test ./steg/ -bench=BenchmarkDecodeBySize -benchtime=3s -benchmem
 
 ### Continuous integration
 
-Every push to `master` triggers a GitHub Actions workflow that:
+Two GitHub Actions workflows:
+
+**`test.yml`** runs on every pull request and on pushes to non-`master` branches:
+
+1. `make vet`
+2. `go test ./...`
+3. `go test -race ./...`
+4. `go build ./...`
+
+**`release.yml`** runs on every push to `master`:
 
 1. Runs `go test ./...`
 2. Cross-compiles binaries for Linux, macOS, and Windows (amd64 + arm64)
@@ -404,7 +437,7 @@ Every push to `master` triggers a GitHub Actions workflow that:
 | Issue | Severity | Notes |
 |---|---|---|
 | MAC-then-Encrypt ordering | Low | HMAC is computed over plaintext before encryption. Unconventional (Encrypt-then-MAC is preferred), but not exploitable in this threat model since the tag is inside the encrypted channel. |
-| No streaming decode | Medium | `ReadPayload` allocates the full payload in memory before returning. Very large payloads may cause high memory usage. |
+| No streaming decode | Medium | `ReadPayload` allocates the full payload in memory before returning. Very large payloads may cause high memory usage. The declared length is clamped to the carrier's capacity first, so a wrong password cannot trigger an oversized allocation. |
 | Lossy formats unsupported | High | JPEG and other lossy formats destroy LSB data. Only lossless formats (PNG, BMP, TIFF) are supported. |
 | Statistical steganalysis | Medium | Modifying the LSBs of color channels across a pseudorandom pixel set produces a detectable statistical signature. The built-in `detect` command uses chi-square and RS analysis to surface this. Chi-square reliably detects full-fill encoding; RS analysis effectiveness varies with the carrier image's natural LSB distribution. Higher bits-per-channel settings make signatures more pronounced. |
 

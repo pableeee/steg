@@ -57,8 +57,8 @@ Decoding reverses the pipeline: derives seed via SHA-256(pass), reads the 16-byt
 
 ### Package responsibilities
 
-- **`steg/`** — Top-level encode/decode orchestration; `steg.go` derives the pixel-traversal seed via `deriveSeed` (SHA-256) and all crypto keys via `deriveMainKeys` (Argon2id); `buildPaddedPayload` / `extractRealPayload` handle full-capacity padding.
-- **`steg/container/`** — Payload framing. Writes `[encrypted 4-byte length][encrypted data][encrypted HMAC-SHA256 tag]`. On read, verifies the HMAC-SHA256 tag keyed with `macKey`; a wrong password causes tag verification failure.
+- **`steg/`** — Top-level encode/decode orchestration; `steg.go` derives the pixel-traversal seed via `deriveSeed` (SHA-256) and all crypto keys via `deriveMainKeys` (Argon2id); `buildPaddedPayload` / `extractRealPayload` handle full-capacity padding. `CapacityBytes` / `CapacityForDims` and the `Overhead` constant are the single source of truth for capacity — never reimplement the arithmetic elsewhere, or callers will drift from the encoder and build payloads it rejects.
+- **`steg/container/`** — Payload framing. Writes `[encrypted 4-byte length][encrypted data][encrypted HMAC-SHA256 tag]`. `ReadPayload(r, hashFn, maxPayload)` verifies the HMAC-SHA256 tag keyed with `macKey`; a wrong password causes tag verification failure. `maxPayload` bounds the length field before it sizes an allocation — that field is decrypted but not yet authenticated when read, so a wrong password otherwise yields an arbitrary uint32.
 - **`cursors/`** — Three components that compose:
   - `rng_cursor.go`: Fisher-Yates shuffled pixel traversal using the seed; exposes byte-level `ReadByte/WriteByte`.
   - `adapter.go`: Wraps the `Cursor` interface into `io.ReadWriteSeeker`.
@@ -75,4 +75,6 @@ Decoding reverses the pipeline: derives seed via SHA-256(pass), reads the 16-byt
 The `cursorOptions(seed, bitsPerChannel, channels)` helper in `steg/steg.go` builds the option slice used by `Encode`, `Decode`, `EncodeParallel`, and `DecodeParallel`.
 
 Chunk alignment for parallel operation: `lcm(8 bits/byte, channels × bitsPerChannel bits/pixel) / 8` bytes per aligned chunk boundary. With defaults (3 channels, 1 bit/ch) this is 3 bytes = 8 pixels; values change with different settings.
+
+That alignment only makes chunk *sizes* pixel-aligned. The payload also starts at bit 160 (16-byte salt + 4-byte length), and 160 is not a multiple of `bitsPerPixel` when `bitsPerPixel` is divisible by 3 — including the default of 3. `firstChunkShift` in `steg/parallel.go` shifts the first chunk by the remainder so every later boundary lands on a pixel boundary. Without it two workers read-modify-write the same boundary pixel and the later `img.Set` silently discards the other's bits, producing an image that fails MAC verification. A shared mutex does not fix this: each `At`/`Set` is already serialised, but the load-modify-store *sequence* is not atomic. `TestChunkBoundariesArePixelAligned` guards the invariant arithmetically, because the race window is too narrow for a round-trip test to catch reliably.
 

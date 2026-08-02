@@ -23,7 +23,7 @@ func TestContainerRoundTrip(t *testing.T) {
 	// Reset seek to start of stream
 	buf.Seek(0, io.SeekStart)
 
-	readData, err := container.ReadPayload(buf, md5.New())
+	readData, err := container.ReadPayload(buf, md5.New(), 0)
 	require.NoError(t, err)
 	assert.Equal(t, payload, readData)
 }
@@ -36,7 +36,7 @@ func TestEmptyPayload(t *testing.T) {
 	require.NoError(t, err)
 
 	buf.Seek(0, io.SeekStart)
-	readData, err := container.ReadPayload(buf, md5.New())
+	readData, err := container.ReadPayload(buf, md5.New(), 0)
 	require.NoError(t, err)
 	assert.Empty(t, readData)
 }
@@ -55,7 +55,7 @@ func TestChecksumMismatch(t *testing.T) {
 	buf.Write([]byte{corruptedData})
 
 	buf.Seek(0, io.SeekStart)
-	_, err = container.ReadPayload(buf, md5.New())
+	_, err = container.ReadPayload(buf, md5.New(), 0)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "checksum")
 }
@@ -72,11 +72,15 @@ func TestTruncatedData(t *testing.T) {
 	assert.NoError(t, err)
 
 	buf.Seek(0, io.SeekStart)
-	_, err = container.ReadPayload(buf, md5.New())
+	_, err = container.ReadPayload(buf, md5.New(), 0)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to read")
 }
 
+// TestExcessiveLength checks that an implausible length field is rejected
+// before it is used to size an allocation. The length is decrypted but not yet
+// authenticated at that point, so a wrong password produces an arbitrary
+// uint32 — here 0x7FFFFFFF, which would otherwise allocate 2 GiB.
 func TestExcessiveLength(t *testing.T) {
 	payload := []byte("short")
 	buf := testutil.NewMemReadWriteSeeker(nil)
@@ -90,7 +94,25 @@ func TestExcessiveLength(t *testing.T) {
 	buf.Write([]byte{0xFF, 0xFF, 0xFF, 0x7F})
 
 	buf.Seek(0, io.SeekStart)
-	_, err = container.ReadPayload(buf, md5.New())
+	_, err = container.ReadPayload(buf, md5.New(), 1024)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "exceeds maximum")
+}
+
+// TestExcessiveLengthUnbounded documents that maxPayload <= 0 disables the
+// check, in which case the oversized read fails later instead.
+func TestExcessiveLengthUnbounded(t *testing.T) {
+	payload := []byte("short")
+	buf := testutil.NewMemReadWriteSeeker(nil)
+
+	err := container.WritePayload(buf, bytes.NewReader(payload), md5.New())
+	require.NoError(t, err)
+
+	buf.Seek(0, io.SeekStart)
+	buf.Write([]byte{0x00, 0x00, 0x10, 0x00}) // 1 MiB: large, but not 2 GiB
+
+	buf.Seek(0, io.SeekStart)
+	_, err = container.ReadPayload(buf, md5.New(), 0)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to read payload")
 }

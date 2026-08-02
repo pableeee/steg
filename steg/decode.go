@@ -40,9 +40,13 @@ func Decode(m draw.Image, pass []byte, bitsPerChannel, channels int) ([]byte, er
 		return nil, err
 	}
 
+	// The padded block is exactly 4 bytes (real-length prefix) plus the image's
+	// usable capacity; anything longer cannot have been written by Encode.
+	maxPadded := CapacityBytes(m, bitsPerChannel, channels) + 4
+
 	adapter := cursors.CursorAdapter(payloadCM)
 	mac := hmac.New(sha256.New, macKey)
-	padded, err := container.ReadPayload(adapter, mac)
+	padded, err := container.ReadPayload(adapter, mac, maxPadded)
 	if err != nil {
 		return nil, err
 	}

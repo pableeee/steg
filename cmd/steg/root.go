@@ -10,11 +10,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/pableeee/steg/steg"
 	"github.com/spf13/cobra"
 	"golang.org/x/image/bmp"
 	"golang.org/x/image/tiff"
+	"golang.org/x/term"
 )
 
 var parallel bool
@@ -101,7 +103,8 @@ func init() {
 	encodeCmd.Flags().BoolVarP(&parallel, "parallel", "P", false, "use parallel encode")
 	encodeCmd.Flags().IntVarP(&bitsPerChannel, "bits-per-channel", "b", 1, "number of LSBs to use per color channel (1-8)")
 	encodeCmd.Flags().IntVarP(&channels, "channels", "c", 3, "number of color channels to use: 1=R, 2=R+G, 3=R+G+B")
-	encodeCmd.MarkFlagRequired("password")
+	// password is intentionally not required: resolvePassword falls back to
+	// STEG_PASSWORD or an interactive prompt.
 
 	decodeCmd.Flags().StringVarP(
 		&decoderFlags.inputFile, "input_image", "i", "", "Image containing the coded message.",
@@ -115,7 +118,6 @@ func init() {
 	decodeCmd.Flags().BoolVarP(&parallel, "parallel", "P", false, "use parallel decode")
 	decodeCmd.Flags().IntVarP(&bitsPerChannel, "bits-per-channel", "b", 1, "number of LSBs to use per color channel (1-8)")
 	decodeCmd.Flags().IntVarP(&channels, "channels", "c", 3, "number of color channels to use: 1=R, 2=R+G, 3=R+G+B")
-	decodeCmd.MarkFlagRequired("password")
 
 	capacityCmd.Flags().StringVarP(
 		&capacityFlags.inputImage, "input_image", "i", "", "Image to measure (PNG, BMP, TIFF).",
@@ -133,13 +135,53 @@ func init() {
 	)
 	testVisualCmd.MarkFlagRequired("input_image")
 	testVisualCmd.MarkFlagRequired("output_dir")
-	testVisualCmd.MarkFlagRequired("password")
 
 	rootCmd.AddCommand(encodeCmd)
 	rootCmd.AddCommand(decodeCmd)
 	rootCmd.AddCommand(capacityCmd)
 	rootCmd.AddCommand(testVisualCmd)
 	rootCmd.AddCommand(detectCmd)
+}
+
+// resolvePassword returns the password to use, preferring an explicit flag,
+// then the STEG_PASSWORD environment variable, and finally an interactive
+// prompt. A password passed via --password is visible to every other process on
+// the machine through the process table and is recorded in shell history, so
+// the prompt is the safer default when the terminal is interactive.
+func resolvePassword(flagValue string, confirm bool) ([]byte, error) {
+	if flagValue != "" {
+		return []byte(flagValue), nil
+	}
+	if env := os.Getenv("STEG_PASSWORD"); env != "" {
+		return []byte(env), nil
+	}
+	if !term.IsTerminal(int(syscall.Stdin)) {
+		return nil, fmt.Errorf(
+			"no password provided: pass --password, set STEG_PASSWORD, or run on a terminal")
+	}
+
+	fmt.Fprint(os.Stderr, "Password: ")
+	pass, err := term.ReadPassword(int(syscall.Stdin))
+	fmt.Fprintln(os.Stderr)
+	if err != nil {
+		return nil, fmt.Errorf("unable to read password: %w", err)
+	}
+	if len(pass) == 0 {
+		return nil, fmt.Errorf("password must not be empty")
+	}
+
+	if confirm {
+		fmt.Fprint(os.Stderr, "Confirm password: ")
+		again, err := term.ReadPassword(int(syscall.Stdin))
+		fmt.Fprintln(os.Stderr)
+		if err != nil {
+			return nil, fmt.Errorf("unable to read password: %w", err)
+		}
+		if !bytes.Equal(pass, again) {
+			return nil, fmt.Errorf("passwords do not match")
+		}
+	}
+	return pass, nil
 }
 
 func toDrawImage(src image.Image) draw.Image {
@@ -192,6 +234,11 @@ func runEncode() error {
 		return fmt.Errorf("--channels must be between 1 and 3, got %d", channels)
 	}
 
+	pass, err := resolvePassword(encoderFlags.key, true)
+	if err != nil {
+		return err
+	}
+
 	src, err := decodeImage(encoderFlags.inputImage)
 	if err != nil {
 		return err
@@ -205,9 +252,9 @@ func runEncode() error {
 	defer fmsg.Close()
 
 	if parallel {
-		err = steg.EncodeParallel(cimg, []byte(encoderFlags.key), bufio.NewReader(fmsg), bitsPerChannel, channels)
+		err = steg.EncodeParallel(cimg, pass, bufio.NewReader(fmsg), bitsPerChannel, channels)
 	} else {
-		err = steg.Encode(cimg, []byte(encoderFlags.key), bufio.NewReader(fmsg), bitsPerChannel, channels)
+		err = steg.Encode(cimg, pass, bufio.NewReader(fmsg), bitsPerChannel, channels)
 	}
 	if err != nil {
 		return err
@@ -224,7 +271,24 @@ func runDecode() error {
 		return fmt.Errorf("--channels must be between 1 and 3, got %d", channels)
 	}
 
+	pass, err := resolvePassword(decoderFlags.key, false)
+	if err != nil {
+		return err
+	}
+
 	src, err := decodeImage(decoderFlags.inputFile)
+	if err != nil {
+		return err
+	}
+
+	// Decode before touching the output path: a wrong password must not leave a
+	// truncated or empty file behind.
+	var b []byte
+	if parallel {
+		b, err = steg.DecodeParallel(toDrawImage(src), pass, bitsPerChannel, channels)
+	} else {
+		b, err = steg.Decode(toDrawImage(src), pass, bitsPerChannel, channels)
+	}
 	if err != nil {
 		return err
 	}
@@ -235,34 +299,11 @@ func runDecode() error {
 	}
 	defer out.Close()
 
-	var b []byte
-	if parallel {
-		b, err = steg.DecodeParallel(toDrawImage(src), []byte(decoderFlags.key), bitsPerChannel, channels)
-	} else {
-		b, err = steg.Decode(toDrawImage(src), []byte(decoderFlags.key), bitsPerChannel, channels)
-	}
-	if err != nil {
-		return err
-	}
-
-	_, err = out.Write(b)
-	if err != nil {
+	if _, err = out.Write(b); err != nil {
 		return err
 	}
 
 	return nil
-}
-
-// imageCapacity returns the usable byte capacity for the given image dimensions,
-// channel count, and bits per channel. The 44-byte overhead covers the 4-byte
-// encrypted nonce, 4-byte container-length, 4-byte real-length prefix, and
-// 32-byte HMAC tag.
-func imageCapacity(w, h, ch, bpc int) int {
-	total := w * h * ch * bpc / 8
-	if total <= 44 {
-		return 0
-	}
-	return total - 44
 }
 
 func runCapacity() error {
@@ -290,13 +331,14 @@ func runCapacity() error {
 	for ch := 1; ch <= 3; ch++ {
 		fmt.Printf("  %s", chNames[ch-1])
 		for _, bpc := range bpcValues {
-			cap := imageCapacity(w, h, ch, bpc)
+			cap := steg.CapacityForDims(w, h, ch, bpc)
 			fmt.Printf("%*s", col, humanBytes(cap))
 		}
 		fmt.Println()
 	}
 
-	fmt.Println("\nOverhead: 44 B (4 enc-nonce + 4 container-length + 4 real-length + 32 HMAC).")
+	fmt.Printf("\nOverhead: %d B (16 plaintext-salt + 4 container-length + 4 real-length + 32 HMAC).\n",
+		steg.Overhead)
 	return nil
 }
 
@@ -340,7 +382,10 @@ func runTestVisual() error {
 
 	b := src.Bounds()
 	w, h := b.Max.X, b.Max.Y
-	pass := []byte(testVisualFlags.key)
+	pass, err := resolvePassword(testVisualFlags.key, false)
+	if err != nil {
+		return err
+	}
 
 	bpcValues := []int{1, 2, 4, 8}
 	total := 3 * len(bpcValues)
@@ -350,7 +395,7 @@ func runTestVisual() error {
 
 	for ch := 1; ch <= 3; ch++ {
 		for _, bpc := range bpcValues {
-			cap := imageCapacity(w, h, ch, bpc)
+			cap := steg.CapacityForDims(w, h, ch, bpc)
 			name := fmt.Sprintf("visual_ch%d_b%d.png", ch, bpc)
 			outPath := filepath.Join(testVisualFlags.outputDir, name)
 
