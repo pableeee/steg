@@ -21,8 +21,9 @@
 - [Architecture](#architecture)
 - [Development](#development)
 - [Known limitations](#known-limitations)
-- [Roadmap](#roadmap)
 - [Steganalysis](#steganalysis)
+- [Next steps](#next-steps)
+- [Roadmap](#roadmap)
 
 ---
 
@@ -468,6 +469,92 @@ Measures local pixel smoothness using regular (`R`) and singular (`S`) group fra
 | all n | `LIKELY_STEGO` |
 
 `n` = number of test×channel combinations (6 for a 3-channel image).
+
+---
+
+## Next steps
+
+The weakest point of the current design is not the cryptography but the
+detectability of the embedding itself. `steg detect` flags every image the
+tool produces, and it does so without needing the password. The items below
+attack that problem, in priority order.
+
+### 1. LSB matching instead of LSB replacement
+
+Every colour value is a number between 0 and 255, and its lowest bit is just
+whether the number is even or odd. Hiding a bit means forcing that value to be
+even or odd.
+
+**What happens today.** If a pixel is 100 and the bit to hide is 1, the
+encoder writes 101. If it is 101 and the bit is 0, it writes 100. A pixel
+never leaves its own pair: 100 and 101 are partners, 102 and 103 are
+partners, and so on.
+
+**Why that is detectable.** A natural photograph has uneven counts inside
+each pair — maybe 500 pixels at 100 and 380 at 101, because that is how the
+scene happened to look. Encrypted data is half zeros and half ones, so
+embedding it pushes half of those pixels to even and half to odd, and the pair
+ends up at 440 / 440. This happens across all 128 pairs at once, and no
+natural image has all 128 pairs balanced. The chi-square test does not look
+for the payload; it only measures whether the pairs are suspiciously even.
+With replacement they always are.
+
+**The alternative.** When the pixel's bit does not match the bit to hide,
+flip a coin and add or subtract 1 instead of jumping to the partner. A pixel
+at 100 that must carry a 1 becomes either 101 or 99. Both are odd, so the
+decoder reads exactly what it reads today, but half of the changes now land in
+a neighbouring pair rather than the pixel's own. The surplus at 100 is spread
+between 99 and 101 instead of being dumped entirely on 101.
+
+**The effect.** Pairs no longer balance. Each modification is a ±1 step in a
+random direction, which is indistinguishable from ordinary sensor noise. The
+histogram gets slightly smoother, as if the photo were a touch noisier, but the
+pair structure that chi-square and RS analysis are built to find never
+appears. Both tests in `steg detect` stop working.
+
+**What it does not fix.** Modern detectors trained on relationships between
+neighbouring pixels can still see unusual noise in smooth regions such as sky
+or walls when the embedding rate is high. That is what adaptive embedding
+(item 3) addresses. Matching alone moves the tool out of the "detectable with
+a 50-line script" category, which is where it sits today.
+
+**Implementation notes.**
+- The change lives in `WriteByte` in `cursors/rng_cursor.go`. The decoder is
+  untouched and existing images remain readable.
+- Values 0 and 255 cannot move in both directions; the only valid direction is
+  forced.
+- The ±1 coin must come from a source independent of the password so that the
+  direction of each step leaks nothing about the key.
+
+### 2. Bounded padding
+
+Padding currently fills the entire carrier with random bytes, so a one-byte
+payload randomises every pixel in the image and maximises the statistical
+signal. Padding exists to hide the payload length, and that goal is met just
+as well by rounding up to a fixed multiple (for example 4 KiB) or to a
+fraction of the capacity. Combined with matching this drastically reduces the
+footprint.
+
+### 3. Adaptive embedding
+
+Skip smooth regions, where any LSB change stands out, and embed only in
+pixels with high local variance. The decoder must reconstruct the same
+selection without knowing the payload, so the criterion has to be computed
+from bits that are never modified — typically the upper seven bits of each
+channel.
+
+### 4. Close the loop with `detect`
+
+Have `encode` run the steganalysis on its own output and warn when the result
+is detectable, and fix the open RS threshold issue. Without this the three
+items above cannot be measured. A benchmark in `cmd/attack1` comparing
+replacement, matching, and adaptive embedding across a set of images would
+make the trade-offs concrete.
+
+### 5. Pipe mode
+
+Read the payload from stdin and write to stdout so `steg` composes with
+`tar`, `gpg`, or `age` in a pipeline.
 
 ---
 
