@@ -40,10 +40,14 @@ make mocks
                 ↓
         CursorAdapter (Cursor → io.ReadWriteSeeker)
                 ↓
-        buildPaddedPayload → [4B real-length][real-payload][random padding] (fills image capacity)
+        buildPaddedPayload → [4B real-length][real-payload][random padding], paddedSize bytes:
+        max(4096, nextPowerOfTwo(4 + len)), or capacity + 4 (full fill) if that bucket does not fit
                 ↓
         container.WritePayload → [encrypted container-length][encrypted padded block][encrypted HMAC-SHA256(macKey)]
+        (stream ends after the tag; later pixels keep their original values)
 ```
+
+Every encode write (salt, sequential and parallel payload) uses LSB matching at 1 bit per channel (±1 in a random direction, `crypto/rand`-seeded ChaCha8, independent of the keys) and replacement at 2–8 bits. Decoders read the same bits either way, and accept any container length ≤ capacity + 4, so neither change altered the format. Output is not reproducible.
 
 On-image layout (stream bit b lives in pixel `order[b / bitsPerPixel]`):
 
@@ -53,7 +57,7 @@ On-image layout (stream bit b lives in pixel `order[b / bitsPerPixel]`):
 | 128–159 | 4 B | AES-CTR payload | container length (LE uint32) |
 | 160–191 | 4 B | AES-CTR payload | real payload length (LE uint32) |
 | 192–… | N B | AES-CTR payload | real payload bytes |
-| …–… | P B | AES-CTR payload | random padding (fills capacity) |
+| …–… | P B | AES-CTR payload | random padding (to the `paddedSize` bucket) |
 | …–(…+256) | 32 B | AES-CTR payload | HMAC-SHA256 tag |
 
 Pixel order: `publicOrderKey = SHA-256("github.com/pableeee/steg/v2 salt positions")`. Fisher-Yates step i swaps `points[i]` with `points[i + uniform(N−i)]`, where `uniform` is rejection sampling over raw `ChaCha8.Uint64()` output (never `rand.Rand.IntN`/`Shuffle`, whose algorithms are not a format contract). The order is generated over `[0,Dx)×[0,Dy)` and offset by `Bounds().Min` on access. The salt pixels depend only on the image settings; everything after them depends on Argon2id output, so guessing a password costs a KDF call. The last salt pixel can also hold the first container bits (≥128). `TestPixelOrderGolden` pins the order: any change to `cursors/order.go` is a format break. Carriers with fewer than k pixels are rejected.
@@ -62,11 +66,11 @@ Decoding reverses the pipeline: builds the public prefix, reads the 16-byte plai
 
 ### Package responsibilities
 
-- **`steg/`** — Top-level encode/decode orchestration; `validateCarrier`/`validateSettings` in `steg.go` are the single check (carrier type, bitsPerChannel 1–8, channels 1–3, ≤ `cursors.MaxPixels` pixels, ≤ 4 GiB capacity) that all four entry points run before touching a pixel; `steg.go` derives all keys via `deriveMainKeys` (Argon2id) and builds the pixel order in `prepareEncode`/`prepareDecode` (salt write/read + KDF + order) — the only place either the sequential or the parallel path gets its order; `buildPaddedPayload` / `extractRealPayload` handle full-capacity padding. `CapacityBytes` / `CapacityForDims` and the `Overhead` constant are the single source of truth for capacity — never reimplement the arithmetic elsewhere, or callers will drift from the encoder and build payloads it rejects.
+- **`steg/`** — Top-level encode/decode orchestration; `validateCarrier`/`validateSettings` in `steg.go` are the single check (carrier type, bitsPerChannel 1–8, channels 1–3, ≤ `cursors.MaxPixels` pixels, ≤ 4 GiB capacity) that all four entry points run before touching a pixel; `steg.go` derives all keys via `deriveMainKeys` (Argon2id) and builds the pixel order in `prepareEncode`/`prepareDecode` (salt write/read + KDF + order) — the only place either the sequential or the parallel path gets its order; `buildPaddedPayload` / `extractRealPayload` handle padding, whose length comes from `paddedSize` (power-of-two bucket ≥ `minPaddedBlock` = 4096, else full fill). `cursorOptions(order, bitsPerChannel, channels, write)` adds `cursors.WithLSBMatching()` when `write` is true: every encode path passes true, every decode path false. `CapacityBytes` / `CapacityForDims` and the `Overhead` constant are the single source of truth for capacity — never reimplement the arithmetic elsewhere, or callers will drift from the encoder and build payloads it rejects.
 - **`steg/container/`** — Payload framing. Writes `[encrypted 4-byte length][encrypted data][encrypted HMAC-SHA256 tag]`. `ReadPayload(r, hashFn, maxPayload)` verifies the HMAC-SHA256 tag keyed with `macKey`; a wrong password causes tag verification failure. `maxPayload` bounds the length field before it sizes an allocation — that field is decrypted but not yet authenticated when read, so a wrong password otherwise yields an arbitrary uint32.
 - **`cursors/`** — Pixel order plus three components that compose:
   - `order.go`: `NewPixelOrder` / `FinishPixelOrder` — the format-defining ChaCha8 Fisher-Yates order (see above).
-  - `rng_cursor.go`: walks a `[]uint32` order of pixel indices (`WithSharedPoints`; row-major if none) with byte-level `ReadByte/WriteByte`, reading and writing the `Pix` bytes of `*image.RGBA` / `*image.NRGBA` directly (no `At`/`Set`, no cache, no flush). Any other image type fails with `ErrUnsupportedImage`, because color conversion would destroy hidden bits. Capacity = `len(order) × bitsPerPixel`.
+  - `rng_cursor.go`: walks a `[]uint32` order of pixel indices (`WithSharedPoints`; row-major if none) with byte-level `ReadByte/WriteByte`, reading and writing the `Pix` bytes of `*image.RGBA` / `*image.NRGBA` directly (no `At`/`Set`, no cache, no flush). Any other image type fails with `ErrUnsupportedImage`, because color conversion would destroy hidden bits. Capacity = `len(order) × bitsPerPixel`. `WithLSBMatching` makes `WriteByte` use `writeByteMatching` (±1 at random when bit 0 must change; 0 only up, 255 only down) with a per-cursor ChaCha8 seeded from `crypto/rand` in `NewRNGCursor`; it is ignored when bitsPerChannel > 1 (plain replacement).
   - `adapter.go`: Wraps the `Cursor` interface into `io.ReadWriteSeeker`.
   - `middleware.go`: Decorator that transparently encrypts/decrypts bytes passing through the cursor via `cipher.EncryptByte`/`DecryptByte`.
 - **`cipher/`** — AES-128 counter-mode stream cipher (uint32 block counter: seeking past 64 GiB is an error, never a wrap); exposes `EncryptByte`/`DecryptByte` and `Seek()` for random access within the keystream. Bit-level XOR is an internal implementation detail of `processBit`, not exposed in the `StreamCipherBlock` interface. Accepts a pre-derived 16-byte `encKey` and a 4-byte nonce; returns an error if key setup fails.
@@ -80,7 +84,7 @@ Decoding reverses the pipeline: builds the public prefix, reads the 16-byte plai
 
 `NewRNGCursor` defaults to `R_Bit`. The `channels` parameter controls which channels are active: 1 = R only, 2 = R+G (adds `UseGreenBit()`), 3 = R+G+B (adds `UseBlueBit()`). The `bitsPerChannel` parameter (1–8) controls how many LSBs per channel are used. Image capacity in bits = `width × height × channels × bitsPerChannel`.
 
-The `cursorOptions(points, bitsPerChannel, channels)` helper in `steg/steg.go` builds the option slice used by `Encode`, `Decode`, `EncodeParallel`, and `DecodeParallel`.
+The `cursorOptions(points, bitsPerChannel, channels, write)` helper in `steg/steg.go` builds the option slice used by `Encode`, `Decode`, `EncodeParallel`, and `DecodeParallel` (`write` enables LSB matching).
 
 Chunk alignment for parallel operation: `lcm(8 bits/byte, channels × bitsPerChannel bits/pixel) / 8` bytes per aligned chunk boundary. With defaults (3 channels, 1 bit/ch) this is 3 bytes = 8 pixels; values change with different settings.
 
