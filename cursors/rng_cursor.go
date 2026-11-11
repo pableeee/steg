@@ -1,11 +1,13 @@
 package cursors
 
 import (
+	crand "crypto/rand"
 	"errors"
 	"fmt"
 	"image"
 	"image/draw"
 	"io"
+	"math/rand/v2"
 )
 
 // ErrUnsupportedImage is returned (wrapped) for carriers other than
@@ -61,6 +63,15 @@ type RNGCursor struct {
 	chanOff        []int    // byte offset within a pixel of each used channel
 	order          []uint32 // traversal order; nil means row-major
 	maxBits        int64    // capacity in bits: pixels in the order × bitsPerPixel
+
+	// LSB matching (see WithLSBMatching). matchRNG is non-nil only when the
+	// option is set and bitsPerChannel == 1; it is this cursor's own
+	// generator, never shared. dirBits buffers random bits from one Uint64
+	// call; dirLeft counts how many of them are still unused.
+	lsbMatching bool
+	matchRNG    *rand.ChaCha8
+	dirBits     uint64
+	dirLeft     uint
 }
 
 type Option func(*RNGCursor)
@@ -89,6 +100,35 @@ func WithSharedPoints(order []uint32) Option {
 func WithBitsPerChannel(n int) Option {
 	return func(c *RNGCursor) { c.bitsPerChannel = n }
 }
+
+// WithLSBMatching makes WriteByte embed by LSB matching (±1) instead of LSB
+// replacement. When a channel's bit 0 already equals the bit to hide, the
+// byte is left alone; otherwise 1 is added or subtracted at random (only +1
+// at 0, only −1 at 255). Both results have the hidden bit as their bit 0, so
+// reading is unchanged and any decoder reads exactly the same bits; but the
+// changes no longer stay inside each (2k, 2k+1) value pair, which removes
+// the pair-equalising signature chi-square and RS analysis look for.
+//
+// It applies only with 1 bit per channel. With more bits per channel each
+// channel's data bits are written by separate slot steps (possibly separate
+// WriteByte calls), so choosing a minimum-distortion k-bit value is out of
+// scope; such a cursor ignores this option and does plain replacement,
+// byte-identical to a cursor without it.
+//
+// The ±1 directions come from a ChaCha8 generator private to the cursor,
+// seeded from crypto/rand by NewRNGCursor. They are independent of the
+// password and keys, so they reveal nothing about them, and cursors created
+// separately (e.g. one per worker over disjoint pixels) share no state.
+// The directions are not reproducible: encoding the same input twice yields
+// different images, and the written image depends on the carrier's prior
+// values, not only on the hidden bits.
+func WithLSBMatching() Option {
+	return func(c *RNGCursor) { c.lsbMatching = true }
+}
+
+// seedSource supplies the LSB-matching generator's seed. Tests replace it
+// to exercise the failure path.
+var seedSource io.Reader = crand.Reader
 
 // NewRNGCursor returns a cursor over img, which must be an *image.RGBA or
 // *image.NRGBA (see CheckImage). The cursor uses the R channel plus any
@@ -134,6 +174,17 @@ func NewRNGCursor(img draw.Image, options ...Option) (*RNGCursor, error) {
 	}
 	c.bitsPerPixel = int64(c.bitCount) * int64(c.bitsPerChannel)
 	c.maxBits = numPixels * c.bitsPerPixel
+
+	// Seed here rather than on first write: a failure then surfaces before
+	// any pixel is modified (never mid-payload, leaving a half-written
+	// carrier), and WriteByte keeps a single error kind (out of bounds).
+	if c.lsbMatching && c.bitsPerChannel == 1 {
+		var seed [32]byte
+		if _, err := io.ReadFull(seedSource, seed[:]); err != nil {
+			return nil, fmt.Errorf("cursors: seeding LSB matching: %w", err)
+		}
+		c.matchRNG = rand.NewChaCha8(seed)
+	}
 	return c, nil
 }
 
@@ -216,6 +267,9 @@ func (c *RNGCursor) ReadByte() (byte, error) {
 // as ReadByte. Bits are stored in the image immediately; there is nothing to
 // flush.
 func (c *RNGCursor) WriteByte(b byte) error {
+	if c.matchRNG != nil {
+		return c.writeByteMatching(b)
+	}
 	pixelIdx := c.cursor / c.bitsPerPixel
 	slotInPixel := int(c.cursor % c.bitsPerPixel)
 	off := -1
@@ -236,6 +290,52 @@ func (c *RNGCursor) WriteByte(b byte) error {
 		} else {
 			*p &^= mask
 		}
+		c.cursor++
+		slotInPixel++
+		if int64(slotInPixel) == c.bitsPerPixel {
+			slotInPixel = 0
+			pixelIdx++
+			off = -1
+		}
+	}
+	return nil
+}
+
+// writeByteMatching is WriteByte for LSB matching with 1 bit per channel, so
+// slotInPixel is the channel index and the data bit is bit 0.
+func (c *RNGCursor) writeByteMatching(b byte) error {
+	pixelIdx := c.cursor / c.bitsPerPixel
+	slotInPixel := int(c.cursor % c.bitsPerPixel)
+	off := -1
+
+	for i := 7; i >= 0; i-- {
+		if c.cursor >= c.maxBits {
+			return fmt.Errorf("out of bounds: %w", io.EOF)
+		}
+		if off < 0 {
+			off = c.pixelOffset(pixelIdx)
+		}
+		p := &c.pix[off+c.chanOff[slotInPixel]]
+		v := *p
+		// Branch-free on purpose: whether a change is needed and its
+		// direction are both coin flips, so branches would mispredict half
+		// the time. flip is 1 when bit 0 must change; a random bit is
+		// consumed only then.
+		flip := (v ^ (b >> i)) & 1
+		if c.dirLeft == 0 {
+			c.dirBits = c.matchRNG.Uint64()
+			c.dirLeft = 64
+		}
+		up := uint8(c.dirBits & 1)
+		c.dirBits >>= flip
+		c.dirLeft -= uint(flip)
+		if v == 0 {
+			up = 1 // 0 can only go up
+		}
+		if v == 255 {
+			up = 0 // 255 can only go down
+		}
+		*p = v + flip*2*up - flip // v, v+1 or v-1; never wraps (see above)
 		c.cursor++
 		slotInPixel++
 		if int64(slotInPixel) == c.bitsPerPixel {

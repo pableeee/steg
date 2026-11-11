@@ -55,7 +55,7 @@ func TestSubImageWritesStayInBounds(t *testing.T) {
 
 // subImageCases are carriers with a non-zero origin. The large case spans many
 // worker chunks (chunk size is lcmBytes(8, channels*bitsPerChannel)*1024 bytes,
-// and the padded block always fills the carrier's full capacity).
+// and the padded block for these payloads is a 32 KiB bucket, still many chunks).
 var subImageCases = []struct {
 	name                     string
 	fullW, fullH             int

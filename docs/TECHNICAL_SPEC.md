@@ -40,18 +40,21 @@ this document is wrong.
 
 ## 1. Overview
 
-Steg hides an arbitrary byte string in a lossless RGB image by overwriting the
-`N` least-significant bits of up to three colour channels of every pixel, in a
-pixel order that is partly public and partly derived from the password. The
+Steg hides an arbitrary byte string in a lossless RGB image by setting the
+`N` least-significant bits of up to three colour channels of a prefix of the
+pixels, taken in a pixel order that is partly public and partly derived from the password. The
 embedded data is a single **bit stream**:
 
 ```
 [16-byte plaintext salt][AES-128-CTR encrypted: length | padded payload | HMAC-SHA256 tag]
 ```
 
-The encoder always writes the stream to the full capacity of the carrier: a
-short payload is followed by random padding, so every encode touches every
-usable bit of the image.
+The payload is followed by random padding up to a power-of-two bucket of at
+least 4 KiB, or up to the full capacity of the carrier when that bucket does
+not fit (section 8). Only the stream prefix up to the end of the tag is
+written; every pixel after it in the order keeps its original value. At 1 bit
+per channel the encoder embeds by LSB matching (±1), at 2–8 bits by
+replacement (section 3.1); the decoder reads bits the same way in both cases.
 
 ---
 
@@ -99,8 +102,40 @@ slots 0..5 of a pixel are R bit 1, R bit 0, G bit 1, G bit 0, B bit 1, B bit 0.
 Bytes are packed into the stream **MSB first**: stream byte `i` occupies stream
 bits `8i .. 8i+7`, and bit `8i + j` holds bit `7 − j` of the byte.
 
-Writing a bit sets or clears only that bit of the channel value. Inactive
-channels, the bits above the low `bpc`, and alpha are left as they were.
+Reading a stream bit reads that bit of the channel value. Inactive channels and
+alpha are never written; how the active channel values change on write is
+specified in section 3.1.
+
+### 3.1 Write rule
+
+The format defines only the value of the `bpc` low bits of each written channel
+value. A conforming encoder may change a channel value in any way that leaves
+those bits equal to the stream bits mapped to them; the decoder cannot tell the
+difference. This encoder does one of two things:
+
+* **`bpc = 1`: LSB matching** (`cursors.WithLSBMatching`, `writeByteMatching`).
+  If bit 0 of the value `v` already equals the stream bit, `v` is left alone.
+  Otherwise `v` becomes `v + 1` or `v − 1`, chosen at random; `v = 0` always
+  becomes 1 and `v = 255` always becomes 254. Both candidates have the required
+  bit 0, so every written value is within ±1 of the original and never wraps.
+  The direction bits come from a ChaCha8 generator private to each cursor and
+  seeded with 32 bytes from `crypto/rand` when the cursor is created; one
+  generator bit is consumed per changed value. They are independent of the
+  password and of every derived key, so they reveal nothing about either, and
+  encoding the same input twice gives different images (the salt already made
+  them differ in the encrypted region).
+* **`bpc = 2..8`: LSB replacement.** Writing a bit sets or clears only that bit;
+  the bits above the low `bpc` are left as they were. The `bpc` bits of a
+  channel are written by separate slot steps, possibly separate `WriteByte`
+  calls, so a minimum-distortion `bpc`-bit choice is out of scope; a cursor
+  created with `WithLSBMatching` ignores the option at these settings and is
+  byte-identical to one without it.
+
+Matching is enabled on every write path (the salt write in `prepareEncode`, the
+sequential container write, every parallel worker and the post-parallel length
+and tag writes) and never on decode: `cursorOptions(..., write)` adds
+`WithLSBMatching` exactly when `write` is true. Images from encoders that used
+replacement at `bpc = 1` and images from this one are mutually decodable.
 
 Only the first `8 × floor(n × bpp / 8)` stream bits are used; when `n × bpp` is
 not a multiple of 8 the last few slots of the stream are never written.
@@ -238,14 +273,18 @@ Byte offsets are stream byte offsets (stream bit = 8 × byte).
 | Stream bytes | Size | Cipher | Field |
 |---|---|---|---|
 | 0–15 | 16 B | none | `salt` |
-| 16–19 | 4 B | AES-CTR | `L` = container length, LE32. The encoder always writes `L = cap + 4` |
+| 16–19 | 4 B | AES-CTR | `L` = container length, LE32. The encoder writes `L = paddedSize(R, cap)` (section 8) |
 | 20–23 | 4 B | AES-CTR | real payload length `R`, LE32 (first 4 bytes of the padded block) |
 | 24 … 24+R−1 | R B | AES-CTR | real payload |
 | 24+R … 20+L−1 | L−4−R B | AES-CTR | random padding |
 | 20+L … 20+L+31 | 32 B | AES-CTR | HMAC-SHA256 tag |
 
-Bytes `20 .. 20+L−1` are the **padded block**. With `L = cap + 4` the stream
-ends at byte `56 + cap = floor(n × bpp / 8)`, i.e. exactly at capacity.
+Bytes `20 .. 20+L−1` are the **padded block**. The stream ends at byte
+`20 + L + 32`; the encoder writes nothing after it, so the channel values of
+every slot past stream bit `8 × (52 + L)` keep the carrier's original values
+(the pixel holding the last tag bit may also contain later, untouched slots).
+When the encoder falls back to `L = cap + 4` the stream ends at byte
+`56 + cap = floor(n × bpp / 8)`, i.e. exactly at capacity.
 
 Container write (`container.WritePayload`, called with the stream positioned at
 byte 16): skip 4 bytes, write the padded block while feeding it to the HMAC,
@@ -269,15 +308,51 @@ A decoder accepts any `L ≤ cap + 4`; it does not require `L = cap + 4`.
 
 ## 8. Padding
 
-**File:** `steg/steg.go` (`buildPaddedPayload`, `extractRealPayload`)
+**File:** `steg/steg.go` (`paddedSize`, `minPaddedBlock`, `buildPaddedPayload`,
+`extractRealPayload`)
 
 ```
-paddedBlock = LE32(R) ‖ payload ‖ crypto/rand bytes      // length exactly cap + 4
+paddedBlock = LE32(R) ‖ payload ‖ crypto/rand bytes      // length paddedSize(R, cap)
 ```
+
+The block length is the smallest power of two that is at least `4 + R` and at
+least `minPaddedBlock = 4096`, unless that bucket exceeds `cap + 4`, in which
+case it is `cap + 4` (the carrier is filled completely). As implemented:
+
+```
+paddedSize(R, cap):
+    full   = cap + 4
+    need   = R + 4
+    bucket = 4096
+    while bucket < need and bucket < full:
+        bucket = bucket × 2
+    if bucket > full: return full
+    return bucket
+```
+
+Examples:
+
+| `R` (bytes) | `4 + R` | `L` (with `cap + 4 ≥ L`) |
+|---|---|---|
+| 0 … 4092 | ≤ 4096 | 4096 |
+| 4093 | 4097 | 8192 |
+| 8188 | 8192 | 8192 |
+| 8189 | 8193 | 16384 |
+
+If the bucket does not fit, `L = cap + 4`: for example any payload on a
+carrier with `cap + 4 < 4096` (such as 100 × 100 at the defaults, `cap = 3694`),
+or a 600,000-byte payload when `cap + 4` lies between 600,004 and 1,048,575.
+A bucket exactly equal to `cap + 4` is the same thing. Since `R ≤ cap`, the
+result always satisfies `4 + R ≤ L ≤ cap + 4`.
 
 If `R > cap` encode fails ("payload too large"). If `cap ≤ 0` encode fails
 ("image too small to hold any payload"). The padding is encrypted like
 everything else, so on the image it is indistinguishable from payload.
+
+The bucket is an encoder choice, not part of the format: the decoder accepts
+any `L` with `4 + R ≤ L ≤ cap + 4` (section 7). Images written by the previous
+encoder, which always used `L = cap + 4`, decode unchanged, and that encoder's
+decoder reads bucketed images.
 
 ---
 
@@ -336,6 +411,7 @@ and all four entry points reject such input before touching a pixel.
 
 ```
 1. payload = read all input; paddedBlock = buildPaddedPayload(...)      (section 8)
+   L = len(paddedBlock) = paddedSize(R, cap)
 2. order   = public prefix (section 4)
    salt    = 16 bytes from crypto/rand
    write salt, unencrypted, to stream bytes 0–15 via order[0..k−1]
@@ -343,7 +419,11 @@ and all four entry points reject such input before touching a pixel.
    finish order with keys.orderKey
 4. position the cipher and cursor at stream bit 128 (byte 16)
 5. container write: LE32(L), paddedBlock, HMAC tag — all encrypted      (section 7)
+   stream bytes 20+L+32 onward are not written
 ```
+
+Every write in steps 2 and 5 follows the write rule of section 3.1 (LSB
+matching at `bpc = 1`, replacement above).
 
 ### Decode (`steg.Decode`)
 
@@ -385,7 +465,14 @@ as `Encode` / `Decode`; the four are interchangeable.
 * The padded block (encode) or padded block + tag (decode) is split into jobs
   starting at stream byte 20. Each chunk is `alignment × 1024` bytes, where
   `alignment = lcm(8, bpp) / 8` bytes, so every chunk spans a whole number of
-  pixels.
+  pixels. The padded block is usually a bucket far smaller than the carrier
+  (section 8) and may fit in one chunk: a 4 KiB block does whenever
+  `alignment ≥ 4` (at the defaults, `alignment = 3`, it takes two jobs), and so
+  does the full-fill block of a small carrier. The dispatch loop then sends a
+  single job clipped to the block.
+* Every encode worker, and the sequential stack that writes the length and
+  tag, creates its own cursor with LSB matching at `bpc = 1` (section 3.1),
+  so each has its own direction generator and workers share no random state.
 * The payload starts at bit 160, which is not a pixel boundary when `bpp` is a
   multiple of 3 (including the default `bpp = 3`). `firstChunkShift(bpp)` is the
   smallest `r ≥ 0` with `(160 + 8r) mod bpp = 0`; the first chunk is `r` bytes
@@ -509,11 +596,14 @@ The earlier design seeded `math/rand` with the first 8 bytes of
 SHA-256(password): recomputing the order for a password guess cost one SHA-256
 instead of a KDF call.
 
-**What the secret order buys today: nothing.** The encoder fills the whole
-carrier, so every pixel carries data and the order hides nothing about
-*where* the data is. It starts to matter once padding is bounded (README, Next
-steps, item 2) and only part of the image is touched; this change is that
-item's prerequisite.
+**What the secret order buys.** With bounded padding (section 8) only the
+stream prefix up to the end of the tag is written, so the touched pixels are
+the first `ceil(8 × (52 + L) / bpp)` entries of the order: the public salt
+pixels plus a pseudorandom subset, spread over the whole image, that depends
+on Argon2id output. Without the password an attacker cannot tell which pixels
+carry data, and cannot test a candidate subset more cheaply than one KDF call
+per password guess. When the payload fills the carrier (`L = cap + 4`) every
+pixel carries data and the order hides nothing about *where* it is.
 
 ### ChaCha8 and a hand-written bounded draw
 
@@ -523,12 +613,45 @@ forever. `ChaCha8.Uint64` is fixed by the chacha8rand specification;
 releases, so the shuffle uses its own rejection-sampling draw.
 `TestPixelOrderGolden` pins the output.
 
-### Full-capacity padding
+### Bounded padding
 
-Writing the whole carrier on every encode removes payload size as a
-statistical signal: a 1-byte and a 500 KB payload produce the same LSB
-disturbance. The cost is that the disturbance is always maximal; see the
-limitations below.
+Earlier builds padded every payload to the whole carrier, which hid the payload
+size completely (a 1-byte and a 500 KB payload produced the same disturbance)
+but made the disturbance always maximal: a 31-byte text changed 87.5% of the
+pixels of a 1024×1536 photo. Padding to a power-of-two bucket of at least
+4 KiB keeps most of the size-hiding and changes 0.62% of the pixels for the
+same payload. Above the 4 KiB floor the bucket is less than twice the length
+an unpadded block would need; below it, the floor makes every payload up to
+4,092 bytes look the same, at the cost of writing 4 KiB even for one byte.
+
+The trade-off is a size leak. The bucket hides the payload size only to within
+a factor of two. `L` itself is encrypted, so reading it needs the password,
+but the number of changed values is roughly proportional to `L`, so a
+steganalyst who can estimate the embedding rate (or who has the original
+carrier) learns roughly which bucket was used. A payload that falls back to
+full fill hides its size as completely as before.
+
+### LSB matching at 1 bit per channel
+
+Replacement keeps every value inside its pair `(2k, 2k+1)`, so random data
+evens out the counts within each pair; that is the signature chi-square and RS
+analysis detect. Matching moves a value by ±1 at random, which crosses pair
+boundaries half the time and leaves the pair structure intact. On a 1024×1536
+photo filled to capacity, chi-square p went from 0.13–0.95 to 0.0000 on every
+channel and RS asymmetry from about −0.043 to between −0.0015 and +0.0014;
+`steg detect` changed from `LIKELY_STEGO` to `CLEAN`. This defeats those two
+detectors only. Modern steganalysis (histogram characteristic-function
+attacks, rich models such as SRM with a trained classifier) detects LSB
+matching at high embedding rates, especially in smooth regions; adaptive
+embedding is what would address that.
+
+The directions are drawn from `crypto/rand`-seeded ChaCha8 rather than from
+anything keyed, because a direction that depended on the password or keys
+would leak information about them through the image. Matching only changes
+which of two values with the right bit 0 is written, so it needed no format
+change. At `bpc ≥ 2` a channel's bits are written in separate steps and the
+minimum-distortion choice is not local to one step, so the encoder keeps
+replacement there.
 
 ### MAC-then-encrypt
 
@@ -549,14 +672,16 @@ chunk without coordinating cipher state.
 
 | Issue | Severity | Notes |
 |---|---|---|
-| Statistical steganalysis | High | LSB replacement at full capacity is flagged by chi-square and RS analysis on every channel written to; `steg detect` does it without the password. RS is noisier on small images (below roughly 512×512). |
-| Secret order currently ineffective | Info | With full-capacity padding every pixel carries data, so the keyed order hides nothing. It only matters with bounded padding. |
+| Statistical steganalysis | Medium | At `bpc = 1` LSB matching defeats chi-square and RS analysis (`steg detect` reads `CLEAN` even at full capacity on a natural photo). It does not make the image undetectable: modern detectors (characteristic-function attacks, SRM-type rich models with a trained classifier) detect LSB matching at high embedding rates, especially in smooth regions. At `bpc ≥ 2` the encoder uses replacement, which chi-square and RS flag at high embedding rates. RS is noisier on small images (below roughly 512×512). |
+| Payload size bucketed, not hidden | Low | `L` reveals the payload size to within a factor of two (section 8). It is encrypted, but the embedding rate, which an analyst can estimate, grows with it. Full-fill payloads hide their size completely. |
+| Secret order ineffective at full fill | Info | When `L = cap + 4` every pixel carries data, so the keyed order hides nothing about where the data is. With a smaller bucket it selects which pixels are touched. |
+| Output not reproducible | Info | The salt and the LSB-matching directions come from `crypto/rand`, so the same input encodes to a different image each time. |
 | Public salt positions | Info | By design: the salt pixels are computable from the image size and settings, and the salt is plaintext. Anyone can read it; it does not help guess the password. |
 | Dictionary attacks on weak passwords | Medium | Each guess costs one Argon2id (t=2, 64 MiB, p=4) call; the length bound rejects most wrong guesses right after it. Strength rests on the password. |
 | No format version field | Low | A decoder of the wrong format version fails as if the password were wrong. Images from pre-v2 builds must be decoded with the build that wrote them. |
 | Settings not stored | Low | `bpc` and `ch` must be supplied at decode time; a mismatch looks like a wrong password. |
 | MAC-then-encrypt | Low | See section 15. |
-| No streaming decode | Medium | The full padded block (carrier capacity + 4 bytes) is held in memory. The length is bounded by capacity before allocation, so a wrong password cannot trigger an oversized allocation. |
+| No streaming decode | Medium | The full padded block (`L` bytes, at most carrier capacity + 4) is held in memory. The length is bounded by capacity before allocation, so a wrong password cannot trigger an oversized allocation. |
 | Transparent carriers rejected (CLI) | Low | Carriers with any non-opaque pixel are refused; flatten them first. |
 | 8-bit carriers only | Low | The library accepts only `*image.RGBA` and `*image.NRGBA` and rejects other types. The CLI converts every carrier to 8-bit RGBA, so a 16-bit or grayscale input comes out as 8-bit RGB. |
 | Size limits | Low | At most 2³²−1 pixels and 4 GiB of capacity per carrier (section 10). |

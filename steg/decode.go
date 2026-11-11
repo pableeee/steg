@@ -25,7 +25,7 @@ func Decode(m draw.Image, pass []byte, bitsPerChannel, channels int) ([]byte, er
 		return nil, err
 	}
 
-	cur, err := cursors.NewRNGCursor(m, cursorOptions(points, bitsPerChannel, channels)...)
+	cur, err := cursors.NewRNGCursor(m, cursorOptions(points, bitsPerChannel, channels, false)...)
 	if err != nil {
 		return nil, err
 	}
@@ -38,8 +38,9 @@ func Decode(m draw.Image, pass []byte, bitsPerChannel, channels int) ([]byte, er
 		return nil, err
 	}
 
-	// The padded block is exactly 4 bytes (real-length prefix) plus the image's
-	// usable capacity; anything longer cannot have been written by Encode.
+	// The padded block is at most 4 bytes (real-length prefix) plus the image's
+	// usable capacity (exactly that for full-fill images); anything longer
+	// cannot have been written by Encode. Shorter, bucketed blocks are accepted.
 	maxPadded := CapacityBytes(m, bitsPerChannel, channels) + 4
 
 	adapter := cursors.CursorAdapter(payloadCM)

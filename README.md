@@ -34,7 +34,9 @@
 - **Authenticated encryption** — AES-128-CTR encryption with HMAC-SHA256; a wrong password returns an error, never garbled data.
 - **Strong key derivation** — Argon2id (time=2, mem=64 MiB, threads=4) derives independent encryption and MAC keys, the cipher nonce and the pixel-order key from the password and per-image random salt in a single call.
 - **Random salt per encode** — `crypto/rand` generates a fresh 16-byte salt on every encode, stored in plaintext at publicly known pixel positions; Argon2id derives all keys and the cipher nonce from the password and this salt, so each encode produces a unique keystream even with the same password and carrier.
-- **Keyed pixel traversal** — after the salt pixels, pixels are visited in a Fisher-Yates order driven by ChaCha8 under a key from Argon2id, so recomputing the order for a guessed password costs a full KDF call. (While the encoder fills the whole carrier this hides nothing about where the data is; see [Security design](#security-design).)
+- **Keyed pixel traversal** — after the salt pixels, pixels are visited in a Fisher-Yates order driven by ChaCha8 under a key from Argon2id, so recomputing the order for a guessed password costs a full KDF call. With bounded padding only a prefix of this order is written, so the touched pixels are a keyed pseudorandom subset spread over the whole image (see [Security design](#security-design)).
+- **Bounded padding** — the payload is padded to a power-of-two bucket of at least 4 KiB (`max(4096, nextPowerOfTwo(4 + payload))`), not to the whole carrier; pixels past the end of the stream keep their original values. A 31-byte text in a 1024×1536 photo changes 0.6% of the pixels instead of 87.5%. Payloads whose bucket does not fit fill the carrier as before. The bucket hides the payload size only to within a power of two.
+- **LSB matching at 1 bit per channel** — a channel whose low bit must change moves ±1 in a random direction instead of to its pair partner, which removes the signature chi-square and RS analysis look for. The decoder reads the same bits, so images stay compatible both ways. With 2–8 bits per channel the encoder still uses plain replacement.
 - **Safe CLI writes** — `encode` refuses transparent carriers, and verifies that the image it wrote decodes back to the payload before putting it at the output path.
 - **Configurable capacity vs. detectability** — `--bits-per-channel` (1–8 LSBs per channel) and `--channels` (1=R, 2=R+G, 3=R+G+B) let you trade off payload capacity against visual impact. At 1 bit/channel no pixel changes by more than ±1.
 - **`capacity` command** — prints a table of usable byte capacity for every (channels × bits-per-channel) combination for a given image.
@@ -198,23 +200,7 @@ steg detect -i image.png
 |---|---|---|
 | `--input_image` | `-i` | Image to analyse (PNG, BMP, TIFF) |
 
-Example output for a 1024×1536 photograph after a default encode (3 channels, 1 bit/channel) of a 31-byte text file:
-
-```
-Chi-square analysis (p-value > 0.05 = suspicious):
-  R: χ²=143.06      df=127  p=0.1563  [SUSPICIOUS]
-  G: χ²=114.34      df=115  p=0.4997  [SUSPICIOUS]
-  B: χ²=66.95       df=80   p=0.8509  [SUSPICIOUS]
-
-RS analysis (asymmetry < -0.02 = suspicious):
-  R: Rm=0.4996  Sm=0.5004  R-m=0.5435  S-m=0.4565  asymmetry=-0.0439  [SUSPICIOUS]
-  G: Rm=0.4999  Sm=0.5001  R-m=0.5420  S-m=0.4580  asymmetry=-0.0421  [SUSPICIOUS]
-  B: Rm=0.4991  Sm=0.5009  R-m=0.5443  S-m=0.4557  asymmetry=-0.0452  [SUSPICIOUS]
-
-Verdict: LIKELY_STEGO
-```
-
-The same photograph before encoding:
+Example output for a 1024×1536 photograph before encoding:
 
 ```
 Chi-square analysis (p-value > 0.05 = suspicious):
@@ -230,7 +216,34 @@ RS analysis (asymmetry < -0.02 = suspicious):
 Verdict: CLEAN
 ```
 
-A tiny payload does not help: the encoder always fills the whole carrier (see [Next steps](#next-steps)).
+The same photograph after a default encode (3 channels, 1 bit/channel) of a 31-byte text file. Bounded padding writes a 4 KiB block, so only about 0.6% of the pixels change, each channel by at most ±1:
+
+```
+Chi-square analysis (p-value > 0.05 = suspicious):
+  R: χ²=453.74      df=127  p=0.0000  [CLEAN]
+  G: χ²=1595.36     df=115  p=0.0000  [CLEAN]
+  B: χ²=2263.58     df=80   p=0.0000  [CLEAN]
+
+RS analysis (asymmetry < -0.02 = suspicious):
+  R: Rm=0.5195  Sm=0.4805  R-m=0.5242  S-m=0.4758  asymmetry=-0.0046  [CLEAN]
+  G: Rm=0.5205  Sm=0.4795  R-m=0.5222  S-m=0.4778  asymmetry=-0.0017  [CLEAN]
+  B: Rm=0.5191  Sm=0.4809  R-m=0.5245  S-m=0.4755  asymmetry=-0.0054  [CLEAN]
+
+Verdict: CLEAN
+```
+
+The ±1 directions are random, so the numbers vary slightly from one encode to the next. The previous encoder (LSB replacement, padding to the full carrier) and the current one on the same photograph:
+
+| Encoder | Payload | Pixels changed | chi-square p (R/G/B) | RS asymmetry (R/G/B) | Verdict |
+|---|---|---|---|---|---|
+| previous | 31 B | 87.5% | 0.4973 / 0.2542 / 0.5285 | −0.0444 / −0.0445 / −0.0443 | `LIKELY_STEGO` |
+| previous | 589,768 B (full) | 87.5% | 0.6226 / 0.1330 / 0.9523 | −0.0432 / −0.0426 / −0.0431 | `LIKELY_STEGO` |
+| current | 31 B | 0.62% | 0.0000 / 0.0000 / 0.0000 | −0.0047 / −0.0014 / −0.0057 | `CLEAN` |
+| current | 100,000 B | 19.4% | 0.0000 / 0.0000 / 0.0000 | −0.0041 / −0.0017 / −0.0053 | `CLEAN` |
+| current | 589,768 B (full) | 87.6% | 0.0000 / 0.0000 / 0.0000 | −0.0014 / +0.0014 / −0.0015 | `CLEAN` |
+| current, `-b 2` | 31 B | 0.35% | 0.0000 / 0.0000 / 0.0000 | −0.0046 / −0.0020 / −0.0056 | `CLEAN` |
+
+A `CLEAN` verdict means these two tests found nothing, not that the image is undetectable; see [Steganalysis](#steganalysis). With 2 or more bits per channel the encoder still uses replacement, so a large payload at `-b 2` or above is flagged.
 
 ### Example
 
@@ -329,11 +342,13 @@ go test ./steg/ -bench=BenchmarkDecodeBySize -benchtime=3s -benchmem
 - **Integrity / authentication** — HMAC-SHA256 over the plaintext padded block (real-length prefix, payload and padding), encrypted alongside it. A wrong password or any bit-flip in the encrypted region produces a MAC failure; no plaintext is returned.
 - **Resistance to brute force** — Argon2id with 64 MiB memory requirement makes offline dictionary attacks expensive, even on GPU hardware.
 - **Keystream uniqueness** — A fresh `crypto/rand` 16-byte salt is generated on every encode and stored in plaintext in the image header. Argon2id derives the cipher nonce from the password and this salt, so each encode produces a unique payload keystream even when the same password and carrier are reused.
-- **Pixel order** — The salt has to be found before any key exists, so the salt pixel positions are public by design: anyone can compute them from the image size and settings. Everything after them is placed by a Fisher-Yates shuffle keyed with Argon2id output, so recomputing the order for a guessed password costs a full KDF call (previously the order came from SHA-256 of the password, which made guesses cheap). Be clear about what this buys today: nothing. The encoder fills the whole carrier, so every pixel carries data and the secret order hides nothing about *where* the data is. It starts to matter with bounded padding ([Next steps](#next-steps), item 2), when only part of the image is written; this change was its prerequisite.
+- **Pixel order** — The salt has to be found before any key exists, so the salt pixel positions are public by design: anyone can compute them from the image size and settings. Everything after them is placed by a Fisher-Yates shuffle keyed with Argon2id output, so recomputing the order for a guessed password costs a full KDF call (previously the order came from SHA-256 of the password, which made guesses cheap). With bounded padding the encoder writes only the stream prefix up to the end of the tag, so the pixels it touches are a pseudorandom subset spread over the whole image, and which subset depends on Argon2id output. Without the password an attacker cannot single out the pixels that carry data, only estimate how many there are. When the payload fills the carrier every pixel carries data and the order hides nothing about *where* it is.
+- **Payload size** — padding to a power-of-two bucket hides the size only to within a factor of two: a 31-byte and a 4,000-byte payload look the same, a 5,000-byte one does not. The bucket length is encrypted, so reading it needs the password, but the number of changed pixels grows with the bucket, so a steganalyst who can estimate the embedding rate learns roughly which bucket was used. The previous full-carrier padding hid the size completely, at the cost of maximal disturbance.
 
 ### What steg does not protect against
 
-- An attacker who can compare the carrier and the steg image pixel-by-pixel will observe that the LSBs of R, G, and B channels differ from a typical natural image distribution (statistical steganalysis).
+- An attacker who has the original carrier can compare it pixel by pixel with the steg image and see exactly which pixels changed, and from their number the approximate payload bucket.
+- Steganalysis beyond chi-square and RS. At 1 bit per channel LSB matching defeats both tests in `steg detect`, but modern detectors (histogram characteristic-function attacks, rich models such as SRM with a trained classifier) do detect LSB matching at high embedding rates, especially in smooth regions. At 2–8 bits per channel the encoder uses replacement, which the built-in tests catch at high embedding rates.
 
 ---
 
@@ -348,11 +363,14 @@ Bit offset           Size        Cipher                  Field
 128                  32 bits     AES-128-CTR (payload)   Container length (uint32, LE)
 160                  32 bits     AES-128-CTR (payload)   Real payload length (uint32, LE)
 192                  N×8 bits    AES-128-CTR (payload)   Real payload bytes
-192 + N×8            P×8 bits    AES-128-CTR (payload)   Random padding (fills to capacity)
+192 + N×8            P×8 bits    AES-128-CTR (payload)   Random padding (to the bucket size)
 192 + (N+P)×8        256 bits    AES-128-CTR (payload)   HMAC-SHA256 tag
+                                                         (stream ends here; later pixels untouched)
 ```
 
-A single AES-128-CTR payload cipher (`AES-CTR(encKey, payloadNonce)`) encrypts everything from bit 128 onward. The 16-byte `randomSalt` at bits 0–127 is stored in plaintext — an attacker who sees it still cannot derive any keys without the password. Argon2id takes the password and `randomSalt` and produces all key material (encKey, macKey, payloadNonce, orderKey) in a single call, so no bootstrap cipher is needed. Every encode writes the full image capacity, so the LSB distribution is uniformly disturbed regardless of payload size.
+The padded block (real length + payload + padding, `4 + N + P` bytes) is `max(4096, nextPowerOfTwo(4 + N))` bytes, or `capacity + 4` bytes when that bucket does not fit the carrier, in which case the stream fills the carrier exactly. A single AES-128-CTR payload cipher (`AES-CTR(encKey, payloadNonce)`) encrypts everything from bit 128 onward. The 16-byte `randomSalt` at bits 0–127 is stored in plaintext — an attacker who sees it still cannot derive any keys without the password. Argon2id takes the password and `randomSalt` and produces all key material (encKey, macKey, payloadNonce, orderKey) in a single call, so no bootstrap cipher is needed.
+
+The decoder accepts any container length up to `capacity + 4`, so images written by the previous full-carrier encoder decode with this build and vice versa; bounded padding and LSB matching did not change the format.
 
 The pixel order (`cursors/order.go`) is built in two parts of one Fisher-Yates shuffle over all pixels:
 
@@ -498,7 +516,9 @@ Two GitHub Actions workflows:
 | Library carriers: `*image.RGBA` / `*image.NRGBA` only | Low | `steg.Encode`, `Decode`, `EncodeParallel` and `DecodeParallel` reject every other `draw.Image` type (error wraps `cursors.ErrUnsupportedImage`) before touching a pixel, because color conversion (premultiplication, luma, 16-bit truncation) would destroy the hidden bits. Convert first with `draw.Draw` into an `*image.RGBA`. An `*image.NRGBA` with translucent pixels round-trips in memory; the CLI's transparency rule is about saving to files. The CLI converts every input itself. |
 | Size limits | Low | At most 2³²−1 pixels per carrier (the pixel order uses 4-byte indices), and at most 4 GiB of capacity (the container length field is 32 bits). Invalid settings (bits per channel outside 1–8, channels outside 1–3) are rejected by the library as well as the CLI. |
 | Images from earlier builds | Low | The pixel order changed and there is no format version field; an older image fails to decode exactly as with a wrong password. Decode it with the binary that created it. |
-| Statistical steganalysis | Medium | Modifying the LSBs of color channels across a pseudorandom pixel set produces a detectable statistical signature. The built-in `detect` command uses chi-square and RS analysis to surface this. Because the encoder always fills the carrier, both chi-square and RS analysis flag every channel written to on a natural photograph. RS analysis is less reliable on small images. Higher bits-per-channel settings make signatures more pronounced. |
+| Statistical steganalysis | Medium | At 1 bit per channel the encoder uses LSB matching, which chi-square and RS analysis (the tests in `steg detect`) are not built to see: a 1024×1536 photo reads `CLEAN` even when filled to capacity. That is not undetectability. Modern detectors (histogram characteristic-function attacks, rich models such as SRM with a trained classifier) detect LSB matching at high embedding rates, especially in smooth regions; adaptive embedding ([Next steps](#next-steps)) is what addresses that. With 2–8 bits per channel the encoder uses replacement, and a large payload is flagged by the built-in tests. |
+| Payload size only bucketed | Low | The padded block is a power-of-two bucket of at least 4 KiB, so the payload size is hidden only to within a factor of two. The bucket is encrypted, but the number of changed pixels grows with it, so an embedding-rate estimate reveals it roughly. A payload that fills the carrier hides its size completely. |
+| Output not reproducible | Info | The salt is fresh on every encode, and the ±1 directions of LSB matching come from `crypto/rand`, so encoding the same input twice gives different images. Both are independent of the password. |
 
 ---
 
@@ -508,15 +528,23 @@ The `detect` command runs two complementary statistical tests against the image'
 
 ### Chi-square test
 
-Compares the histogram of pixel value pairs `(2k, 2k+1)` per channel. In a natural image these pairs are unequal; LSB embedding equalises them. Only pairs that occur in the image count: the degrees of freedom are the number of occupied pairs minus one (shown as `df`), and the p-value is the exact chi-square upper tail. A high p-value (> 0.05) for a channel is flagged as suspicious. A channel with fewer than two occupied pairs is reported as `too few distinct values to test` and not flagged.
+Compares the histogram of pixel value pairs `(2k, 2k+1)` per channel. In a natural image these pairs are unequal; LSB replacement equalises them (LSB matching does not; see below). Only pairs that occur in the image count: the degrees of freedom are the number of occupied pairs minus one (shown as `df`), and the p-value is the exact chi-square upper tail. A high p-value (> 0.05) for a channel is flagged as suspicious. A channel with fewer than two occupied pairs is reported as `too few distinct values to test` and not flagged.
 
-**Performance:** correctly identifies which channels were written to; untouched channels stay at p ≈ 0.0000. On a channel fully overwritten with random bits the p-value is roughly uniform between 0 and 1, so each written channel falls below 0.05 about 5% of the time by chance. A full-capacity R+G+B encode therefore reads `LIKELY_STEGO` most of the time (about 86% in our estimate) and `SUSPICIOUS` otherwise; RS analysis does not have this variance.
+**Performance against LSB replacement:** correctly identifies which channels were written to; untouched channels stay at p ≈ 0.0000. On a channel fully overwritten by replacement the p-value is roughly uniform between 0 and 1, so each written channel falls below 0.05 about 5% of the time by chance. A full-capacity R+G+B replacement encode therefore reads `LIKELY_STEGO` most of the time (about 86% in our estimate) and `SUSPICIOUS` otherwise; RS analysis does not have this variance.
+
+**Against this tool's output:** at 1 bit per channel the encoder uses LSB matching, whose changes cross pair boundaries instead of equalising each pair, so the pairs stay as uneven as in the original and p stays at 0.0000 even with the carrier full. At 2–8 bits per channel the encoder uses replacement and the test works as above.
 
 ### RS analysis
 
-Measures local pixel smoothness using regular (`R`) and singular (`S`) group fractions under a positive (`Rm`, `Sm`) and a negative (`R-m`, `S-m`) flipping mask. In a clean photograph `Rm ≈ R-m`. LSB embedding pulls `Rm` down toward `Sm` while pushing `R-m` up, so the reported asymmetry `Rm − R-m` turns negative (Fridrich, Goljan, Du). A channel with asymmetry below `−0.02` is flagged as suspicious.
+Measures local pixel smoothness using regular (`R`) and singular (`S`) group fractions under a positive (`Rm`, `Sm`) and a negative (`R-m`, `S-m`) flipping mask. In a clean photograph `Rm ≈ R-m`. LSB replacement pulls `Rm` down toward `Sm` while pushing `R-m` up, so the reported asymmetry `Rm − R-m` turns negative (Fridrich, Goljan, Du). A channel with asymmetry below `−0.02` is flagged as suspicious.
 
-**Performance:** on a 1024×1536 photograph the clean channels measure −0.002 to −0.006, and the same photo after a default full-capacity encode measures −0.040 to −0.048. All three stego channels are flagged and none of the clean ones are. Because the tool always fills the whole carrier, every image it produces shows this shift on every channel it writes to. The statistic is noisier on small images (below roughly 512×512), where a clean channel can cross the threshold by chance. Images whose LSB plane is already artificial (for example, synthetic images with all-even values) can have a large clean asymmetry and are not a meaningful baseline.
+**Performance against LSB replacement:** on a 1024×1536 photograph the clean channels measure −0.002 to −0.006, and the same photo after a full-capacity replacement encode (the previous encoder) measures −0.040 to −0.048. All three stego channels are flagged and none of the clean ones are.
+
+**Against this tool's output:** RS models the flipping pattern of replacement, and LSB matching does not produce it. At 1 bit per channel the asymmetry stays near the clean value for small and medium payloads (−0.0047 / −0.0014 / −0.0057 for a 31-byte payload on the photo above) and moves toward zero, not below −0.02, when the carrier is full (−0.0014 / +0.0014 / −0.0015). That shift is real but far from the threshold; a detector calibrated on the clean image might notice it, `steg detect` does not. At 2–8 bits per channel the encoder uses replacement and large payloads are flagged.
+
+Both tests remain useful as detectors of LSB replacement, which is what most simple steganography tools do. A `CLEAN` verdict on this tool's 1-bit output says only that these two tests found nothing; stronger detectors for LSB matching exist and are outside this repository's tooling.
+
+The RS statistic is noisier on small images (below roughly 512×512), where a clean channel can cross the threshold by chance. Images whose LSB plane is already artificial (for example, synthetic images with all-even values) can have a large clean asymmetry and are not a meaningful baseline.
 
 ### Verdict thresholds
 
@@ -532,90 +560,65 @@ Measures local pixel smoothness using regular (`R`) and singular (`S`) group fra
 
 ## Next steps
 
-The weakest point of the current design is not the cryptography but the
-detectability of the embedding itself. `steg detect` flags every image the
-tool produces, and it does so without needing the password. The items below
-attack that problem, in priority order.
+The weakest point of the design is not the cryptography but the detectability
+of the embedding itself. Until recently `steg detect` flagged every image the
+tool produced, without needing the password. LSB matching and bounded padding
+(below, done) put the tool's 1-bit output out of reach of chi-square and RS
+analysis; the remaining items are about the stronger detectors those two
+changes do not address.
 
-### 1. LSB matching instead of LSB replacement
+### Done: LSB matching instead of LSB replacement
 
-Every colour value is a number between 0 and 255, and its lowest bit is just
-whether the number is even or odd. Hiding a bit means forcing that value to be
-even or odd.
+Every colour value is a number between 0 and 255, and its lowest bit is whether
+it is even or odd. Replacement forced that bit directly, so a pixel never left
+its pair (100↔101, 102↔103, …): encrypted data, half zeros and half ones,
+evened out the counts inside every pair, which is exactly what chi-square
+measures. At 1 bit per channel the encoder now adds or subtracts 1 at random
+when the bit must change (0 can only go up, 255 only down), so a value at 100
+that must carry a 1 becomes 101 or 99. The decoder reads the same bit and was
+not changed. The ±1 directions come from a per-cursor ChaCha8 generator seeded
+from `crypto/rand`, independent of the password and keys. With 2–8 bits per
+channel the encoder still uses replacement.
 
-**What happens today.** If a pixel is 100 and the bit to hide is 1, the
-encoder writes 101. If it is 101 and the bit is 0, it writes 100. A pixel
-never leaves its own pair: 100 and 101 are partners, 102 and 103 are
-partners, and so on.
+**Measured effect:** on `dude.png` filled to capacity, chi-square p went from
+0.62 / 0.13 / 0.95 to 0.0000 on every channel, and RS asymmetry from about
+−0.043 to between −0.0015 and +0.0014: `LIKELY_STEGO` became `CLEAN`.
 
-**Why that is detectable.** A natural photograph has uneven counts inside
-each pair — maybe 500 pixels at 100 and 380 at 101, because that is how the
-scene happened to look. Encrypted data is half zeros and half ones, so
-embedding it pushes half of those pixels to even and half to odd, and the pair
-ends up at 440 / 440. This happens across all 128 pairs at once, and no
-natural image has all 128 pairs balanced. The chi-square test does not look
-for the payload; it only measures whether the pairs are suspiciously even.
-With replacement they always are.
+### Done: Bounded padding
 
-**The alternative.** When the pixel's bit does not match the bit to hide,
-flip a coin and add or subtract 1 instead of jumping to the partner. A pixel
-at 100 that must carry a 1 becomes either 101 or 99. Both are odd, so the
-decoder reads exactly what it reads today, but half of the changes now land in
-a neighbouring pair rather than the pixel's own. The surplus at 100 is spread
-between 99 and 101 instead of being dumped entirely on 101.
+The padded block is now `max(4096, nextPowerOfTwo(4 + payload))` bytes, or
+the whole carrier when that bucket does not fit, and pixels past the end of
+the stream keep their original values. Because the pixel order after the salt
+is keyed by Argon2id output, the touched pixels are a keyed pseudorandom
+subset spread over the image.
 
-**The effect.** Pairs no longer balance. Each modification is a ±1 step in a
-random direction, which is indistinguishable from ordinary sensor noise. The
-histogram gets slightly smoother, as if the photo were a touch noisier, but the
-pair structure that chi-square and RS analysis are built to find never
-appears. Both tests in `steg detect` stop working.
+**Measured effect:** a 31-byte text in `dude.png` changes 9,724 pixels (0.62%)
+instead of 1,375,953 (87.5%). The cost is that the payload size is hidden only
+to within a power of two (see [Security design](#security-design)).
 
-**What it does not fix.** Modern detectors trained on relationships between
-neighbouring pixels can still see unusual noise in smooth regions such as sky
-or walls when the embedding rate is high. That is what adaptive embedding
-(item 3) addresses. Matching alone moves the tool out of the "detectable with
-a 50-line script" category, which is where it sits today.
+### 1. Adaptive embedding
 
-**Implementation notes.**
-- The change lives in `WriteByte` in `cursors/rng_cursor.go`. The decoder is
-  untouched and existing images remain readable.
-- Values 0 and 255 cannot move in both directions; the only valid direction is
-  forced.
-- The ±1 coin must come from a source independent of the password so that the
-  direction of each step leaks nothing about the key.
+LSB matching defeats chi-square and RS, but modern detectors (histogram
+characteristic-function attacks, rich models such as SRM with a trained
+classifier) still see ±1 noise in smooth regions such as sky or walls when the
+embedding rate is high. Skip smooth regions, where any LSB change stands out,
+and embed only in pixels with high local variance. The decoder must
+reconstruct the same selection without knowing the payload, so the criterion
+has to be computed from bits that are never modified — typically the upper
+seven bits of each channel.
 
-### 2. Bounded padding
-
-Padding currently fills the entire carrier with random bytes, so a one-byte
-payload randomises every pixel in the image and maximises the statistical
-signal. Padding exists to hide the payload length, and that goal is met just
-as well by rounding up to a fixed multiple (for example 4 KiB) or to a
-fraction of the capacity. Combined with matching this drastically reduces the
-footprint.
-
-The prerequisite is now in place: the pixel order after the salt is keyed by
-Argon2id output rather than by a cheap hash of the password, so once only part
-of the image is written, computing which pixels carry data requires the
-password, and testing a password guess costs a full KDF call.
-
-### 3. Adaptive embedding
-
-Skip smooth regions, where any LSB change stands out, and embed only in
-pixels with high local variance. The decoder must reconstruct the same
-selection without knowing the payload, so the criterion has to be computed
-from bits that are never modified — typically the upper seven bits of each
-channel.
-
-### 4. Close the loop with `detect`
+### 2. Close the loop with `detect`
 
 Have `encode` run the steganalysis on its own output and warn when the result
-is detectable. (The RS test's threshold had the wrong sign; that is fixed, so
-both tests now give a usable signal.) Without this the three items above cannot
-be measured. A benchmark in `cmd/attack1` comparing
-replacement, matching, and adaptive embedding across a set of images would
-make the trade-offs concrete.
+is detectable. Chi-square and RS no longer flag 1-bit output, so the warning
+is mainly useful at 2–8 bits per channel, or with a stronger detector. A
+benchmark in `cmd/attack1` comparing replacement, matching, and adaptive
+embedding across a set of images, at several payload sizes, would make the
+trade-offs concrete; `TestEncoderOutputEvadesDetectors` and
+`TestEncoderOutputReplacementAboveOneBit` in `steg/analysis` are a first
+guard.
 
-### 5. Pipe mode
+### 3. Pipe mode
 
 Read the payload from stdin and write to stdout so `steg` composes with
 `tar`, `gpg`, or `age` in a pipeline.
