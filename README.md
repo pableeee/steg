@@ -24,6 +24,7 @@
 - [Development](#development)
 - [Known limitations](#known-limitations)
 - [Steganalysis](#steganalysis)
+  - [Trained detector: `stegbench`](#trained-detector-stegbench)
 - [Next steps](#next-steps)
 - [Roadmap](#roadmap)
 
@@ -42,6 +43,7 @@
 - **`capacity` command** — prints a table of usable byte capacity for every (channels × bits-per-channel) combination for a given image.
 - **`test-visual` command** — generates carrier images filled to capacity at every encoding intensity for side-by-side visual comparison.
 - **`detect` command** — runs chi-square and RS steganalysis on any image and reports a per-channel verdict (`CLEAN` / `SUSPICIOUS` / `LIKELY_STEGO`).
+- **`stegbench` benchmark** — measures how detectable LSB replacement, LSB matching and the real encoder are against a trained SPAM + FLD-ensemble detector, as well as chi-square and RS, over a corpus of cover images (see [Trained detector: `stegbench`](#trained-detector-stegbench)).
 - **Multiple image formats** — PNG, BMP, and TIFF are supported as both input and output.
 - **Parallel mode** — a worker-pool implementation (`-P`) spreads encode/decode across all available CPUs; on large images it is about 2.5–3.7× faster than the sequential path (see [Performance](#performance)).
 - **Interoperable modes** — images encoded with the sequential path can be decoded with the parallel path and vice versa.
@@ -348,7 +350,7 @@ go test ./steg/ -bench=BenchmarkDecodeBySize -benchtime=3s -benchmem
 ### What steg does not protect against
 
 - An attacker who has the original carrier can compare it pixel by pixel with the steg image and see exactly which pixels changed, and from their number the approximate payload bucket.
-- Steganalysis beyond chi-square and RS. At 1 bit per channel LSB matching defeats both tests in `steg detect`, but modern detectors (histogram characteristic-function attacks, rich models such as SRM with a trained classifier) do detect LSB matching at high embedding rates, especially in smooth regions. At 2–8 bits per channel the encoder uses replacement, which the built-in tests catch at high embedding rates.
+- Steganalysis beyond chi-square and RS. At 1 bit per channel LSB matching defeats both tests in `steg detect`, but a trained detector does not need them: on never-compressed grayscale images the SPAM + FLD ensemble in `steg/analysis` tells LSB-matching stegos at 0.1 bits per pixel from covers with an average error of 16% (P_E ≈ 0.16; 50% would be guessing), and stronger modern detectors exist (see [Trained detector: `stegbench`](#trained-detector-stegbench)). At 2–8 bits per channel the encoder uses replacement, which the built-in tests catch at high embedding rates.
 
 ---
 
@@ -426,7 +428,8 @@ Both the sequential and the parallel paths get the order from `prepareEncode` / 
 | `steg/container` | Payload framing (length prefix + HMAC tag); constant-time tag verification |
 | `cursors` | `order.go` (pixel order: public ChaCha8 prefix for the salt, keyed suffix — format-defining), `RNGCursor` (bit↔pixel mapping over a given order; reads and writes the `Pix` bytes of `*image.RGBA` / `*image.NRGBA` directly), `CursorAdapter` (byte↔bit bridge), `CipherMiddleware` (transparent encrypt/decrypt) |
 | `cipher` | AES-128 CTR stream cipher; bit- and byte-addressable keystream; seekable |
-| `steg/analysis` | Chi-square and RS steganalysis detectors; `Analyze()` returns a combined verdict |
+| `steg/analysis` | Chi-square and RS steganalysis detectors (`Analyze()` returns the combined verdict `steg detect` prints); second-order SPAM features (`SPAM`) and a trained Fisher-linear-discriminant ensemble (`TrainEnsemble`, `Ensemble.Predict` / `Votes`), with a plain-Go Cholesky solver |
+| `cmd/stegbench` | Steganalysis benchmark: embeds into a corpus of covers (simulated replacement and matching, or the real encoder), trains and tests the SPAM ensemble, and reports P_E with chi-square and RS flag rates |
 | `mocks` | Auto-generated gomock mocks for `Cursor` and `StreamCipherBlock` interfaces |
 | `testutil` | `MemReadWriteSeeker` in-memory helper for tests |
 
@@ -476,12 +479,13 @@ go test ./steg/ -bench=BenchmarkDecodeBySize -benchtime=3s -benchmem
 ├── cmd/
 │   ├── steg/        # CLI entry point (Cobra)
 │   ├── attack1/     # Steganalysis report over one or more images (built on steg/analysis)
-│   └── attack4/     # Dictionary attack using the real decode path as password oracle
+│   ├── attack4/     # Dictionary attack using the real decode path as password oracle
+│   └── stegbench/   # Steganalysis benchmark: SPAM + FLD ensemble, chi-square, RS over a cover corpus
 ├── cursors/         # Pixel order, RNGCursor, CursorAdapter, CipherMiddleware
 ├── docs/            # Technical spec, ADRs, release notes
 ├── mocks/           # Auto-generated gomock mocks
 ├── steg/            # Encode/decode orchestration, container framing
-│   ├── analysis/    # Chi-square and RS steganalysis detectors
+│   ├── analysis/    # Chi-square, RS, SPAM features + FLD ensemble (spam.go, ensemble.go, linalg.go)
 │   └── container/
 └── testutil/        # Shared test helpers
 ```
@@ -516,7 +520,7 @@ Two GitHub Actions workflows:
 | Library carriers: `*image.RGBA` / `*image.NRGBA` only | Low | `steg.Encode`, `Decode`, `EncodeParallel` and `DecodeParallel` reject every other `draw.Image` type (error wraps `cursors.ErrUnsupportedImage`) before touching a pixel, because color conversion (premultiplication, luma, 16-bit truncation) would destroy the hidden bits. Convert first with `draw.Draw` into an `*image.RGBA`. An `*image.NRGBA` with translucent pixels round-trips in memory; the CLI's transparency rule is about saving to files. The CLI converts every input itself. |
 | Size limits | Low | At most 2³²−1 pixels per carrier (the pixel order uses 4-byte indices), and at most 4 GiB of capacity (the container length field is 32 bits). Invalid settings (bits per channel outside 1–8, channels outside 1–3) are rejected by the library as well as the CLI. |
 | Images from earlier builds | Low | The pixel order changed and there is no format version field; an older image fails to decode exactly as with a wrong password. Decode it with the binary that created it. |
-| Statistical steganalysis | Medium | At 1 bit per channel the encoder uses LSB matching, which chi-square and RS analysis (the tests in `steg detect`) are not built to see: a 1024×1536 photo reads `CLEAN` even when filled to capacity. That is not undetectability. Modern detectors (histogram characteristic-function attacks, rich models such as SRM with a trained classifier) detect LSB matching at high embedding rates, especially in smooth regions; adaptive embedding ([Next steps](#next-steps)) is what addresses that. With 2–8 bits per channel the encoder uses replacement, and a large payload is flagged by the built-in tests. |
+| Statistical steganalysis | Medium | At 1 bit per channel the encoder uses LSB matching, which chi-square and RS analysis (the tests in `steg detect`) do not see: a 1024×1536 photo reads `CLEAN` even when filled to capacity. A trained detector does see it. On BOSSbase (never-compressed grayscale) the SPAM + FLD ensemble reaches P_E ≈ 0.22 at 0.05 bits per pixel and ≈ 0.16 at 0.1, the same as for replacement; the 4 KiB padding floor alone is 0.127 bits per pixel in a 512×512 single-channel carrier, where the real encoder measures P_E ≈ 0.22 (see [`stegbench`](#trained-detector-stegbench)). Stronger detectors than SPAM exist, so these are upper bounds on how hard the output is to detect. Lowering the floor and adaptive embedding ([Next steps](#next-steps)) are the answers. With 2–8 bits per channel the encoder uses replacement, and a large payload is flagged by the built-in tests. |
 | Payload size only bucketed | Low | The padded block is a power-of-two bucket of at least 4 KiB, so the payload size is hidden only to within a factor of two. The bucket is encrypted, but the number of changed pixels grows with it, so an embedding-rate estimate reveals it roughly. A payload that fills the carrier hides its size completely. |
 | Output not reproducible | Info | The salt is fresh on every encode, and the ±1 directions of LSB matching come from `crypto/rand`, so encoding the same input twice gives different images. Both are independent of the password. |
 
@@ -524,7 +528,7 @@ Two GitHub Actions workflows:
 
 ## Steganalysis
 
-The `detect` command runs two complementary statistical tests against the image's LSB distribution.
+`steg/analysis` has three detectors. Two are fixed statistical tests that need no training, chi-square and RS analysis; they are what the `detect` command runs, and they are built for LSB replacement. The third is a trained classifier, SPAM features with a Fisher-linear-discriminant ensemble, which also detects LSB matching; it needs a set of cover and stego images to train on, so `steg detect` does not run it. `cmd/stegbench` trains and evaluates it (see [Trained detector: `stegbench`](#trained-detector-stegbench)).
 
 ### Chi-square test
 
@@ -542,7 +546,7 @@ Measures local pixel smoothness using regular (`R`) and singular (`S`) group fra
 
 **Against this tool's output:** RS models the flipping pattern of replacement, and LSB matching does not produce it. At 1 bit per channel the asymmetry stays near the clean value for small and medium payloads (−0.0047 / −0.0014 / −0.0057 for a 31-byte payload on the photo above) and moves toward zero, not below −0.02, when the carrier is full (−0.0014 / +0.0014 / −0.0015). That shift is real but far from the threshold; a detector calibrated on the clean image might notice it, `steg detect` does not. At 2–8 bits per channel the encoder uses replacement and large payloads are flagged.
 
-Both tests remain useful as detectors of LSB replacement, which is what most simple steganography tools do. A `CLEAN` verdict on this tool's 1-bit output says only that these two tests found nothing; stronger detectors for LSB matching exist and are outside this repository's tooling.
+Both tests remain useful as detectors of LSB replacement, which is what most simple steganography tools do. A `CLEAN` verdict on this tool's 1-bit output says only that these two tests found nothing; the trained detector below does see LSB matching.
 
 The RS statistic is noisier on small images (below roughly 512×512), where a clean channel can cross the threshold by chance. Images whose LSB plane is already artificial (for example, synthetic images with all-even values) can have a large clean asymmetry and are not a meaningful baseline.
 
@@ -556,6 +560,66 @@ The RS statistic is noisier on small images (below roughly 512×512), where a cl
 
 `n` = number of test×channel combinations (6 for a 3-channel image).
 
+### Trained detector: `stegbench`
+
+`cmd/stegbench` measures how detectable an embedding method is at a given embedding rate (bits per pixel, bpp) against a detector that has been trained for it, the setting modern steganalysis assumes.
+
+**Detector.** Second-order SPAM features (Pevný, Bas, Fridrich, IEEE TIFS 2010): truncated differences between neighbouring pixels (T = 3) in 8 directions, modelled as a second-order Markov chain, 686 features per image plane. They feed a Fisher-linear-discriminant ensemble (Kodovský, Fridrich, Holub, IEEE TIFS 2012): 51 base learners, each trained on a random 300-feature subspace and a bootstrap sample, majority vote. The paper's out-of-bag search for the number of learners and the subspace size is not implemented; both are fixed (`-learners`, `-subspace` override them). Everything is plain Go, no new dependency. The sign convention of the differences follows the paper's equation; the reference MATLAB code may pair them the other way round, which amounts to analysing the intensity-inverted image: same detection power, but not numerically identical to published features.
+
+**Method.** For each cover image, `stegbench` makes one stego image per (method, rate):
+
+- `replacement` — simulated LSB replacement at `round(rate × N)` uniformly random pixels with random message bits;
+- `matching` — the same with LSB matching (±1 at random when the bit must change), which is what `steg encode` does at 1 bit per channel;
+- `tool` — the real `steg.Encode` (1 channel × 1 bit; the plane goes into R = G = B of an RGBA image), with the payload sized to the bounded-padding bucket whose rate is closest to the requested one.
+
+It extracts SPAM features from every cover and stego, then over several random splits trains the ensemble on half the images and tests it on the other half. A cover and its stegos always land in the same half. It reports P_E = (P_FA + P_MD) / 2 on the test half, mean ± standard deviation over the splits (P_FA: covers called stego, P_MD: stegos called cover; 0.5 is guessing), plus the fraction of covers and of stegos that chi-square and RS flag. All randomness is derived from `-seed`, so runs are reproducible, except `tool` rows (the encoder's salt and ±1 directions come from `crypto/rand`). `tool` runs Argon2id for every image, about 64 MiB per worker.
+
+**Running it.** Covers are `.pgm` (binary P5, 8-bit) or `.png` files directly in `-dir` (grayscale, or one colour channel chosen with `-channel`). The standard corpus is BOSSbase 1.01, 10,000 never-compressed 512×512 grayscale images:
+
+```bash
+mkdir -p ~/datasets/bossbase/extracted
+(cd ~/datasets/bossbase &&
+  curl -O https://dde.binghamton.edu/download/ImageDB/BOSSbase_1.01.zip &&
+  unzip -q BOSSbase_1.01.zip -d extracted)
+
+# from the repository root
+go run ./cmd/stegbench -dir ~/datasets/bossbase/extracted/BOSSbase_1.01
+go run ./cmd/stegbench -dir ~/datasets/bossbase/extracted/BOSSbase_1.01 -methods matching -rates 0.005,0.01,0.02
+go run ./cmd/stegbench -dir ~/datasets/bossbase/extracted/BOSSbase_1.01 -n 500 -methods matching,tool -rates 0.127,0.25,0.5,1
+go run ./cmd/stegbench -h   # all flags
+```
+
+The default run (replacement and matching at 0.05, 0.1, 0.2, 0.4 and 1 bpp, 5 splits of 5,000 / 5,000 images) takes 81 s and peaks at 1.8 GB of memory on a 32-thread Ryzen 9 9950X3D.
+
+**Results** on BOSSbase 1.01, all 10,000 images, 5 splits. "Changed" is the fraction of pixels whose value changed; chi-square and RS give the fraction of covers / stegos flagged.
+
+| Method | Rate (bpp) | Changed | P_E (mean ± std) | P_FA | P_MD | chi-square cover / stego | RS cover / stego |
+|---|---|---|---|---|---|---|---|
+| replacement | 0.05 | 0.025 | 0.2259 ± 0.0033 | 0.2564 | 0.1954 | 0.000 / 0.000 | 0.019 / 0.284 |
+| replacement | 0.1 | 0.05 | 0.1581 ± 0.0043 | 0.1722 | 0.1441 | 0.000 / 0.000 | 0.019 / 0.755 |
+| replacement | 0.2 | 0.1 | 0.0813 ± 0.0028 | 0.0922 | 0.0704 | 0.000 / 0.001 | 0.019 / 0.945 |
+| replacement | 0.4 | 0.2 | 0.0216 ± 0.0005 | 0.0210 | 0.0223 | 0.000 / 0.007 | 0.019 / 0.991 |
+| replacement | 1 | 0.5 | 0.0039 ± 0.0002 | 0.0055 | 0.0022 | 0.000 / 0.945 | 0.019 / 1.000 |
+| matching | 0.005 | 0.0025 | 0.4342 ± 0.0014 | 0.4551 | 0.4132 | 0.000 / 0.000 | 0.019 / 0.020 |
+| matching | 0.01 | 0.005 | 0.3831 ± 0.0048 | 0.4089 | 0.3573 | 0.000 / 0.000 | 0.019 / 0.020 |
+| matching | 0.02 | 0.01 | 0.3201 ± 0.0053 | 0.3500 | 0.2902 | 0.000 / 0.000 | 0.019 / 0.021 |
+| matching | 0.05 | 0.025 | 0.2246 ± 0.0033 | 0.2468 | 0.2023 | 0.000 / 0.000 | 0.019 / 0.027 |
+| matching | 0.1 | 0.05 | 0.1601 ± 0.0063 | 0.1806 | 0.1396 | 0.000 / 0.000 | 0.019 / 0.040 |
+| matching | 0.2 | 0.1 | 0.1025 ± 0.0014 | 0.1181 | 0.0870 | 0.000 / 0.000 | 0.019 / 0.052 |
+| matching | 0.4 | 0.2 | 0.0587 ± 0.0025 | 0.0701 | 0.0473 | 0.000 / 0.000 | 0.019 / 0.068 |
+| matching | 1 | 0.5 | 0.0162 ± 0.0010 | 0.0207 | 0.0117 | 0.000 / 0.000 | 0.019 / 0.075 |
+
+The real encoder matches the simulation. On 500 images, at the rates bounded padding can reach in a 512×512 single-channel carrier (0.1266 bpp is the 4 KiB floor; then 0.2516, 0.5016 and 1.0), P_E for `tool` vs `matching` was 0.223 vs 0.208 at 0.127 bpp, 0.144 vs 0.136 at 0.25, 0.085 vs 0.079 at 0.5 and 0.031 vs 0.031 at 1.0, equal within split noise.
+
+**What this shows:**
+
+1. **Chi-square and RS are blind to LSB matching.** Chi-square flags no matching stego at any rate; RS flags 2–7.5% of them, against 1.9% of covers. RS does catch replacement from 0.1 bpp (76% of stegos, 95% at 0.2).
+2. **Against the trained detector, matching is no better than replacement at low rates.** At 0.05 and 0.1 bpp P_E is about 0.22 and 0.16 for both. Matching helps only from 0.2 bpp up (0.10 vs 0.08 at 0.2, 0.016 vs 0.004 at 1). Its benefit is against the simple tests, not against a modern detector.
+3. **The embedding rate dominates.** P_E for matching goes 0.43 at 0.005 bpp, 0.38 at 0.01, 0.32 at 0.02, 0.22 at 0.05.
+4. **The bounded-padding floor matters.** A 4 KiB minimum block is 0.127 bpp in a 512×512 single-channel carrier, where P_E is about 0.15–0.2: caught most of the time. In a 1024×1536 colour image with 3 channels the same floor is about 0.007 bits per channel value, a rate at which a single grayscale plane gives P_E around 0.4. That comparison is only indicative: a detector that uses the correlation between colour channels, a different cover source and any JPEG history in the carrier all change the picture.
+
+**Caveats.** BOSSbase is never-compressed, the easiest setting for the detector. The detector is trained on the same cover source and the same rate it is tested on, an idealised attacker. SPAM dates from 2010; stronger detectors (rich models such as SRM, convolutional networks) exist. The P_E values above are therefore an upper bound on how hard the output is to detect, not a guarantee.
+
 ---
 
 ## Next steps
@@ -564,8 +628,9 @@ The weakest point of the design is not the cryptography but the detectability
 of the embedding itself. Until recently `steg detect` flagged every image the
 tool produced, without needing the password. LSB matching and bounded padding
 (below, done) put the tool's 1-bit output out of reach of chi-square and RS
-analysis; the remaining items are about the stronger detectors those two
-changes do not address.
+analysis. `stegbench` (also done) shows that a trained detector still sees it,
+and that the embedding rate is what decides how well; the remaining items
+lower that rate or make each changed bit harder to see.
 
 ### Done: LSB matching instead of LSB replacement
 
@@ -596,29 +661,55 @@ subset spread over the image.
 instead of 1,375,953 (87.5%). The cost is that the payload size is hidden only
 to within a power of two (see [Security design](#security-design)).
 
-### 1. Adaptive embedding
+### Done: Steganalysis benchmark
 
-LSB matching defeats chi-square and RS, but modern detectors (histogram
-characteristic-function attacks, rich models such as SRM with a trained
-classifier) still see ±1 noise in smooth regions such as sky or walls when the
-embedding rate is high. Skip smooth regions, where any LSB change stands out,
-and embed only in pixels with high local variance. The decoder must
-reconstruct the same selection without knowing the payload, so the criterion
-has to be computed from bits that are never modified — typically the upper
-seven bits of each channel.
+`cmd/stegbench` trains a SPAM + FLD-ensemble detector and measures P_E for
+simulated replacement, simulated matching and the real encoder across
+embedding rates (see [Trained detector: `stegbench`](#trained-detector-stegbench)).
 
-### 2. Close the loop with `detect`
+**Measured effect:** on BOSSbase, matching is no harder to detect than
+replacement at 0.05 and 0.1 bpp (P_E ≈ 0.22 and 0.16 for both), and the 4 KiB
+padding floor in a 512×512 single-channel carrier is 0.127 bpp, where the
+real encoder is caught most of the time. Both items below are to be judged
+by `stegbench`.
 
-Have `encode` run the steganalysis on its own output and warn when the result
-is detectable. Chi-square and RS no longer flag 1-bit output, so the warning
-is mainly useful at 2–8 bits per channel, or with a stronger detector. A
-benchmark in `cmd/attack1` comparing replacement, matching, and adaptive
-embedding across a set of images, at several payload sizes, would make the
-trade-offs concrete; `TestEncoderOutputEvadesDetectors` and
-`TestEncoderOutputReplacementAboveOneBit` in `steg/analysis` are a first
-guard.
+### 1. Lower the padding floor
 
-### 3. Pipe mode
+Small payloads are the common case, and for them the 4 KiB minimum block, not
+the payload, sets the embedding rate. A 31-byte message is written as a
+4,148-byte stream. Lowering the floor (for example to a few hundred bytes)
+cuts the rate for small payloads by an order of magnitude, which `stegbench`
+shows is the largest single lever on P_E (0.22 at 0.05 bpp, 0.38 at 0.01).
+The cost is that small payload sizes become more distinguishable from each
+other, since fewer of them share a bucket. It changes only the encoder's
+`paddedSize`; the decoder already accepts any container length, so the format
+stays compatible. This comes first because it is cheap and helps the case
+that matters most.
+
+### 2. Adaptive embedding
+
+LSB matching defeats chi-square and RS, but not a trained detector: at the
+same rate it is as detectable as replacement up to 0.1 bpp. Adaptive
+embedding attacks the other factor, how visible each change is. Syndrome-trellis
+codes (STC) carry the same message with fewer changes per bit, and a cost
+function places those changes in noisy, textured regions instead of smooth
+ones such as sky or walls. The decoder must reconstruct the same selection
+without knowing the payload, so the costs have to be computed from bits that
+are never modified (typically the upper seven bits of each channel), and the
+on-image format changes. It is the way to improve P_E at medium rates, where
+a lower floor does not help, but it is a much larger change than item 1.
+
+### 3. Close the loop with `detect`
+
+The benchmark part of this item is done (`stegbench`). What remains is having
+`encode` run the steganalysis on its own output and warn when the result is
+detectable. Chi-square and RS no longer flag 1-bit output, so with them the
+warning is mainly useful at 2–8 bits per channel; the SPAM ensemble needs a
+trained model, which the CLI does not ship. `TestEncoderOutputEvadesDetectors`
+and `TestEncoderOutputReplacementAboveOneBit` in `steg/analysis` guard the
+chi-square and RS behaviour.
+
+### 4. Pipe mode
 
 Read the payload from stdin and write to stdout so `steg` composes with
 `tar`, `gpg`, or `age` in a pipeline.
