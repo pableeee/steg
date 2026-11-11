@@ -58,10 +58,19 @@ func validateSettings(w, h, bitsPerChannel, channels int) error {
 // cursorOptions builds the RNGCursor option slice for the given configuration.
 // channels: 1 = R only, 2 = R+G, 3 = R+G+B. order is the traversal order from
 // prepareEncode/prepareDecode; it is shared, never copied or modified.
-func cursorOptions(order []uint32, bitsPerChannel, channels int) []cursors.Option {
+//
+// write selects LSB matching (±1 embedding) for cursors that write: every
+// encode path passes true, every decode path false. Matching only changes how
+// a mismatching bit is written (the byte moves ±1 at random instead of to its
+// pair partner); bit 0 ends up the same, so decoding is unaffected. It applies
+// at 1 bit per channel only; with more bits the cursor uses plain replacement.
+func cursorOptions(order []uint32, bitsPerChannel, channels int, write bool) []cursors.Option {
 	opts := []cursors.Option{
 		cursors.WithSharedPoints(order),
 		cursors.WithBitsPerChannel(bitsPerChannel),
+	}
+	if write {
+		opts = append(opts, cursors.WithLSBMatching())
 	}
 	if channels >= 2 {
 		opts = append(opts, cursors.UseGreenBit())
@@ -151,7 +160,7 @@ func prepareOrder(m draw.Image, pass []byte, bitsPerChannel, channels int,
 
 	// Stream bits 0–127 all live in order[:k], which is already final. The
 	// cursor is dropped before order[k:] are shuffled under it.
-	cur, err := cursors.NewRNGCursor(m, cursorOptions(order, bitsPerChannel, channels)...)
+	cur, err := cursors.NewRNGCursor(m, cursorOptions(order, bitsPerChannel, channels, write)...)
 	if err != nil {
 		return mainKeys{}, nil, err
 	}
@@ -203,10 +212,44 @@ func CapacityForDims(w, h, bitsPerChannel, channels int) int {
 	return total - Overhead
 }
 
+// minPaddedBlock is the smallest padded block the encoder writes when the
+// carrier can hold more: every payload of up to minPaddedBlock-4 bytes looks
+// the same.
+const minPaddedBlock = 4096
+
+// paddedSize returns the length of the padded block (the 4-byte real-length
+// prefix, the payload and the random padding) that the encoder writes for a
+// realLen-byte payload into a carrier of the given capacity (CapacityBytes).
+//
+// The block is rounded up to a power-of-two bucket of at least minPaddedBlock
+// bytes: max(4096, nextPowerOfTwo(4 + realLen)). If that bucket does not fit
+// the carrier, the block is capacity + 4 bytes, i.e. the carrier is filled
+// completely, as for payloads near capacity or carriers whose capacity + 4 is
+// below 4096. Only the stream prefix up to the end of the tag is written; every
+// pixel past it keeps its original value.
+//
+// The bucket leaks only the order of magnitude of the payload size, through the
+// (encrypted) container length and through the embedding rate a steganalyst
+// could estimate. Above the 4 KiB floor it costs at most twice the bits an
+// unpadded payload would change; below it, small payloads all write 4 KiB.
+// The caller must have checked realLen <= capacity.
+func paddedSize(realLen, capacity int) int {
+	full := int64(capacity) + 4
+	need := int64(realLen) + 4
+	bucket := int64(minPaddedBlock)
+	for bucket < need && bucket < full {
+		bucket <<= 1
+	}
+	if bucket > full {
+		return int(full)
+	}
+	return int(bucket)
+}
+
 // buildPaddedPayload prepends a 4-byte LE real-length prefix and appends random
-// padding so the full image capacity is always written. This removes the
-// payload-size signal from LSB statistics regardless of actual payload size.
-// The returned slice is passed directly to container.WritePayload.
+// padding up to paddedSize bytes, so the payload size is hidden within its
+// power-of-two bucket. The returned slice is passed directly to
+// container.WritePayload.
 func buildPaddedPayload(m draw.Image, payload []byte, bitsPerChannel, channels int) ([]byte, error) {
 	cap := CapacityBytes(m, bitsPerChannel, channels)
 	if cap <= 0 {
@@ -215,9 +258,10 @@ func buildPaddedPayload(m draw.Image, payload []byte, bitsPerChannel, channels i
 	if len(payload) > cap {
 		return nil, fmt.Errorf("steg: payload too large (%d bytes, capacity %d bytes)", len(payload), cap)
 	}
-	// Layout: [4B real-length][real-payload][random padding] = 4 + cap bytes total.
-	// Container then writes: [4B container-length][data][32B HMAC] = imageTotal bytes.
-	out := make([]byte, 4+cap)
+	// Layout: [4B real-length][real-payload][random padding] = paddedSize bytes,
+	// at most 4 + cap. Container then writes:
+	// [4B container-length][data][32B HMAC], at most imageTotal - 16 bytes.
+	out := make([]byte, paddedSize(len(payload), cap))
 	binary.LittleEndian.PutUint32(out[:4], uint32(len(payload)))
 	copy(out[4:], payload)
 	if _, err := rand.Read(out[4+len(payload):]); err != nil {

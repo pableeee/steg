@@ -11,11 +11,12 @@
 //   - RS: the noise makes the LSB plane look natural, so Rm ≈ R-m and the clean
 //     asymmetry Rm − R-m is near zero. Embedding pushes it negative.
 //
-// The encoder always fills the whole carrier (real payload plus encrypted
-// random padding), so steg.Encode can only produce a 100% fill. Fill-rate
-// sweeps therefore use randomizeLSBs, which replaces each channel LSB with a
-// random bit with probability rate — the statistical effect of embedding
-// encrypted data in that fraction of the carrier.
+// The detector tests do not use steg.Encode. They model LSB *replacement*
+// (the classic embedding these detectors are built for) with replaceLSBs,
+// which overwrites each channel LSB with a random bit with probability rate
+// from a seeded RNG, so results are deterministic. steg.Encode itself uses LSB
+// matching at 1 bit per channel and bounded padding, and is designed not to be
+// flagged; TestEncoderOutput* check that separately.
 package analysis_test
 
 import (
@@ -66,29 +67,40 @@ func cloneRGBA(src *image.RGBA) *image.RGBA {
 	return dst
 }
 
-// encodeFull returns a copy of src encoded by steg.Encode with default
-// settings (3 channels, 1 bit/channel). The payload is tiny, but the encoder
-// pads it to the full carrier capacity, so every channel LSB is rewritten.
-func encodeFull(t testing.TB, src *image.RGBA) *image.RGBA {
+// encodeWith returns a copy of src encoded by steg.Encode with a random
+// payload of payloadLen bytes (payloadLen < 0 means the carrier's full
+// capacity for the settings).
+func encodeWith(t testing.TB, src *image.RGBA, payloadLen, bitsPerChannel, channels int) *image.RGBA {
 	t.Helper()
 	dst := cloneRGBA(src)
-	require.NoError(t, steg.Encode(dst, []byte("detectpass"), bytes.NewReader([]byte("hidden message")), 1, 3))
+	if payloadLen < 0 {
+		payloadLen = steg.CapacityBytes(dst, bitsPerChannel, channels)
+	}
+	payload := make([]byte, payloadLen)
+	rand.New(rand.NewSource(3)).Read(payload)
+	require.NoError(t, steg.Encode(dst, []byte("detectpass"), bytes.NewReader(payload), bitsPerChannel, channels))
 	return dst
 }
 
-// randomizeLSBs returns a copy of src in which each R, G and B LSB is replaced
-// by a random bit with probability rate (deterministic seed).
-func randomizeLSBs(src *image.RGBA, rate float64) *image.RGBA {
+// replaceLSBs returns a copy of src in which the LSB of each of the first
+// nChannels channels (R, then G, then B) is replaced by a random bit with
+// probability rate (deterministic seed): LSB replacement embedding.
+func replaceLSBs(src *image.RGBA, rate float64, nChannels int) *image.RGBA {
 	dst := cloneRGBA(src)
 	rng := rand.New(rand.NewSource(2))
 	for i := 0; i < len(dst.Pix); i += 4 {
-		for c := range 3 {
+		for c := range nChannels {
 			if rng.Float64() < rate {
 				dst.Pix[i+c] = dst.Pix[i+c]&^1 | uint8(rng.Intn(2))
 			}
 		}
 	}
 	return dst
+}
+
+// randomizeLSBs is replaceLSBs over all three channels.
+func randomizeLSBs(src *image.RGBA, rate float64) *image.RGBA {
+	return replaceLSBs(src, rate, 3)
 }
 
 var fillRates = []float64{0, 0.01, 0.05, 0.10, 0.25, 0.50, 0.75, 1.00}
@@ -128,7 +140,7 @@ func TestChiSquareFullFill(t *testing.T) {
 func TestChiSquarePValueIncreasesWithFill(t *testing.T) {
 	src := photoLikeImage(500, 500)
 	clean := analysis.ChiSquare(src)
-	encoded := analysis.ChiSquare(encodeFull(t, src))
+	encoded := analysis.ChiSquare(randomizeLSBs(src, 1.0))
 	for i, ch := range channelNames {
 		assert.Greater(t, encoded[i].PValue, clean[i].PValue,
 			"chi-square p-value for channel %s should increase after 100%% fill", ch)
@@ -213,7 +225,7 @@ func TestRSClean(t *testing.T) {
 }
 
 func TestRSFullFill(t *testing.T) {
-	img := encodeFull(t, photoLikeImage(500, 500))
+	img := randomizeLSBs(photoLikeImage(500, 500), 1.0)
 	results := analysis.RSAnalysis(img)
 	require.Len(t, results, 3)
 	for _, r := range results {
@@ -222,11 +234,10 @@ func TestRSFullFill(t *testing.T) {
 	}
 }
 
-// TestRSUntouchedChannelsStayClean encodes into R only (channels=1) and checks
-// that RS flags R but not the unmodified G and B channels.
+// TestRSUntouchedChannelsStayClean replaces R's LSBs only and checks that RS
+// flags R but not the unmodified G and B channels.
 func TestRSUntouchedChannelsStayClean(t *testing.T) {
-	img := cloneRGBA(photoLikeImage(500, 500))
-	require.NoError(t, steg.Encode(img, []byte("detectpass"), bytes.NewReader([]byte("hidden message")), 1, 1))
+	img := replaceLSBs(photoLikeImage(500, 500), 1.0, 1)
 	results := analysis.RSAnalysis(img)
 	assert.True(t, results[0].Suspicious, "R carries the payload (asymmetry=%+.4f)", results[0].Asymmetry)
 	assert.False(t, results[1].Suspicious, "G is untouched (asymmetry=%+.4f)", results[1].Asymmetry)
@@ -275,23 +286,48 @@ func TestAnalyzeClean(t *testing.T) {
 	assert.Equal(t, "CLEAN", result.Verdict)
 }
 
-// TestAnalyzeFullFill: a real full-capacity encode is never CLEAN, and RS
-// flags every channel. The verdict is not pinned to LIKELY_STEGO: at full fill
-// each channel's chi-square p-value is roughly uniform, so it drops below 0.05
-// about 5% of the time per channel and the verdict is SUSPICIOUS in roughly
-// one encode in seven. Each encode draws a fresh salt, so this varies by run.
+// TestAnalyzeFullFill: full LSB replacement on every channel trips both
+// detectors everywhere.
 func TestAnalyzeFullFill(t *testing.T) {
-	result := analysis.Analyze(encodeFull(t, photoLikeImage(500, 500)))
-	assert.Contains(t, []string{"SUSPICIOUS", "LIKELY_STEGO"}, result.Verdict)
-	for _, r := range result.RS {
-		assert.True(t, r.Suspicious, "RS channel %s should be flagged (asymmetry=%+.4f)", r.Channel, r.Asymmetry)
+	result := analysis.Analyze(randomizeLSBs(photoLikeImage(500, 500), 1.0))
+	assert.Equal(t, "LIKELY_STEGO", result.Verdict)
+}
+
+// ── What steg.Encode actually produces ───────────────────────────────────────
+
+// TestEncoderOutputEvadesDetectors: at 1 bit per channel the encoder uses LSB
+// matching, so even a payload that fills the whole carrier leaves the pair
+// structure chi-square looks for and the RS asymmetry intact. A small payload
+// touches only a bounded prefix of the pixel order. Both must read CLEAN.
+// If this fails, check that the encode paths still enable cursors.WithLSBMatching.
+func TestEncoderOutputEvadesDetectors(t *testing.T) {
+	src := photoLikeImage(500, 500)
+	for _, tc := range []struct {
+		name       string
+		payloadLen int
+	}{
+		{"small payload", 100},
+		{"full capacity", -1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result := analysis.Analyze(encodeWith(t, src, tc.payloadLen, 1, 3))
+			assert.Equal(t, "CLEAN", result.Verdict)
+			for _, r := range result.RS {
+				t.Logf("RS %s asymmetry %+.4f", r.Channel, r.Asymmetry)
+			}
+			for _, r := range result.ChiSquare {
+				t.Logf("chi-square %s p %.4f", r.Channel, r.PValue)
+			}
+		})
 	}
 }
 
-// TestAnalyzeFullFillSeeded pins the verdict on deterministic full-fill LSBs.
-func TestAnalyzeFullFillSeeded(t *testing.T) {
-	result := analysis.Analyze(randomizeLSBs(photoLikeImage(500, 500), 1.0))
-	assert.Equal(t, "LIKELY_STEGO", result.Verdict)
+// TestEncoderOutputReplacementAboveOneBit: with more than 1 bit per channel the
+// encoder still uses replacement, so a full-capacity encode stays detectable.
+// Documents the limit of LSB matching rather than a goal.
+func TestEncoderOutputReplacementAboveOneBit(t *testing.T) {
+	result := analysis.Analyze(encodeWith(t, photoLikeImage(500, 500), -1, 2, 3))
+	assert.NotEqual(t, "CLEAN", result.Verdict)
 }
 
 // TestAnalyzeDetectionLimits logs the combined verdict at increasing fill rates.

@@ -14,8 +14,11 @@ import (
 
 // Encode hides the contents of r in m, keyed by pass, using the lowest
 // bitsPerChannel bits (1..8) of the first channels channels (1 = R, 2 = R+G,
-// 3 = R+G+B) of every pixel. It fills the whole capacity (see CapacityBytes),
-// padding the payload with random bytes.
+// 3 = R+G+B) of the pixels it writes. The payload may be up to CapacityBytes long. It is
+// padded with random bytes to a power-of-two bucket of at least 4 KiB (see
+// paddedSize), or to the whole capacity when the bucket does not fit; only
+// the pixels that stream prefix maps to are written, the rest of m is left
+// untouched.
 //
 // m must be an *image.RGBA or *image.NRGBA: their 8-bit channels are modified
 // in place and round-trip exactly, at any alpha. Any other type is rejected
@@ -46,7 +49,7 @@ func Encode(m draw.Image, pass []byte, r io.Reader, bitsPerChannel, channels int
 		return err
 	}
 
-	cur, err := cursors.NewRNGCursor(m, cursorOptions(points, bitsPerChannel, channels)...)
+	cur, err := cursors.NewRNGCursor(m, cursorOptions(points, bitsPerChannel, channels, true)...)
 	if err != nil {
 		return err
 	}

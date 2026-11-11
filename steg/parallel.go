@@ -60,8 +60,8 @@ type decJob struct {
 // shared image. Workers need no lock: the dispatch loops hand them
 // pixel-aligned chunks (see firstChunkShift), so they write disjoint bytes.
 func newWorkerStack(m draw.Image, keys mainKeys, order []uint32,
-	bitsPerChannel, channels int) (io.ReadWriteSeeker, error) {
-	cur, err := cursors.NewRNGCursor(m, cursorOptions(order, bitsPerChannel, channels)...)
+	bitsPerChannel, channels int, write bool) (io.ReadWriteSeeker, error) {
+	cur, err := cursors.NewRNGCursor(m, cursorOptions(order, bitsPerChannel, channels, write)...)
 	if err != nil {
 		return nil, err
 	}
@@ -122,7 +122,7 @@ func EncodeParallel(m draw.Image, pass []byte, r io.Reader, bitsPerChannel, chan
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			adapter, werr := newWorkerStack(m, keys, points, bitsPerChannel, channels)
+			adapter, werr := newWorkerStack(m, keys, points, bitsPerChannel, channels, true)
 			if werr != nil {
 				fail(werr)
 				return
@@ -142,7 +142,9 @@ func EncodeParallel(m draw.Image, pass []byte, r io.Reader, bitsPerChannel, chan
 
 	// Dispatch the padded block in pixel-aligned chunks, starting at the byte
 	// where the payload begins. The first chunk absorbs the header's
-	// misalignment so no two workers ever share a pixel.
+	// misalignment so no two workers ever share a pixel. The block is usually a
+	// bucket much smaller than the carrier (see paddedSize), possibly smaller
+	// than one chunk; the loop then sends a single, clipped job.
 	totalLen := int64(len(padded))
 	shift := firstChunkShift(channels * bitsPerChannel)
 	var offset int64
@@ -177,7 +179,7 @@ dispatch:
 	// Both run after wg.Wait(), so although each may share a pixel with the
 	// payload region, no concurrent writer can clobber it.
 	// The salt region (bytes 0–15) was written by prepareEncode.
-	seqAdapter, err := newWorkerStack(m, keys, points, bitsPerChannel, channels)
+	seqAdapter, err := newWorkerStack(m, keys, points, bitsPerChannel, channels, true)
 	if err != nil {
 		return err
 	}
@@ -213,7 +215,7 @@ func DecodeParallel(m draw.Image, pass []byte, bitsPerChannel, channels int) ([]
 	}
 
 	// Read the 4-byte container length field at byte 16 (after the plaintext salt).
-	seqAdapter, err := newWorkerStack(m, keys, points, bitsPerChannel, channels)
+	seqAdapter, err := newWorkerStack(m, keys, points, bitsPerChannel, channels, false)
 	if err != nil {
 		return nil, err
 	}
@@ -259,7 +261,7 @@ func DecodeParallel(m draw.Image, pass []byte, bitsPerChannel, channels int) ([]
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			adapter, werr := newWorkerStack(m, keys, points, bitsPerChannel, channels)
+			adapter, werr := newWorkerStack(m, keys, points, bitsPerChannel, channels, false)
 			if werr != nil {
 				fail(werr)
 				return
