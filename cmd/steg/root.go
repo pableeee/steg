@@ -3,10 +3,15 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"image"
 	"image/draw"
 	"image/png"
+	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -209,21 +214,149 @@ func decodeImage(path string) (image.Image, error) {
 	}
 }
 
+// writeImage encodes img to w as PNG, BMP, or TIFF based on the extension of
+// path. path only selects the format; nothing is opened.
+func writeImage(w io.Writer, path string, img image.Image) error {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".bmp":
+		return bmp.Encode(w, img)
+	case ".tif", ".tiff":
+		return tiff.Encode(w, img, nil)
+	default:
+		return png.Encode(w, img)
+	}
+}
+
 // encodeImage writes img to path as PNG, BMP, or TIFF based on extension.
 func encodeImage(path string, img image.Image) error {
 	f, err := os.Create(path)
 	if err != nil {
 		return fmt.Errorf("unable to create output file: %w", err)
 	}
-	defer f.Close()
-	switch strings.ToLower(filepath.Ext(path)) {
-	case ".bmp":
-		return bmp.Encode(f, img)
-	case ".tif", ".tiff":
-		return tiff.Encode(f, img, nil)
-	default:
-		return png.Encode(f, img)
+	if err = writeImage(f, path, img); err != nil {
+		f.Close()
+		return err
 	}
+	return f.Close()
+}
+
+// isOpaque reports whether every pixel of img has full alpha.
+func isOpaque(img image.Image) bool {
+	if o, ok := img.(interface{ Opaque() bool }); ok {
+		return o.Opaque()
+	}
+	b := img.Bounds()
+	for y := b.Min.Y; y < b.Max.Y; y++ {
+		for x := b.Min.X; x < b.Max.X; x++ {
+			if _, _, _, a := img.At(x, y).RGBA(); a != 0xffff {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// checkCarrierAlpha rejects carriers with any non-opaque pixel, whatever the
+// output format. The cursor writes into toDrawImage's alpha-premultiplied
+// bytes; PNG and BMP store straight alpha, so their encoders un-premultiply
+// non-opaque pixels and destroy the hidden bits (alpha-0 pixels collapse to
+// 0,0,0,0). TIFF happens to keep the bytes verbatim, but the result holds
+// invalid premultiplied pixels (colour above alpha) that give the embedding
+// away and do not survive a re-save, so it is rejected too for consistency.
+func checkCarrierAlpha(carrier image.Image, carrierPath string) error {
+	if isOpaque(carrier) {
+		return nil
+	}
+	return fmt.Errorf(
+		"carrier image %s has transparency (non-opaque pixels); hidden data cannot be "+
+			"stored reliably in transparent pixels. Remove the alpha channel first "+
+			"(flatten the image onto an opaque background)",
+		carrierPath)
+}
+
+// decodeFromFile reads the image at path and extracts the hidden payload. It
+// is the single decode path shared by `steg decode` and encode verification.
+func decodeFromFile(path string, pass []byte, bpc, ch int, par bool) ([]byte, error) {
+	src, err := decodeImage(path)
+	if err != nil {
+		return nil, err
+	}
+	if par {
+		return steg.DecodeParallel(toDrawImage(src), pass, bpc, ch)
+	}
+	return steg.Decode(toDrawImage(src), pass, bpc, ch)
+}
+
+// createTempSibling creates a new file next to path whose name keeps path's
+// extension, so writeImage/decodeImage pick the same format. The file is
+// created with mode 0666 (subject to umask), like os.Create, so the final
+// output's permissions match what a direct write would have produced.
+func createTempSibling(path string) (*os.File, error) {
+	dir, base := filepath.Split(path)
+	ext := filepath.Ext(base)
+	stem := strings.TrimSuffix(base, ext)
+	for i := 0; i < 100; i++ {
+		var rnd [6]byte
+		if _, err := rand.Read(rnd[:]); err != nil {
+			return nil, err
+		}
+		name := filepath.Join(dir, fmt.Sprintf(".%s.steg-tmp-%s%s", stem, hex.EncodeToString(rnd[:]), ext))
+		f, err := os.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0666)
+		if err == nil {
+			return f, nil
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return nil, err
+		}
+	}
+	return nil, fmt.Errorf("unable to create temporary file next to %s", path)
+}
+
+// writeVerified writes img to outPath only after proving that the written
+// file decodes back to payload. The image goes to a temporary sibling first;
+// it is re-read through decodeFromFile and compared byte for byte, and only
+// then renamed onto outPath. On any failure the temporary file is removed and
+// a pre-existing file at outPath is left untouched.
+func writeVerified(outPath string, img image.Image, pass, payload []byte, bpc, ch int, par bool) (err error) {
+	tmp, err := createTempSibling(outPath)
+	if err != nil {
+		return fmt.Errorf("unable to create output file: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		if err != nil {
+			os.Remove(tmpName)
+		}
+	}()
+
+	if err = writeImage(tmp, outPath, img); err != nil {
+		tmp.Close()
+		return fmt.Errorf("unable to write output image: %w", err)
+	}
+	if err = tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("unable to write output image: %w", err)
+	}
+	if err = tmp.Close(); err != nil {
+		return fmt.Errorf("unable to write output image: %w", err)
+	}
+
+	got, derr := decodeFromFile(tmpName, pass, bpc, ch, par)
+	if derr != nil {
+		err = fmt.Errorf("verification failed: the written image does not decode (%v); "+
+			"output not written", derr)
+		return err
+	}
+	if !bytes.Equal(got, payload) {
+		err = fmt.Errorf("verification failed: the written image decodes to different data; " +
+			"output not written")
+		return err
+	}
+
+	if err = os.Rename(tmpName, outPath); err != nil {
+		return fmt.Errorf("unable to move verified image into place: %w", err)
+	}
+	return nil
 }
 
 func runEncode() error {
@@ -234,33 +367,39 @@ func runEncode() error {
 		return fmt.Errorf("--channels must be between 1 and 3, got %d", channels)
 	}
 
+	// Load and check the carrier before prompting for a password, so an
+	// unusable carrier fails fast.
+	src, err := decodeImage(encoderFlags.inputImage)
+	if err != nil {
+		return err
+	}
+	if err = checkCarrierAlpha(src, encoderFlags.inputImage); err != nil {
+		return err
+	}
+
+	// Steg.Encode reads the whole payload into memory anyway; holding it here
+	// lets us compare it against what the written file decodes to.
+	payload, err := os.ReadFile(encoderFlags.inputMessage)
+	if err != nil {
+		return err
+	}
+
 	pass, err := resolvePassword(encoderFlags.key, true)
 	if err != nil {
 		return err
 	}
 
-	src, err := decodeImage(encoderFlags.inputImage)
-	if err != nil {
-		return err
-	}
-
 	cimg := toDrawImage(src)
-	fmsg, err := os.Open(encoderFlags.inputMessage)
-	if err != nil {
-		return err
-	}
-	defer fmsg.Close()
-
 	if parallel {
-		err = steg.EncodeParallel(cimg, pass, bufio.NewReader(fmsg), bitsPerChannel, channels)
+		err = steg.EncodeParallel(cimg, pass, bytes.NewReader(payload), bitsPerChannel, channels)
 	} else {
-		err = steg.Encode(cimg, pass, bufio.NewReader(fmsg), bitsPerChannel, channels)
+		err = steg.Encode(cimg, pass, bytes.NewReader(payload), bitsPerChannel, channels)
 	}
 	if err != nil {
 		return err
 	}
 
-	return encodeImage(encoderFlags.outputImage, cimg)
+	return writeVerified(encoderFlags.outputImage, cimg, pass, payload, bitsPerChannel, channels, parallel)
 }
 
 func runDecode() error {
@@ -276,19 +415,9 @@ func runDecode() error {
 		return err
 	}
 
-	src, err := decodeImage(decoderFlags.inputFile)
-	if err != nil {
-		return err
-	}
-
 	// Decode before touching the output path: a wrong password must not leave a
 	// truncated or empty file behind.
-	var b []byte
-	if parallel {
-		b, err = steg.DecodeParallel(toDrawImage(src), pass, bitsPerChannel, channels)
-	} else {
-		b, err = steg.Decode(toDrawImage(src), pass, bitsPerChannel, channels)
-	}
+	b, err := decodeFromFile(decoderFlags.inputFile, pass, bitsPerChannel, channels, parallel)
 	if err != nil {
 		return err
 	}
@@ -373,6 +502,9 @@ func runTestVisual() error {
 	// Decode the carrier image once; we'll copy it for each run.
 	src, err := decodeImage(testVisualFlags.inputImage)
 	if err != nil {
+		return err
+	}
+	if err = checkCarrierAlpha(src, testVisualFlags.inputImage); err != nil {
 		return err
 	}
 
