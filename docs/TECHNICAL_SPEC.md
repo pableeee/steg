@@ -1,480 +1,539 @@
 # Steg — Technical Specification
 
-**Version:** v2 (post security hardening)
-**Date:** 2026-03-07
+**Format:** v2 (keyed pixel order)
+**Date:** 2026-11-11
+
+This document specifies the on-image format precisely enough to write a
+compatible decoder without reading the Go source. Every statement here was
+checked against the code; where they disagree, the code is authoritative and
+this document is wrong.
+
+> **Format break.** v2 changed how the pixel traversal order is derived. Images
+> written by earlier builds (SHA-256 seed + `math/rand` shuffle, or the older
+> bootstrap-cipher layouts) cannot be decoded by a v2 build, and v2 images cannot
+> be decoded by earlier builds. There is no version field on the image: a
+> mismatched decoder simply fails with a length or MAC error, exactly as for a
+> wrong password.
 
 ---
 
 ## Table of Contents
 
 1. [Overview](#1-overview)
-2. [Layer Architecture](#2-layer-architecture)
-3. [Key Derivation](#3-key-derivation)
-4. [Pixel Traversal — RNG Cursor](#4-pixel-traversal--rng-cursor)
-5. [Bit-Level Stream Cipher](#5-bit-level-stream-cipher)
-6. [Cursor Adapter](#6-cursor-adapter)
-7. [Cipher Middleware](#7-cipher-middleware)
-8. [Container Framing](#8-container-framing)
-9. [On-Image Layout](#9-on-image-layout)
-10. [Encode Flow](#10-encode-flow)
-11. [Decode Flow](#11-decode-flow)
-12. [Capacity](#12-capacity)
-13. [Design Decisions](#13-design-decisions)
-14. [Known Limitations](#14-known-limitations)
+2. [Parameters and notation](#2-parameters-and-notation)
+3. [Bit-to-pixel mapping](#3-bit-to-pixel-mapping)
+4. [Pixel order](#4-pixel-order)
+5. [Key derivation](#5-key-derivation)
+6. [Stream cipher](#6-stream-cipher)
+7. [Stream layout and container framing](#7-stream-layout-and-container-framing)
+8. [Padding](#8-padding)
+9. [Authentication](#9-authentication)
+10. [Capacity](#10-capacity)
+11. [Encode and decode procedures](#11-encode-and-decode-procedures)
+12. [Parallel encode/decode](#12-parallel-encodedecode)
+13. [Implementation layers](#13-implementation-layers)
+14. [CLI behaviour](#14-cli-behaviour)
+15. [Design rationale](#15-design-rationale)
+16. [Known limitations](#16-known-limitations)
 
 ---
 
 ## 1. Overview
 
-Steg hides an arbitrary file inside a lossless image by modifying the least-significant bit (LSB) of selected color channels of a pseudorandom subset of pixels. The data is encrypted and authenticated before being written, so an observer who recovers the bits cannot read the payload without the password, and any tampering is detected at decode time.
+Steg hides an arbitrary byte string in a lossless RGB image by overwriting the
+`N` least-significant bits of up to three colour channels of every pixel, in a
+pixel order that is partly public and partly derived from the password. The
+embedded data is a single **bit stream**:
 
-The tool operates entirely on the local filesystem. Input and output are PNG, BMP, or TIFF files. The carrier image is modified in-place in memory and re-encoded in lossless format, so no visual quality is lost and no pixel value changes by more than 1 in the modified channels.
+```
+[16-byte plaintext salt][AES-128-CTR encrypted: length | padded payload | HMAC-SHA256 tag]
+```
+
+The encoder always writes the stream to the full capacity of the carrier: a
+short payload is followed by random padding, so every encode touches every
+usable bit of the image.
 
 ---
 
-## 2. Layer Architecture
+## 2. Parameters and notation
 
-The implementation is structured as a stack of composable layers. Each layer implements or wraps a narrow interface so that components can be tested and substituted independently.
+| Symbol | Meaning |
+|---|---|
+| `W`, `H` | Image width and height in pixels (`Bounds().Dx()`, `Bounds().Dy()`) |
+| `n` | `W × H`, number of pixels |
+| `bpc` | Bits per channel, 1–8 (CLI `--bits-per-channel`, default 1) |
+| `ch` | Active channels, 1–3: 1 = R, 2 = R+G, 3 = R+G+B (CLI `--channels`, default 3) |
+| `bpp` | Bits per pixel, `ch × bpc` |
+| `k` | Salt pixels, `ceil(128 / bpp)` = `(128 + bpp − 1) / bpp` |
+| `p` | Stream bit position, starting at 0 |
+| `LE32` | 4-byte little-endian unsigned 32-bit integer |
 
-```
-┌─────────────────────────────────────────────────────┐
-│  cmd/steg  (CLI — Cobra, PNG I/O)                   │
-└────────────────────┬────────────────────────────────┘
-                     │ draw.Image + password
-┌────────────────────▼────────────────────────────────┐
-│  steg.Encode / steg.Decode  (orchestration)         │
-│    deriveKeys → seed, encKey, macKey  (Argon2id)    │
-└───┬───────────────────────────────────┬─────────────┘
-    │ seed                              │ encKey, macKey
-┌───▼────────────────┐       ┌──────────▼──────────────┐
-│  cursors.RNGCursor │       │  cipher.NewCipher        │
-│  (pixel traversal) │       │  (AES-128-CTR, bit-level)│
-└───┬────────────────┘       └──────────┬───────────────┘
-    │ Cursor interface                  │ StreamCipherBlock
-┌───▼────────────────────────────────── ▼───────────────┐
-│  cursors.CipherMiddleware  (encrypts/decrypts each bit)│
-└───┬────────────────────────────────────────────────────┘
-    │ Cursor interface
-┌───▼──────────────────────────────────────────────────┐
-│  cursors.CursorAdapter  (bit-level → io.ReadWriteSeeker) │
-└───┬──────────────────────────────────────────────────┘
-    │ io.ReadWriteSeeker + hash.Hash (HMAC-SHA256)
-┌───▼──────────────────────────────────────────────────┐
-│  container.WritePayload / ReadPayload                │
-│  [length][payload][HMAC-SHA256 tag]                  │
-└──────────────────────────────────────────────────────┘
-```
+`bpc` and `ch` are not stored on the image; the decoder must be given the values
+used at encode time.
 
-All layers below `steg.Encode/Decode` are unaware of each other's existence and interact only through `Cursor`, `io.ReadWriteSeeker`, or `hash.Hash`.
+Pixel values are the 8-bit R, G and B components of an opaque pixel. Pixel
+coordinates in this document are relative to the image's origin
+(`Bounds().Min`); pixel index `i` in row-major order is the point
+`(x, y) = (i mod W, i div W)`.
 
 ---
 
-## 3. Key Derivation
-
-**File:** `steg/steg.go`
-
-A single Argon2id call produces all cryptographic material from the password:
-
-```
-derived = Argon2id(password, appSalt, time=1, memory=64 MiB, threads=4, length=60)
-
-seed      = int64( BigEndian(derived[0:8])  )  // RNG cursor seed
-encKey    = derived[8:24]                       // 16-byte AES-128 key
-macKey    = derived[24:56]                      // 32-byte HMAC-SHA256 key
-kdfNonce  = BigEndian.Uint32(derived[56:60])   // bootstrap cipher nonce
-```
-
-**Parameters:**
-
-| Parameter | Value | Rationale |
-|-----------|-------|-----------|
-| Algorithm | Argon2id | Resists GPU and side-channel attacks; OWASP 2023 recommendation |
-| Time cost | 1 | OWASP interactive-login profile |
-| Memory | 64 MiB | Memory-hardness as the primary brute-force deterrent |
-| Parallelism | 4 | Matches common core counts; increases attacker cost |
-| Salt | `"github.com/pableeee/steg/v1"` (fixed) | Domain separator; memory-hardness compensates for the lack of randomness |
-| Output length | 60 bytes | 8 (seed) + 16 (AES key) + 32 (MAC key) + 4 (bootstrap nonce) |
-
-All four values are derived from the same password in a single pass and are cryptographically independent — learning one gives no information about the others.
-
----
-
-## 4. Pixel Traversal — RNG Cursor
+## 3. Bit-to-pixel mapping
 
 **File:** `cursors/rng_cursor.go`
-**Interface:** `cursors.Cursor`
 
-```go
-type Cursor interface {
-    Seek(offset int64, whence int) (int64, error)
-    WriteBit(bit uint8) (uint, error)
-    ReadBit() (uint8, error)
-}
-```
-
-The `RNGCursor` presents the image as a flat, seekable sequence of bits by mapping a linear bit position to a specific pixel and channel.
-
-### Pixel sequence generation
-
-All `width × height` pixel coordinates are enumerated in row-major order and then Fisher-Yates-shuffled using `math/rand` seeded with the Argon2id-derived `seed`:
+Given the pixel order `order[0..n−1]` (section 4), stream bit `p` lives at:
 
 ```
-positions[0..N-1] = shuffle( {(x,y) : 0 ≤ x < W, 0 ≤ y < H} )
+pixelIndex   = p div bpp                        → pixel order[pixelIndex]
+slot         = p mod bpp
+channel      = activeChannels[slot div bpc]     (activeChannels = [R], [R,G] or [R,G,B])
+bitInChannel = (bpc − 1) − (slot mod bpc)       (0 = least-significant bit)
 ```
 
-This shuffle is deterministic: the same seed always produces the same pixel order, which is how decode reproduces the exact traversal used during encode.
+So inside one pixel the slots run through the channels in the order R, G, B
+(only the active ones), and within each channel through its `bpc` low bits from
+the most significant of them down to bit 0. Example with `ch = 3, bpc = 2`:
+slots 0..5 of a pixel are R bit 1, R bit 0, G bit 1, G bit 0, B bit 1, B bit 0.
 
-### Channel selection
+Bytes are packed into the stream **MSB first**: stream byte `i` occupies stream
+bits `8i .. 8i+7`, and bit `8i + j` holds bit `7 − j` of the byte.
 
-The cursor supports three channels per pixel: red (`R_Bit = 0x1`), green (`G_Bit = 0x2`), and blue (`B_Bit = 0x4`). The `channels` parameter on `Encode`/`Decode` controls which are active:
+Writing a bit sets or clears only that bit of the channel value. Inactive
+channels, the bits above the low `bpc`, and alpha are left as they were.
 
-- `channels = 1` → R only (default `R_Bit`)
-- `channels = 2` → R + G (`UseGreenBit()` added)
-- `channels = 3` → R + G + B (`UseBlueBit()` added, the default CLI setting)
-
-The `cursorOptions(seed, bitsPerChannel, channels)` helper in `steg/steg.go` constructs this option slice.
-
-With `channels` active channels and `bitsPerChannel` bits per channel, the slot-to-image mapping is:
-
-```
-bitsPerPixel = channels × bitsPerChannel
-pixelIndex   = cursorPosition / bitsPerPixel
-slotInPixel  = cursorPosition % bitsPerPixel
-channelIndex = slotInPixel / bitsPerChannel         (selects channel)
-bitInChannel = (bitsPerChannel − 1) − (slotInPixel % bitsPerChannel)  (MSB-first)
-```
-
-### Bit read/write
-
-`bitsPerChannel` LSBs (1–8) of each selected channel are read or written. Bits within a channel are ordered MSB-first. At the default of 1 bit/channel no pixel changes by more than ±1 per modified channel; higher settings increase the change magnitude and visual impact proportionally.
+Only the first `8 × floor(n × bpp / 8)` stream bits are used; when `n × bpp` is
+not a multiple of 8 the last few slots of the stream are never written.
 
 ---
 
-## 5. Bit-Level Stream Cipher
+## 4. Pixel order
+
+**File:** `cursors/order.go` (`NewPixelOrder`, `FinishPixelOrder`), orchestrated
+by `prepareOrder` in `steg/steg.go`.
+
+The order is a permutation of all `n` pixel indices produced by **one**
+Fisher-Yates shuffle whose steps are split between two pseudo-random streams:
+
+* steps `0 .. k−1` (the **public prefix**) are driven by ChaCha8 under a fixed,
+  published key, so `order[0..k−1]` depend only on `W`, `H` and `k`; the 128
+  salt bits live in these pixels;
+* steps `k .. n−2` (the **secret suffix**) are driven by ChaCha8 under
+  `orderKey`, which comes from Argon2id over the password and the salt
+  (section 5).
+
+### 4.1 Random source
+
+ChaCha8 is Go's `math/rand/v2.ChaCha8`, the generator specified by
+[C2SP chacha8rand](https://c2sp.org/chacha8rand). Only its raw `Uint64()` output
+is used. Each of the two streams is a fresh generator seeded with its 32-byte
+key; the secret stream does not continue the public one.
+
+```
+publicOrderKey = SHA-256("github.com/pableeee/steg/v2 salt positions")   (ASCII, no terminator)
+orderKey       = Argon2id output bytes [52:84]                           (section 5)
+```
+
+### 4.2 Bounded draw
+
+`uniform(src, m)` returns an unbiased integer in `[0, m)` for `m > 0` by
+rejection sampling over raw 64-bit outputs:
+
+```
+threshold = (2^64 − m) mod m          // in Go: -m % m on uint64
+loop:
+    x = src.Uint64()
+    if x ≥ threshold: return x mod m
+```
+
+Draws below `threshold` are discarded and consume stream output. This is
+deliberately not `rand.Rand.IntN` or `rand.Shuffle`, whose algorithms Go does
+not promise to keep stable across releases.
+
+### 4.3 Shuffle
+
+```
+shuffleRange(order, from, to, key):
+    to  = min(to, n − 1)            // the last step (i = n−1) is the identity: skipped,
+    src = ChaCha8(key)              // it consumes no stream output
+    for i = from .. to−1:
+        j = i + uniform(src, n − i)
+        swap(order[i], order[j])
+
+order = [0, 1, ..., n−1]            // row-major pixel indices
+shuffleRange(order, 0, k, publicOrderKey)     // public prefix
+-- read or write the 16-byte salt through order[0..k−1] (section 7) --
+shuffleRange(order, k, n, orderKey)           // secret suffix
+```
+
+The second call does not change `order[0..k−1]`. The image must have at least
+`k` pixels or encode/decode fails ("image too small").
+
+The last salt pixel `order[k−1]` may also carry the first stream bits after the
+salt (whenever `bpp` does not divide 128). That is consistent: its position is
+fixed by the public prefix, so it is known before `orderKey` exists.
+
+---
+
+## 5. Key derivation
+
+**File:** `steg/steg.go` (`deriveMainKeys`)
+
+```
+salt    = 16 bytes read from stream bits 0–127 (written from crypto/rand at encode time)
+derived = Argon2id(password, salt, time = 2, memory = 64 MiB (65536 KiB),
+                   threads = 4, keyLen = 84)            // golang.org/x/crypto/argon2.IDKey, v1.3
+
+encKey   = derived[0:16]                      // AES-128 key
+macKey   = derived[16:48]                     // HMAC-SHA256 key
+nonce    = big-endian uint32(derived[48:52])  // CTR nonce
+orderKey = derived[52:84]                     // ChaCha8 key for the secret order suffix
+```
+
+The password is the raw byte string (the CLI passes it unmodified, no
+normalisation). An empty password is rejected.
+
+---
+
+## 6. Stream cipher
 
 **File:** `cipher/cipher.go`
-**Interface:** `cipher.StreamCipherBlock`
 
-```go
-type StreamCipherBlock interface {
-    Seek(offset int64, whence int) (int64, error)
-    EncryptBit(bit uint8) (uint8, error)
-    DecryptBit(bit uint8) (uint8, error)
-}
-```
-
-The cipher implements AES-128 in a custom counter mode that operates at the individual-bit level and supports seeking within the keystream.
-
-### Counter block construction
-
-Each 128-bit AES block is constructed as:
+A custom AES-128 counter mode, addressed by **absolute stream bit position**.
+The keystream bit used for stream bit `p` is:
 
 ```
-block_input = [ nonce (4 B, LE) | 0x00 0x00 0x00 0x00 | counter (4 B, LE) | 0x00 0x00 0x00 0x00 ]
-keystream_block = AES_128(encKey, block_input)
+counterBlock(c) = LE32(nonce) ‖ 00 00 00 00 ‖ LE32(c) ‖ 00 00 00 00      // 16 bytes
+KS(c)           = AES-128-Encrypt(encKey, counterBlock(c))
+
+keystreamBit(p) = (KS(p div 128)[(p div 8) mod 16] >> (p mod 8)) & 1
 ```
 
-Counter is a `uint32` incremented once per 128-bit (16-byte) keystream block consumed. The cipher maintains a window over the current block using `mixIndex` (start bit of block) and `maxIndex` (end bit of block), refreshing when the position falls outside the window.
+That is, keystream bytes are consumed **LSB first**, while data bytes are
+packed MSB first (section 3). For stream bit `p`:
+`storedBit(p) = dataBit(p) XOR keystreamBit(p)`.
 
-### Bit extraction from keystream
+Encryption applies to stream bits 128 onward. Keystream positions 0–127
+(counter block 0) are never used, because the salt is stored in plaintext;
+the first encrypted bit, `p = 128`, uses bit 0 of byte 0 of `KS(1)`.
 
-Given bit position `index` within the keystream:
-
-```
-byte_in_block = (index / 8) % 16
-bit_in_byte   = index % 8           // LSB = 0, MSB = 7
-keystream_bit = (keystream_block[byte_in_block] >> bit_in_byte) & 1
-output_bit    = input_bit XOR keystream_bit
-```
-
-Note: within each keystream byte, bits are consumed LSB-first.
-
-### Seeking
-
-`Seek` computes the target block counter from the requested bit position and refreshes the block if necessary. This allows the orchestration layer to position the cipher at bit 32 after the bootstrap write so that the payload cipher's keystream byte 0 aligns with on-image byte 4 (the first byte of the container length field).
-
----
-
-## 6. Cursor Adapter
-
-**File:** `cursors/adapter.go`
-
-`CursorAdapter` bridges the bit-level `Cursor` interface to the standard `io.ReadWriteSeeker` interface expected by the container layer.
-
-### Byte packing
-
-Bytes are packed **MSB-first**: the first bit read/written corresponds to bit 7 of the byte.
+Equivalent byte-level formulation: for stream byte `i ≥ 16`,
 
 ```
-Write(byte b):
-    for i = 7 downto 0:
-        WriteBit( (b >> i) & 1 )
-
-Read() → byte b:
-    for i = 7 downto 0:
-        b |= ReadBit() << i
-```
-
-### Seek translation
-
-The adapter multiplies incoming byte offsets by 8 before delegating to the cursor, and divides the returned bit position by 8 to satisfy the `io.ReadWriteSeeker` contract.
-
----
-
-## 7. Cipher Middleware
-
-**File:** `cursors/middleware.go`
-
-`CipherMiddleware` is a `Cursor` decorator that transparently encrypts bits on write and decrypts bits on read, without either the layers above or below knowing about each other.
-
-```
-WriteBit(b):  → EncryptBit(b) → WriteBit(encrypted_b) to underlying Cursor
-ReadBit():    → ReadBit() from underlying Cursor → DecryptBit(b) → return plaintext_b
-Seek(n):      → Seek(n) on cipher AND Seek(n) on underlying Cursor (must stay in sync)
-```
-
-The middleware is inserted between the raw `RNGCursor` and the `CursorAdapter`, so all bytes that flow through the adapter are automatically encrypted or decrypted.
-
----
-
-## 8. Container Framing
-
-**File:** `steg/container/container.go`
-
-The container layer adds a length prefix and an authentication tag around the payload. It is unaware of encryption — it writes to whatever `io.WriteSeeker` it receives, which may or may not be backed by a cipher.
-
-### Write sequence
-
-```
-1. Note current stream position as basePos.
-2. Seek to basePos + 4  (reserve 4 bytes for the length field).
-3. Stream payload bytes from io.Reader to writer; feed each chunk to hashFn.
-4. Write hashFn.Sum(nil)  (32 bytes for HMAC-SHA256).
-5. Seek back to basePos.
-6. Write uint32(payload_length) as 4 bytes, little-endian.
-```
-
-Because the payload length is not known in advance, it is written last by seeking back to the reserved slot.
-
-### Read sequence
-
-```
-1. Read 4 bytes → uint32 length (little-endian).
-2. Read length bytes → payload; feed to hashFn.
-3. Read hashFn.Size() bytes → stored tag.
-4. Compare hashFn.Sum(nil) with stored tag.
-5. If equal, return payload; otherwise return error.
-```
-
-### Hash function
-
-The `hashFn` parameter is `hash.Hash`. During encode and decode this is always `hmac.New(sha256.New, macKey)`, giving a 32-byte HMAC-SHA256 tag keyed with the Argon2id-derived MAC key.
-
----
-
-## 9. On-Image Layout
-
-Bits are stored in the order the `RNGCursor` produces them (pseudorandom pixel sequence, green channel before blue channel within each pixel).
-
-```
-Bit offset           Size        Cipher                  Content
-────────────────────────────────────────────────────────────────────────────────
-0                    32 bits     AES-128-CTR (bootstrap) Per-encode random nonce
-32                   32 bits     AES-128-CTR (payload)   Container length (uint32, LE)
-64                   32 bits     AES-128-CTR (payload)   Real payload length (uint32, LE)
-96                   N×8 bits    AES-128-CTR (payload)   Real payload bytes
-96 + N×8             P×8 bits    AES-128-CTR (payload)   Random padding (fills to capacity)
-96 + (N+P)×8         256 bits    AES-128-CTR (payload)   HMAC-SHA256 tag (32 bytes)
-```
-
-**Total bits used:** always exactly `W × H × channels × bitsPerChannel` — the full image
-capacity is written on every encode regardless of payload size.
-
-Two AES-128-CTR cipher instances are used:
-
-- **Bootstrap cipher** — `AES-CTR(encKey, kdfNonce)` encrypts only the 4-byte random
-  nonce at bits 0–31. `kdfNonce` is fixed per password (KDF-derived). No plaintext
-  appears at any position.
-- **Payload cipher** — `AES-CTR(encKey, randomNonce)` encrypts everything from bit 32
-  onwards. `randomNonce` is `crypto/rand`-generated and differs on every encode,
-  giving a unique keystream even when the same password and carrier are reused.
-
-The payload cipher is seeked to bit 32 before the container layer begins, so payload
-cipher keystream byte 0 aligns with on-image byte 4. The cipher and cursor positions
-remain synchronized throughout.
-
----
-
-## 10. Encode Flow
-
-```
-steg.Encode(img draw.Image, pass []byte, payload io.Reader, bitsPerChannel, channels int)
-
-1.  deriveKeys(pass) → seed, encKey, macKey, kdfNonce
-
-2.  realPayload = io.ReadAll(payload)
-    padded = buildPaddedPayload(img, realPayload, bitsPerChannel, channels)
-        Layout: [4B real-length LE][real-payload][crypto/rand padding]
-        Size:   imageCapacity + 4 bytes (fills the image to capacity)
-
-3.  cur = NewRNGCursor(img, cursorOptions(seed, bitsPerChannel, channels)...)
-
-4.  randomNonce = crypto/rand.Read(4)
-    bootstrapCipher = cipher.NewCipher(kdfNonce, encKey)
-    bootstrapAdapter = CursorAdapter(CipherMiddleware(cur, bootstrapCipher))
-    bootstrapAdapter.Write(randomNonce)
-        Encrypts randomNonce with the bootstrap cipher and writes the 4-byte
-        ciphertext to image bytes 0–3. No plaintext appears on the image.
-
-5.  payloadCipher = cipher.NewCipher(randomNonce, encKey)
-    payloadCM = CipherMiddleware(cur, payloadCipher)
-    payloadCM.Seek(32, SeekStart)
-        Advances cursor to bit 32 (byte 4) and aligns payloadCipher
-        keystream so byte 0 of the cipher corresponds to on-image byte 4.
-
-6.  adapter = CursorAdapter(payloadCM)
-    mac = hmac.New(sha256.New, macKey)
-    container.WritePayload(adapter, bytes.NewReader(padded), mac)
-        Writes: [encrypted container-length][encrypted padded block][encrypted HMAC]
-        container-length field lands at on-image bytes 4–7.
-        padded block starts at on-image byte 8.
-
-7.  cur.Flush()
-    png.Encode(outputFile, img)
+stored[i] = data[i] XOR bitReverse8( KS(i div 16)[i mod 16] )
 ```
 
 ---
 
-## 11. Decode Flow
+## 7. Stream layout and container framing
 
-```
-steg.Decode(img draw.Image, pass []byte, bitsPerChannel, channels int) → []byte
+**Files:** `steg/encode.go`, `steg/decode.go`, `steg/container/container.go`
 
-1.  deriveKeys(pass) → seed, encKey, macKey, kdfNonce
+Byte offsets are stream byte offsets (stream bit = 8 × byte).
 
-2.  cur = NewRNGCursor(img, cursorOptions(seed, bitsPerChannel, channels)...)
-        Reproduces the identical shuffled pixel sequence with identical channel/bit
-        configuration (must match the values used during encode).
+| Stream bytes | Size | Cipher | Field |
+|---|---|---|---|
+| 0–15 | 16 B | none | `salt` |
+| 16–19 | 4 B | AES-CTR | `L` = container length, LE32. The encoder always writes `L = cap + 4` |
+| 20–23 | 4 B | AES-CTR | real payload length `R`, LE32 (first 4 bytes of the padded block) |
+| 24 … 24+R−1 | R B | AES-CTR | real payload |
+| 24+R … 20+L−1 | L−4−R B | AES-CTR | random padding |
+| 20+L … 20+L+31 | 32 B | AES-CTR | HMAC-SHA256 tag |
 
-3.  bootstrapCipher = cipher.NewCipher(kdfNonce, encKey)
-    bootstrapAdapter = CursorAdapter(CipherMiddleware(cur, bootstrapCipher))
-    io.ReadFull(bootstrapAdapter, rawNonce[0:4])
-    randomNonce = BigEndian.Uint32(rawNonce)
-        Decrypts on-image bytes 0–3 with the bootstrap cipher to recover
-        the per-encode random nonce.
+Bytes `20 .. 20+L−1` are the **padded block**. With `L = cap + 4` the stream
+ends at byte `56 + cap = floor(n × bpp / 8)`, i.e. exactly at capacity.
 
-4.  payloadCipher = cipher.NewCipher(randomNonce, encKey)
-    payloadCM = CipherMiddleware(cur, payloadCipher)
-    payloadCM.Seek(32, SeekStart)
+Container write (`container.WritePayload`, called with the stream positioned at
+byte 16): skip 4 bytes, write the padded block while feeding it to the HMAC,
+write the 32-byte tag, seek back and write `LE32(L)`.
 
-5.  adapter = CursorAdapter(payloadCM)
-    mac = hmac.New(sha256.New, macKey)
-    padded = container.ReadPayload(adapter, mac)
-        Reads and decrypts container-length, padded block, and HMAC tag;
-        verifies HMAC. Returns error if tag does not match (wrong password
-        or any tampering).
+Container read (`container.ReadPayload`, `maxPayload = cap + 4`):
 
-6.  return extractRealPayload(padded)
-        Reads the 4-byte real-length prefix from padded, returns
-        padded[4 : 4+realLen]. Padding is discarded.
-```
+1. Read `L`. If `L > cap + 4`, fail ("payload length … exceeds maximum …: wrong
+   password or corrupt image") without allocating or reading further. With a
+   wrong password `L` is effectively random, so this rejects almost every wrong
+   candidate cheaply.
+2. Read `L` bytes (the padded block) and the 32-byte tag.
+3. Compare `HMAC-SHA256(macKey, paddedBlock)` with the tag in constant time
+   (`hmac.Equal`). Mismatch → "checksum validation failed".
+4. `R = LE32(paddedBlock[0:4])`. If `R > L − 4`, fail ("corrupt payload").
+   Return `paddedBlock[4 : 4+R]`.
+
+A decoder accepts any `L ≤ cap + 4`; it does not require `L = cap + 4`.
 
 ---
 
-## 12. Capacity
+## 8. Padding
 
-| Quantity | Formula |
-|----------|---------|
-| Total carrier bits | `W × H × channels × bitsPerChannel` |
-| Total carrier bytes | `W × H × channels × bitsPerChannel / 8` |
-| Overhead | 44 bytes: 4 (enc nonce) + 4 (container length) + 4 (real-length prefix) + 32 (HMAC) |
-| Maximum real payload | `max(0, floor(W × H × channels × bitsPerChannel / 8) − 44)` bytes |
+**File:** `steg/steg.go` (`buildPaddedPayload`, `extractRealPayload`)
 
-Example capacities at the default CLI settings (3 channels, 1 bit/channel):
+```
+paddedBlock = LE32(R) ‖ payload ‖ crypto/rand bytes      // length exactly cap + 4
+```
+
+If `R > cap` encode fails ("payload too large"). If `cap ≤ 0` encode fails
+("image too small to hold any payload"). The padding is encrypted like
+everything else, so on the image it is indistinguishable from payload.
+
+---
+
+## 9. Authentication
+
+The tag is `HMAC-SHA256(macKey, paddedBlock)`: it covers the real-length
+prefix, the payload and the padding. It does **not** directly cover the salt
+or the container length field `L`, but both are bound indirectly:
+
+* a changed salt changes every derived key and the secret order, so the tag no
+  longer verifies;
+* a changed `L` makes the decoder read a different range as the padded block
+  and a different 32 bytes as the tag, which fails verification except with
+  negligible probability.
+
+The tag is computed over plaintext and then encrypted (MAC-then-encrypt); see
+section 15.
+
+---
+
+## 10. Capacity
+
+**File:** `steg/steg.go` (`Overhead`, `CapacityBytes`, `CapacityForDims`) —
+the single source of truth; callers must not reimplement it.
+
+```
+total = floor(W × H × ch × bpc / 8)                 // bytes
+cap   = total − 56   if total > 56, else 0          // maximum real payload, bytes
+```
+
+Overhead (56 B) = 16 salt + 4 container length + 4 real-length prefix + 32 tag.
+
+Default settings (`ch = 3`, `bpc = 1`):
 
 | Image | Pixels | Max payload |
-|-------|--------|-------------|
-| 100 × 100 | 10,000 | ~3,706 bytes (~3.6 KB) |
-| 500 × 500 | 250,000 | ~93,706 bytes (~91.5 KB) |
-| 1920 × 1080 | 2,073,600 | ~777,556 bytes (~759 KB) |
-| 3840 × 2160 | 8,294,400 | ~3,110,356 bytes (~2.97 MB) |
+|---|---|---|
+| 100 × 100 | 10,000 | 3,694 B (3.61 KB) |
+| 500 × 500 | 250,000 | 93,694 B (91.50 KB) |
+| 1920 × 1080 | 2,073,600 | 777,544 B (759.32 KB) |
+| 3840 × 2160 | 8,294,400 | 3,110,344 B (2.97 MB) |
 
-The `steg capacity -i <image>` command prints a 3×4 table covering all channel and
-bits-per-channel combinations for a given image.
-
----
-
-## 13. Design Decisions
-
-### Password-derived pixel order
-
-Using the password-derived seed as the RNG seed means an attacker who does not know the password cannot locate which pixels carry data. This is security-through-obscurity and is not a cryptographic guarantee, but it does raise the practical bar: even if AES were broken, the attacker would need to brute-force the seed before they could read anything.
-
-### Encrypted nonce — two-cipher bootstrap scheme
-
-The per-encode nonce must be recoverable at decode time without out-of-band communication.
-Writing it in plaintext (earlier design) created a fixed-position anchor detectable by
-statistical analysis, and was replaced by the following scheme:
-
-1. A KDF-derived `kdfNonce` (bytes 56–59 of Argon2id output) is fixed per password.
-2. A `crypto/rand` `randomNonce` is generated on every encode.
-3. `randomNonce` is encrypted with `AES-CTR(encKey, kdfNonce)` and written to image
-   bytes 0–3. This looks identical to any other ciphertext on the image.
-4. The payload cipher uses `AES-CTR(encKey, randomNonce)` — unique per encode.
-
-On decode, the bootstrap cipher (`kdfNonce`) decrypts bytes 0–3 to recover `randomNonce`,
-then the payload cipher is reconstructed from it.
-
-This design provides:
-- **No plaintext on the image** — even the nonce is encrypted.
-- **Per-encode keystream uniqueness** — `randomNonce` differs every time, so two encodes
-  with the same password never share a keystream.
-- **No stego marker** — the 4 encrypted nonce bytes are indistinguishable from the rest
-  of the ciphertext.
-
-The bootstrap cipher's keystream bytes 0–3 are fixed per password, but they always
-encrypt a different `crypto/rand` value, so the ciphertext changes on every encode.
-
-A consequence is that encoding the same payload into the same carrier twice produces two
-different output images (nonces differ), which is the correct behavior.
-
-### Four-way key split from a single Argon2id call
-
-Argon2id is memory-hard and slow by design, so calling it once per derived value would
-multiply the key-derivation cost for the legitimate user. Producing 60 bytes in a single
-call and slicing them into seed, encryption key, MAC key, and bootstrap nonce is standard
-practice and does not weaken the derivation.
-
-### HMAC-SHA256 as the authentication tag
-
-HMAC-SHA256 is keyed with `macKey`, which is independent of `encKey`. Because the tag is keyed, an attacker who does not know the password cannot forge a valid tag. The tag is written through the cipher middleware, so it is encrypted on the carrier alongside the payload.
-
-The tag is computed over the **plaintext** payload (MAC-then-Encrypt rather than Encrypt-then-MAC). This is unconventional: the standard recommendation is Encrypt-then-MAC because a MAC over ciphertext lets the verifier reject tampered messages before decryption. Here the tag is inside the encrypted channel, so an attacker cannot isolate and modify only the ciphertext without corrupting the tag position as well. The practical security is similar, but the ordering adds implementation complexity.
-
-### Fixed application salt for Argon2id
-
-A per-image random salt would marginally improve resistance to targeted precomputation (rainbow tables built for a specific candidate password). However, storing a random salt requires reading it before the cipher can be initialized — the same bootstrapping problem solved for the nonce. The current design places the 4-byte nonce first; adding a salt would require extending this plaintext header. The fixed salt `"github.com/pableeee/steg/v1"` serves as a domain separator: keys derived for this application cannot be reused against other Argon2id deployments using the same password.
-
-### Configurable channels and bits-per-channel
-
-The `--channels` flag (1=R, 2=R+G, 3=R+G+B, default 3) and `--bits-per-channel` flag (1–8, default 1) give the user direct control over the capacity vs. detectability trade-off. Higher values increase the payload capacity but also increase the statistical deviation from a natural image's channel distribution, making the steganogram easier to detect.
-
-The `steg capacity` and `steg test-visual` commands let the user explore this trade-off empirically before committing to an encoding configuration.
-
-### `math/rand` for the pixel shuffle
-
-The Fisher-Yates shuffle uses Go's `math/rand` (a pseudo-random number generator), not `crypto/rand`. This is intentional: the shuffle must be deterministic and reproducible from the seed, which `crypto/rand` cannot provide. The security of the system does not depend on the shuffle being unpredictable to a computationally-unbounded adversary; it depends on the adversary not knowing the seed, which is protected by Argon2id.
+`steg capacity -i <image>` prints the 3 × 4 table of every channel / bits-per-
+channel combination.
 
 ---
 
-## 14. Known Limitations
+## 11. Encode and decode procedures
+
+### Encode (`steg.Encode`)
+
+```
+1. payload = read all input; paddedBlock = buildPaddedPayload(...)      (section 8)
+2. order   = public prefix (section 4)
+   salt    = 16 bytes from crypto/rand
+   write salt, unencrypted, to stream bytes 0–15 via order[0..k−1]
+3. keys    = Argon2id(password, salt)                                   (section 5)
+   finish order with keys.orderKey
+4. position the cipher and cursor at stream bit 128 (byte 16)
+5. container write: LE32(L), paddedBlock, HMAC tag — all encrypted      (section 7)
+```
+
+### Decode (`steg.Decode`)
+
+```
+1. order = public prefix; read salt from stream bytes 0–15 (unencrypted)
+2. keys  = Argon2id(password, salt); finish order with keys.orderKey
+3. position at stream byte 16; container read with maxPayload = cap + 4  (section 7)
+4. return the real payload
+```
+
+`Encode` and `Decode` share `prepareEncode` / `prepareDecode` in
+`steg/steg.go` with the parallel paths, so all four obtain the identical order.
+
+Library callers may pass a `draw.Image` whose bounds do not start at (0,0);
+the cursor offsets every point by `Bounds().Min`. The cursor reads pixels with
+`At().RGBA()` and writes them back as `color.RGBA` built from the low byte of
+each 16-bit component, which is exact for 8-bit opaque images such as the
+`*image.RGBA` the CLI always uses.
+
+---
+
+## 12. Parallel encode/decode
+
+**File:** `steg/parallel.go`
+
+`EncodeParallel` / `DecodeParallel` produce and accept exactly the same format
+as `Encode` / `Decode`; the four are interchangeable.
+
+* The salt is written (or read), keys derived and the order finished in
+  `prepareEncode` / `prepareDecode` before any worker starts. Every worker
+  shares the read-only order slice and builds its own cursor + cipher stack.
+* The padded block (encode) or padded block + tag (decode) is split into jobs
+  starting at stream byte 20. Each chunk is `alignment × 1024` bytes, where
+  `alignment = lcm(8, bpp) / 8` bytes, so every chunk spans a whole number of
+  pixels.
+* The payload starts at bit 160, which is not a pixel boundary when `bpp` is a
+  multiple of 3 (including the default `bpp = 3`). `firstChunkShift(bpp)` is the
+  smallest `r ≥ 0` with `(160 + 8r) mod bpp = 0`; the first chunk is `r` bytes
+  longer, which puts every later boundary on a pixel boundary. Without it two
+  encode workers would read-modify-write the same pixel and one would silently
+  discard the other's bits. (A mutex around `At`/`Set` does not prevent that;
+  the whole load-modify-store sequence would have to be atomic.)
+* On encode the HMAC is computed over the whole padded block before dispatch.
+  After all workers finish, a single sequential stack writes the length field
+  (byte 16) and the tag (byte `20 + L`); both may share a pixel with a worker's
+  region, which is safe because no worker is running any more. Encode workers
+  share one mutex around `img.At` / `img.Set` to avoid data races on the
+  underlying pixel array.
+* On decode the length is read and bounded first (`L ≤ cap + 4`), then workers
+  fill the buffer and the tag is verified over the assembled block.
+
+---
+
+## 13. Implementation layers
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  cmd/steg  (Cobra CLI; PNG/BMP/TIFF I/O; transparency check;  │
+│             verify-after-write)                                │
+└───────────────────────┬──────────────────────────────────────┘
+                        │ draw.Image + password
+┌───────────────────────▼──────────────────────────────────────┐
+│  steg.Encode / Decode / EncodeParallel / DecodeParallel        │
+│  prepareEncode/prepareDecode: public order → salt → Argon2id   │
+│  → encKey, macKey, nonce, orderKey → finished order            │
+└───────┬───────────────────────────────────────┬──────────────┘
+        │ []image.Point (order)                 │ encKey, nonce
+┌───────▼─────────────────────┐   ┌─────────────▼──────────────┐
+│  cursors/order.go           │   │  cipher.NewCipher          │
+│  NewPixelOrder (public)     │   │  AES-128-CTR, bit-indexed, │
+│  FinishPixelOrder (keyed)   │   │  seekable                  │
+│  cursors.RNGCursor          │   │                            │
+│  bit↔pixel mapping, cache   │   │                            │
+└───────┬─────────────────────┘   └─────────────┬──────────────┘
+        │ Cursor                                │ StreamCipherBlock
+┌───────▼───────────────────────────────────────▼──────────────┐
+│  cursors.CipherMiddleware  (EncryptByte / DecryptByte)         │
+└───────┬──────────────────────────────────────────────────────┘
+        │ Cursor (ReadByte / WriteByte / Seek in bits)
+┌───────▼──────────────────────────────────────────────────────┐
+│  cursors.CursorAdapter  (Cursor → io.ReadWriteSeeker, bytes)   │
+└───────┬──────────────────────────────────────────────────────┘
+        │ io.ReadWriteSeeker + HMAC-SHA256(macKey)
+┌───────▼──────────────────────────────────────────────────────┐
+│  container.WritePayload / ReadPayload                          │
+│  [LE32 length][padded block][32-byte tag]                      │
+└──────────────────────────────────────────────────────────────┘
+```
+
+Notes on the layers:
+
+* `Cursor` is byte-oriented (`ReadByte`, `WriteByte`, `Seek`) but `Seek`
+  offsets are in **bits**. `CursorAdapter` multiplies byte offsets by 8.
+* `CipherMiddleware.Seek` seeks the cipher and the cursor to the same bit
+  position, which is what makes the keystream index equal the stream bit
+  position (section 6).
+* `RNGCursor` caches one pixel and writes it back once when the cursor leaves
+  it, so each pixel costs one `At` and one `Set` regardless of `bpp`.
+
+---
+
+## 14. CLI behaviour
+
+**File:** `cmd/steg/root.go`
+
+These are properties of the `steg` command, not of the format.
+
+* Every input image is copied into a fresh `*image.RGBA` with origin (0,0)
+  before encoding or decoding.
+* `encode` and `test-visual` reject a carrier that has any non-opaque pixel,
+  whatever the output format. PNG and BMP store straight alpha, so writing the
+  alpha-premultiplied buffer would destroy hidden bits in translucent pixels;
+  TIFF would keep them but produce invalid premultiplied pixels. The user is
+  told to flatten the image onto an opaque background.
+* `encode` loads and checks the carrier and reads the payload file **before**
+  asking for the password.
+* `encode` writes the result to a temporary file next to the output (same
+  extension, so the same format), decodes that file through the same function
+  `steg decode` uses, compares the result byte for byte with the payload, and
+  only then renames it onto the output path. On any failure the temporary file
+  is removed and an existing output file is left untouched.
+* `decode` decodes fully before creating the output file, so a wrong password
+  leaves nothing behind.
+* Output format is chosen by extension: `.bmp`, `.tif`/`.tiff`, otherwise PNG.
+
+---
+
+## 15. Design rationale
+
+### Single Argon2id call over a per-image random salt
+
+All key material comes from one Argon2id call over the password and a fresh
+16-byte salt. The salt has to be readable before any key exists, so it is
+stored in plaintext; that is harmless, since a salt is not a secret. A fresh
+salt on every encode gives a unique `encKey`/`nonce` pair, and therefore a
+unique keystream, even when the same password and carrier are reused. One call
+producing 84 bytes is sliced into four independent values instead of paying
+the KDF cost four times.
+
+### Public salt positions, keyed order for everything else
+
+The decoder must find the salt before it can derive any key, so the salt's
+pixel positions cannot depend on the password. They are taken from a public
+ChaCha8 stream: anyone can compute `order[0..k−1]` from the image size and
+`bpp`, by design. Everything after the salt is placed by the shuffle under
+`orderKey`, which is Argon2id output, so recomputing the rest of the order for
+a guessed password costs one full KDF call; there is no cheaper shortcut.
+
+The earlier design seeded `math/rand` with the first 8 bytes of
+SHA-256(password): recomputing the order for a password guess cost one SHA-256
+instead of a KDF call.
+
+**What the secret order buys today: nothing.** The encoder fills the whole
+carrier, so every pixel carries data and the order hides nothing about
+*where* the data is. It starts to matter once padding is bounded (README, Next
+steps, item 2) and only part of the image is touched; this change is that
+item's prerequisite.
+
+### ChaCha8 and a hand-written bounded draw
+
+The order is part of the format, so it must be bit-for-bit reproducible
+forever. `ChaCha8.Uint64` is fixed by the chacha8rand specification;
+`rand.Rand.IntN` and `rand.Shuffle` are not guaranteed stable across Go
+releases, so the shuffle uses its own rejection-sampling draw.
+`TestPixelOrderGolden` pins the output.
+
+### Full-capacity padding
+
+Writing the whole carrier on every encode removes payload size as a
+statistical signal: a 1-byte and a 500 KB payload produce the same LSB
+disturbance. The cost is that the disturbance is always maximal; see the
+limitations below.
+
+### MAC-then-encrypt
+
+The HMAC is computed over the plaintext padded block and then encrypted with
+it. Encrypt-then-MAC is the usual recommendation; here the tag lives inside the
+encrypted channel, decryption is a cheap XOR, and nothing is released before
+the tag verifies, so the ordering is not exploitable in this threat model.
+
+### Bit-level CTR
+
+The cipher is indexed by stream bit so that any bit range can be encrypted or
+decrypted independently. That is what lets parallel workers seek to their
+chunk without coordinating cipher state.
+
+---
+
+## 16. Known limitations
 
 | Issue | Severity | Notes |
-|-------|----------|-------|
-| MAC-then-Encrypt ordering | Low | HMAC is computed over plaintext before encryption. Unconventional (Encrypt-then-MAC is preferred), but not exploitable in this threat model since the tag is inside the encrypted channel. |
-| Fixed application salt | Low | A per-image random salt would be marginally stronger; not implemented to avoid header bootstrapping complexity. |
-| No streaming decode | Medium | `ReadPayload` allocates the full payload in memory before returning it. Very large payloads may cause high memory usage. |
-| Lossy formats unsupported | High | JPEG and other lossy formats destroy LSB data. Only lossless formats (PNG, BMP, TIFF) are supported. |
-| Bootstrap cipher keystream reuse | Info | The bootstrap cipher uses `(encKey, kdfNonce)` — fixed per password — consuming keystream bytes 0–3 on every encode. Since the plaintext (crypto/rand) is different each time, the ciphertext differs; no information about the nonce or key is exposed. |
-| Nonce tampering | Low | Flipping bits in the encrypted nonce region (bytes 0–3) corrupts the recovered `randomNonce`, causing the payload cipher to differ from encode, which cascades to an HMAC failure. The correct outcome — tampering is detected — but the error message does not distinguish nonce tampering from a wrong password. |
-| Statistical steganalysis | Low (mitigated) | Every encode writes the full image capacity regardless of payload size, making payload-size estimation from statistical analysis infeasible. The built-in `steg detect` command implements chi-square and RS analysis to surface residual LSB signatures. Higher `--bits-per-channel` settings increase the statistical deviation. |
+|---|---|---|
+| Statistical steganalysis | High | LSB replacement at full capacity is flagged by chi-square and RS analysis on every channel written to; `steg detect` does it without the password. RS is noisier on small images (below roughly 512×512). |
+| Secret order currently ineffective | Info | With full-capacity padding every pixel carries data, so the keyed order hides nothing. It only matters with bounded padding. |
+| Public salt positions | Info | By design: the salt pixels are computable from the image size and settings, and the salt is plaintext. Anyone can read it; it does not help guess the password. |
+| Dictionary attacks on weak passwords | Medium | Each guess costs one Argon2id (t=2, 64 MiB, p=4) call; the length bound rejects most wrong guesses right after it. Strength rests on the password. |
+| No format version field | Low | A decoder of the wrong format version fails as if the password were wrong. Images from pre-v2 builds must be decoded with the build that wrote them. |
+| Settings not stored | Low | `bpc` and `ch` must be supplied at decode time; a mismatch looks like a wrong password. |
+| MAC-then-encrypt | Low | See section 15. |
+| No streaming decode | Medium | The full padded block (carrier capacity + 4 bytes) is held in memory. The length is bounded by capacity before allocation, so a wrong password cannot trigger an oversized allocation. |
+| Transparent carriers rejected (CLI) | Low | Carriers with any non-opaque pixel are refused; flatten them first. |
+| 8-bit pixels only | Low | The cursor writes `color.RGBA` built from the low byte of each component. The CLI converts every carrier to 8-bit RGBA, so a 16-bit input comes out as 8-bit; library callers passing a `draw.Image` with deeper components would get wrong pixels. |
+| Lossy formats unsupported | High | JPEG and other lossy formats destroy LSB data. Only PNG, BMP and TIFF are supported. |
