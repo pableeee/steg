@@ -18,9 +18,12 @@ var detectCmd = &cobra.Command{
               unequal (2k)/(2k+1) pixel-value pair frequencies; LSB embedding
               equalises them. A high p-value (> 0.05) is suspicious.
 
-  RS analysis Detects local pixel smoothness asymmetry. LSB embedding biases
-              the response to the positive flipping mask (Rm) over the negative
-              (Rnm). A positive asymmetry (Rm − Rnm > 0.01) is suspicious.`,
+  RS analysis Detects local pixel smoothness asymmetry. In a clean image the
+              regular-group fractions under the positive (Rm) and negative
+              (R-m) flipping masks are about equal; LSB embedding lowers Rm
+              and raises R-m. A negative asymmetry (Rm − R-m < −0.02) is
+              suspicious. Small images (below roughly 512×512) are noisier and
+              may be flagged by chance.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return runDetect()
 	},
@@ -50,7 +53,7 @@ func runDetect() error {
 		fmt.Printf("  %s: χ²=%-10.2f  p=%.4f  [%s]\n", r.Channel, r.ChiSq, r.PValue, label)
 	}
 
-	fmt.Println("\nRS analysis (positive asymmetry = suspicious):")
+	fmt.Println("\nRS analysis (asymmetry < -0.02 = suspicious):")
 	for _, r := range result.RS {
 		label := "CLEAN"
 		if r.Suspicious {

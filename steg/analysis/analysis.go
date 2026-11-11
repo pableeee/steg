@@ -17,12 +17,13 @@ type ChiSquareResult struct {
 }
 
 // RSResult holds the per-channel result of the RS analysis.
-// Asymmetry = Rm - Rnm; positive values indicate embedding.
+// Asymmetry = Rm - Rnm. It is near zero for a clean photograph and turns
+// negative under LSB embedding; values below -0.02 are flagged.
 type RSResult struct {
 	Channel    string
 	Rm, Sm     float64 // regular/singular fractions under positive mask
 	Rnm, Snm   float64 // regular/singular fractions under negative mask
-	Asymmetry  float64 // Rm - Rnm; > 0 = suspicious
+	Asymmetry  float64 // Rm - Rnm; < -0.02 = suspicious
 	Suspicious bool
 }
 
