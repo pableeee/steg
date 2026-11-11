@@ -6,32 +6,8 @@ import (
 	"image/color"
 	"image/draw"
 	"io"
-	"math/rand"
 	"sync"
 )
-
-func GenerateSequence(width, height int, seed int64) []image.Point {
-	rng := rand.New(rand.NewSource(seed))
-	return generateSequence(width, height, rng)
-}
-
-func generateSequence(width, height int, rng *rand.Rand) []image.Point {
-	totalPixels := width * height
-	positions := make([]image.Point, totalPixels)
-
-	// Initialize the positions with sequential values
-	for i := 0; i < totalPixels; i++ {
-		positions[i] = image.Point{X: i % width, Y: i / width}
-	}
-
-	// Shuffle the positions to create a pseudo-random sequence
-	for i := totalPixels - 1; i > 0; i-- {
-		j := rng.Intn(i + 1)
-		positions[i], positions[j] = positions[j], positions[i]
-	}
-
-	return positions
-}
 
 type RNGCursor struct {
 	img            draw.Image
@@ -41,8 +17,7 @@ type RNGCursor struct {
 	bitsPerChannel int
 	useBits        []BitColor
 	points         []image.Point
-	rng            *rand.Rand
-	maxBits        int64 // pre-computed capacity in bits
+	maxBits        int64 // capacity in bits: len(points) × bits per pixel
 
 	// min is the image's origin. points are generated in the range
 	// [0,Dx)×[0,Dy) and offset by min on access, so sub-images whose bounds do
@@ -84,12 +59,11 @@ func UseBlueBit() Option {
 	}
 }
 
-func WithSeed(seed int64) Option {
-	return func(c *RNGCursor) {
-		c.rng = rand.New(rand.NewSource(seed))
-	}
-}
-
+// WithSharedPoints sets the traversal order: stream bit b lives in pixel
+// points[b / bitsPerPixel]. Points are in [0,Dx)×[0,Dy) and are offset by the
+// image's Bounds().Min on access. The slice is read, never modified, so several
+// cursors may share it. Without this option the cursor walks the image in
+// row-major order.
 func WithSharedPoints(points []image.Point) Option {
 	return func(c *RNGCursor) { c.points = points }
 }
@@ -106,7 +80,7 @@ func WithImageMutex(mu *sync.Mutex) Option {
 }
 
 func NewRNGCursor(img draw.Image, options ...Option) *RNGCursor {
-	c := &RNGCursor{img: img, bitMask: R_Bit, bitsPerChannel: 1, rng: rand.New(rand.NewSource(0))}
+	c := &RNGCursor{img: img, bitMask: R_Bit, bitsPerChannel: 1}
 	for _, opt := range options {
 		opt(c)
 	}
@@ -114,7 +88,12 @@ func NewRNGCursor(img draw.Image, options ...Option) *RNGCursor {
 	b := img.Bounds()
 	c.min = b.Min
 	if c.points == nil {
-		c.points = generateSequence(b.Dx(), b.Dy(), c.rng)
+		c.points = make([]image.Point, 0, b.Dx()*b.Dy())
+		for y := 0; y < b.Dy(); y++ {
+			for x := 0; x < b.Dx(); x++ {
+				c.points = append(c.points, image.Point{X: x, Y: y})
+			}
+		}
 	}
 	for _, color := range Colors {
 		if c.bitMask&color == color {
@@ -122,7 +101,9 @@ func NewRNGCursor(img draw.Image, options ...Option) *RNGCursor {
 			c.useBits = append(c.useBits, color)
 		}
 	}
-	c.maxBits = int64(b.Dx()) * int64(b.Dy()) * int64(c.bitCount) * int64(c.bitsPerChannel)
+	// Capacity follows the point slice, not the image bounds, so a slice shorter
+	// than the image can never be indexed past its end.
+	c.maxBits = int64(len(c.points)) * int64(c.bitCount) * int64(c.bitsPerChannel)
 	return c
 }
 

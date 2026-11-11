@@ -2,21 +2,22 @@ package steg
 
 import (
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"image"
 	"image/draw"
+	"io"
 
 	"github.com/pableeee/steg/cursors"
 	"golang.org/x/crypto/argon2"
 )
 
 // cursorOptions builds the RNGCursor option slice for the given configuration.
-// channels: 1 = R only, 2 = R+G, 3 = R+G+B.
-func cursorOptions(seed int64, bitsPerChannel, channels int) []cursors.Option {
+// channels: 1 = R only, 2 = R+G, 3 = R+G+B. points is the traversal order from
+// prepareEncode/prepareDecode; it is shared, never copied or modified.
+func cursorOptions(points []image.Point, bitsPerChannel, channels int) []cursors.Option {
 	opts := []cursors.Option{
-		cursors.WithSeed(seed),
+		cursors.WithSharedPoints(points),
 		cursors.WithBitsPerChannel(bitsPerChannel),
 	}
 	if channels >= 2 {
@@ -38,27 +39,94 @@ func gcd(a, b int) int {
 func lcm(a, b int) int         { return a / gcd(a, b) * b }
 func lcmBytes(bpb, bc int) int { return lcm(bpb, bc) / bpb }
 
-// deriveSeed returns the Fisher-Yates pixel-traversal seed for the given password.
-// SHA-256 is sufficient here: the seed only determines which pixels carry data,
-// not any cryptographic secret. An attacker who knows the password can already
-// decode; one who does not cannot determine the traversal order.
-func deriveSeed(pass []byte) (int64, error) {
-	if len(pass) == 0 {
-		return 0, fmt.Errorf("password must not be empty")
-	}
-	h := sha256.Sum256(pass)
-	return int64(binary.BigEndian.Uint64(h[:8])), nil
+// saltBytes is the size of the plaintext random salt at the start of the stream.
+const saltBytes = 16
+
+// saltPixels returns k = ceil(128 / bitsPerPixel), the number of pixels that
+// hold salt bits. They are the public prefix of the traversal order. The last
+// of them may also hold the first bits of the encrypted container.
+func saltPixels(bitsPerPixel int) int {
+	return (saltBytes*8 + bitsPerPixel - 1) / bitsPerPixel
 }
 
-// deriveMainKeys stretches pass using Argon2id with a per-image random salt.
-// Returns encKey (16-byte AES-128 key), macKey (32-byte HMAC-SHA256 key), payloadNonce (4-byte CTR nonce).
-// 52 bytes: 16 (AES-128 enc key) + 32 (HMAC-SHA256 mac key) + 4 (cipher nonce).
-func deriveMainKeys(pass, salt []byte) (encKey, macKey []byte, payloadNonce uint32, err error) {
-	derived := argon2.IDKey(pass, salt, 2, 64*1024, 4, 52)
-	encKey = derived[0:16]
-	macKey = derived[16:48]
-	payloadNonce = binary.BigEndian.Uint32(derived[48:52])
-	return encKey, macKey, payloadNonce, nil
+// mainKeys is everything derived from the password and the per-image salt.
+type mainKeys struct {
+	encKey   []byte   // AES-128 key for the payload stream cipher
+	macKey   []byte   // HMAC-SHA256 key for the container tag
+	nonce    uint32   // CTR nonce for the payload stream cipher
+	orderKey [32]byte // ChaCha8 key for the secret part of the pixel order
+}
+
+// deriveMainKeys stretches pass using Argon2id with the per-image random salt.
+// Output layout (84 bytes): [0:16] encKey, [16:48] macKey, [48:52] nonce
+// (big-endian uint32), [52:84] orderKey.
+func deriveMainKeys(pass, salt []byte) mainKeys {
+	derived := argon2.IDKey(pass, salt, 2, 64*1024, 4, 84)
+	k := mainKeys{
+		encKey: derived[0:16],
+		macKey: derived[16:48],
+		nonce:  binary.BigEndian.Uint32(derived[48:52]),
+	}
+	copy(k.orderKey[:], derived[52:84])
+	return k
+}
+
+// prepareEncode writes a fresh random salt to the public salt pixels of m,
+// derives the main keys from it, and returns them with the complete pixel
+// order. prepareDecode is its mirror. Both the sequential and the parallel
+// paths obtain their order here and nowhere else, so they cannot drift apart.
+func prepareEncode(m draw.Image, pass []byte, bitsPerChannel, channels int) (mainKeys, []image.Point, error) {
+	var salt [saltBytes]byte
+	if _, err := rand.Read(salt[:]); err != nil {
+		return mainKeys{}, nil, err
+	}
+	return prepareOrder(m, pass, bitsPerChannel, channels, &salt, true)
+}
+
+// prepareDecode reads the salt from the public salt pixels of m, derives the
+// main keys from it, and returns them with the complete pixel order.
+func prepareDecode(m draw.Image, pass []byte, bitsPerChannel, channels int) (mainKeys, []image.Point, error) {
+	var salt [saltBytes]byte
+	return prepareOrder(m, pass, bitsPerChannel, channels, &salt, false)
+}
+
+// prepareOrder computes the public prefix of the order, writes salt to it (or
+// reads salt from it) through a raw, unencrypted cursor, runs Argon2id on the
+// salt, and finishes the order with the derived orderKey.
+func prepareOrder(m draw.Image, pass []byte, bitsPerChannel, channels int,
+	salt *[saltBytes]byte, write bool) (mainKeys, []image.Point, error) {
+	if len(pass) == 0 {
+		return mainKeys{}, nil, fmt.Errorf("password must not be empty")
+	}
+	bitsPerPixel := bitsPerChannel * channels
+	if bitsPerPixel <= 0 {
+		return mainKeys{}, nil, fmt.Errorf("steg: invalid encoding settings (%d bits/channel, %d channels)",
+			bitsPerChannel, channels)
+	}
+	k := saltPixels(bitsPerPixel)
+	b := m.Bounds()
+	points, err := cursors.NewPixelOrder(b.Dx(), b.Dy(), k)
+	if err != nil {
+		return mainKeys{}, nil, fmt.Errorf("steg: image too small: %w", err)
+	}
+
+	// Stream bits 0–127 all live in points[:k], which is already final. The
+	// cursor is flushed and dropped before points[k:] are shuffled under it.
+	cur := cursors.NewRNGCursor(m, cursorOptions(points, bitsPerChannel, channels)...)
+	rw := cursors.CursorAdapter(cur)
+	if write {
+		_, err = rw.Write(salt[:])
+	} else {
+		_, err = io.ReadFull(rw, salt[:])
+	}
+	cur.Flush()
+	if err != nil {
+		return mainKeys{}, nil, err
+	}
+
+	keys := deriveMainKeys(pass, salt[:])
+	cursors.FinishPixelOrder(points, k, keys.orderKey)
+	return keys, points, nil
 }
 
 // Overhead is the number of bytes every encoded image spends on framing:

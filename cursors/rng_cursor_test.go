@@ -50,15 +50,23 @@ func TestRNGCursor(t *testing.T) {
 		assert.Equal(t, payload, readBack)
 	})
 
-	t.Run("2. Deterministic Behavior With Given Seed", func(t *testing.T) {
+	t.Run("2. Deterministic Behavior With Given Order", func(t *testing.T) {
 		img := image.NewRGBA(image.Rect(0, 0, 5, 5))
-		// 1 bit per pixel for simplicity
+		// 1 bit per pixel for simplicity. Each cursor builds its own copy of
+		// the order from the same key, so agreement means the order is
+		// deterministic, not merely shared.
+		order := func() []image.Point {
+			points, err := cursors.NewPixelOrder(5, 5, 3)
+			require.NoError(t, err)
+			cursors.FinishPixelOrder(points, 3, [32]byte{42})
+			return points
+		}
 		cur1 := cursors.NewRNGCursor(img,
-			cursors.WithSeed(42),
+			cursors.WithSharedPoints(order()),
 		)
 
 		cur2 := cursors.NewRNGCursor(img,
-			cursors.WithSeed(42),
+			cursors.WithSharedPoints(order()),
 		)
 
 		payload := []byte("abc")
@@ -136,7 +144,6 @@ func TestRNGCursor(t *testing.T) {
 	// 	// Let's assume that RNGCursor can handle bitDepth as an option, like WithBitDepth(16)
 	// 	cur := cursors.NewRNGCursor(img,
 	// 		cursors.UseGreenBit(),
-	// 		cursors.WithSeed(123),
 	// 	)
 
 	// 	adapter := cursors.CursorAdapter(cur)

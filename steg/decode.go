@@ -12,31 +12,20 @@ import (
 )
 
 func Decode(m draw.Image, pass []byte, bitsPerChannel, channels int) ([]byte, error) {
-	seed, err := deriveSeed(pass)
+	// Read the plaintext salt from stream bits 0–127, derive the keys from it,
+	// and get the full pixel order.
+	keys, points, err := prepareDecode(m, pass, bitsPerChannel, channels)
 	if err != nil {
 		return nil, err
 	}
 
-	cur := cursors.NewRNGCursor(m, cursorOptions(seed, bitsPerChannel, channels)...)
-
-	// Read the 16-byte random salt from image bytes 0–15 (stored in plaintext).
-	saltAdapter := cursors.CursorAdapter(cur)
-	var randomSalt [16]byte
-	if _, err = io.ReadFull(saltAdapter, randomSalt[:]); err != nil {
-		return nil, err
-	}
-
-	// Derive main keys from the recovered salt; seek cursor and cipher to bit 128.
-	encKey, macKey, payloadNonce, err := deriveMainKeys(pass, randomSalt[:])
-	if err != nil {
-		return nil, err
-	}
-	payloadCipher, err := cipher.NewCipher(payloadNonce, encKey)
+	cur := cursors.NewRNGCursor(m, cursorOptions(points, bitsPerChannel, channels)...)
+	payloadCipher, err := cipher.NewCipher(keys.nonce, keys.encKey)
 	if err != nil {
 		return nil, err
 	}
 	payloadCM := cursors.CipherMiddleware(cur, payloadCipher)
-	if _, err = payloadCM.Seek(128, io.SeekStart); err != nil {
+	if _, err = payloadCM.Seek(saltBytes*8, io.SeekStart); err != nil {
 		return nil, err
 	}
 
@@ -45,7 +34,7 @@ func Decode(m draw.Image, pass []byte, bitsPerChannel, channels int) ([]byte, er
 	maxPadded := CapacityBytes(m, bitsPerChannel, channels) + 4
 
 	adapter := cursors.CursorAdapter(payloadCM)
-	mac := hmac.New(sha256.New, macKey)
+	mac := hmac.New(sha256.New, keys.macKey)
 	padded, err := container.ReadPayload(adapter, mac, maxPadded)
 	if err != nil {
 		return nil, err

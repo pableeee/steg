@@ -2,7 +2,6 @@ package steg
 
 import (
 	"crypto/hmac"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
@@ -57,25 +56,17 @@ type decJob struct {
 }
 
 // newWorkerStack creates a per-worker cipher+cursor stack. Each worker has its
-// own independent cipher and cursor state. imgMu, when non-nil, is shared
-// across concurrent workers to serialise img.At()/img.Set() calls.
-func newWorkerStack(m draw.Image, nonce uint32, encKey []byte,
-	points []image.Point, bitsPerChannel, channels int, imgMu *sync.Mutex) (io.ReadWriteSeeker, error) {
-	opts := []cursors.Option{
-		cursors.WithSharedPoints(points),
-		cursors.WithBitsPerChannel(bitsPerChannel),
-	}
-	if channels >= 2 {
-		opts = append(opts, cursors.UseGreenBit())
-	}
-	if channels >= 3 {
-		opts = append(opts, cursors.UseBlueBit())
-	}
+// own independent cipher and cursor state over the shared points slice. imgMu,
+// when non-nil, is shared across concurrent workers to serialise
+// img.At()/img.Set() calls.
+func newWorkerStack(m draw.Image, keys mainKeys, points []image.Point,
+	bitsPerChannel, channels int, imgMu *sync.Mutex) (io.ReadWriteSeeker, error) {
+	opts := cursorOptions(points, bitsPerChannel, channels)
 	if imgMu != nil {
 		opts = append(opts, cursors.WithImageMutex(imgMu))
 	}
 	cur := cursors.NewRNGCursor(m, opts...)
-	c, err := cipher.NewCipher(nonce, encKey)
+	c, err := cipher.NewCipher(keys.nonce, keys.encKey)
 	if err != nil {
 		return nil, err
 	}
@@ -86,11 +77,6 @@ func newWorkerStack(m draw.Image, nonce uint32, encKey []byte,
 // The on-image layout is identical to Encode, so DecodeParallel and Decode
 // can both decode images written by EncodeParallel (and vice-versa).
 func EncodeParallel(m draw.Image, pass []byte, r io.Reader, bitsPerChannel, channels int) error {
-	seed, err := deriveSeed(pass)
-	if err != nil {
-		return err
-	}
-
 	realPayload, err := io.ReadAll(r)
 	if err != nil {
 		return err
@@ -100,30 +86,9 @@ func EncodeParallel(m draw.Image, pass []byte, r io.Reader, bitsPerChannel, chan
 		return err
 	}
 
-	bounds := m.Bounds()
-	points := cursors.GenerateSequence(bounds.Max.X, bounds.Max.Y, seed)
-
-	// Write the plaintext salt (16 bytes) to image bytes 0–15 before workers start.
-	rawOpts := []cursors.Option{cursors.WithSharedPoints(points), cursors.WithBitsPerChannel(bitsPerChannel)}
-	if channels >= 2 {
-		rawOpts = append(rawOpts, cursors.UseGreenBit())
-	}
-	if channels >= 3 {
-		rawOpts = append(rawOpts, cursors.UseBlueBit())
-	}
-	rawCur := cursors.NewRNGCursor(m, rawOpts...)
-	var randomSalt [16]byte
-	if _, err = rand.Read(randomSalt[:]); err != nil {
-		return err
-	}
-	saltAdapter := cursors.CursorAdapter(rawCur)
-	if _, err = saltAdapter.Write(randomSalt[:]); err != nil {
-		return err
-	}
-	rawCur.Flush()
-
-	// Derive main keys from the random salt.
-	encKey, macKey, payloadNonce, err := deriveMainKeys(pass, randomSalt[:])
+	// Write the plaintext salt (stream bytes 0–15) and derive the keys and the
+	// full pixel order before workers start.
+	keys, points, err := prepareEncode(m, pass, bitsPerChannel, channels)
 	if err != nil {
 		return err
 	}
@@ -132,7 +97,7 @@ func EncodeParallel(m draw.Image, pass []byte, r io.Reader, bitsPerChannel, chan
 	chunkSize := alignment * 1024
 
 	// Pre-compute HMAC over the full padded block before dispatching workers.
-	hashFn := hmac.New(sha256.New, macKey)
+	hashFn := hmac.New(sha256.New, keys.macKey)
 	hashFn.Write(padded)
 	tag := hashFn.Sum(nil)
 
@@ -157,7 +122,7 @@ func EncodeParallel(m draw.Image, pass []byte, r io.Reader, bitsPerChannel, chan
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			adapter, werr := newWorkerStack(m, payloadNonce, encKey, points, bitsPerChannel, channels, imgMu)
+			adapter, werr := newWorkerStack(m, keys, points, bitsPerChannel, channels, imgMu)
 			if werr != nil {
 				fail(werr)
 				return
@@ -214,8 +179,8 @@ dispatch:
 	// Post-parallel sequential writes: container length field (byte 16) and HMAC.
 	// Both run after wg.Wait(), so although each may share a pixel with the
 	// payload region, no concurrent writer can clobber it.
-	// Workers use payloadNonce; the salt region (bytes 0–15) is already written.
-	seqAdapter, err := newWorkerStack(m, payloadNonce, encKey, points, bitsPerChannel, channels, nil)
+	// The salt region (bytes 0–15) was written by prepareEncode.
+	seqAdapter, err := newWorkerStack(m, keys, points, bitsPerChannel, channels, nil)
 	if err != nil {
 		return err
 	}
@@ -242,37 +207,15 @@ dispatch:
 // DecodeParallel decodes a message from m using a parallel worker pool.
 // Images encoded by Encode (sequential) are fully compatible.
 func DecodeParallel(m draw.Image, pass []byte, bitsPerChannel, channels int) ([]byte, error) {
-	seed, err := deriveSeed(pass)
-	if err != nil {
-		return nil, err
-	}
-
-	bounds := m.Bounds()
-	points := cursors.GenerateSequence(bounds.Max.X, bounds.Max.Y, seed)
-
-	// Read the 16-byte random salt from image bytes 0–15 (stored in plaintext).
-	rawOpts := []cursors.Option{cursors.WithSharedPoints(points), cursors.WithBitsPerChannel(bitsPerChannel)}
-	if channels >= 2 {
-		rawOpts = append(rawOpts, cursors.UseGreenBit())
-	}
-	if channels >= 3 {
-		rawOpts = append(rawOpts, cursors.UseBlueBit())
-	}
-	rawCur := cursors.NewRNGCursor(m, rawOpts...)
-	saltAdapter := cursors.CursorAdapter(rawCur)
-	var randomSalt [16]byte
-	if _, err = io.ReadFull(saltAdapter, randomSalt[:]); err != nil {
-		return nil, err
-	}
-
-	// Derive main keys from the recovered salt.
-	encKey, macKey, payloadNonce, err := deriveMainKeys(pass, randomSalt[:])
+	// Read the plaintext salt (stream bytes 0–15) and derive the keys and the
+	// full pixel order.
+	keys, points, err := prepareDecode(m, pass, bitsPerChannel, channels)
 	if err != nil {
 		return nil, err
 	}
 
 	// Read the 4-byte container length field at byte 16 (after the plaintext salt).
-	seqAdapter, err := newWorkerStack(m, payloadNonce, encKey, points, bitsPerChannel, channels, nil)
+	seqAdapter, err := newWorkerStack(m, keys, points, bitsPerChannel, channels, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -318,7 +261,7 @@ func DecodeParallel(m draw.Image, pass []byte, bitsPerChannel, channels int) ([]
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			adapter, werr := newWorkerStack(m, payloadNonce, encKey, points, bitsPerChannel, channels, nil)
+			adapter, werr := newWorkerStack(m, keys, points, bitsPerChannel, channels, nil)
 			if werr != nil {
 				fail(werr)
 				return
@@ -369,7 +312,7 @@ dispatch:
 	}
 
 	// Verify HMAC over the full padded block.
-	mac := hmac.New(sha256.New, macKey)
+	mac := hmac.New(sha256.New, keys.macKey)
 	mac.Write(decryptedBuf[:payloadLen])
 	expected := mac.Sum(nil)
 	if !hmac.Equal(expected, decryptedBuf[payloadLen:]) {
