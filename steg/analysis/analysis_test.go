@@ -105,8 +105,11 @@ func TestChiSquareClean(t *testing.T) {
 	}
 }
 
+// TestChiSquareFullFill uses seeded LSB randomisation rather than a real
+// encode: each encode draws a fresh salt, so its LSBs (and the per-channel
+// p-values, roughly uniform at full fill) change from run to run.
 func TestChiSquareFullFill(t *testing.T) {
-	img := encodeFull(t, photoLikeImage(500, 500))
+	img := randomizeLSBs(photoLikeImage(500, 500), 1.0)
 	results := analysis.ChiSquare(img)
 	require.Len(t, results, 3)
 
@@ -272,10 +275,22 @@ func TestAnalyzeClean(t *testing.T) {
 	assert.Equal(t, "CLEAN", result.Verdict)
 }
 
-// TestAnalyzeFullFill: a default full-capacity encode trips both detectors on
-// every channel, so all six checks fire.
+// TestAnalyzeFullFill: a real full-capacity encode is never CLEAN, and RS
+// flags every channel. The verdict is not pinned to LIKELY_STEGO: at full fill
+// each channel's chi-square p-value is roughly uniform, so it drops below 0.05
+// about 5% of the time per channel and the verdict is SUSPICIOUS in roughly
+// one encode in seven. Each encode draws a fresh salt, so this varies by run.
 func TestAnalyzeFullFill(t *testing.T) {
 	result := analysis.Analyze(encodeFull(t, photoLikeImage(500, 500)))
+	assert.Contains(t, []string{"SUSPICIOUS", "LIKELY_STEGO"}, result.Verdict)
+	for _, r := range result.RS {
+		assert.True(t, r.Suspicious, "RS channel %s should be flagged (asymmetry=%+.4f)", r.Channel, r.Asymmetry)
+	}
+}
+
+// TestAnalyzeFullFillSeeded pins the verdict on deterministic full-fill LSBs.
+func TestAnalyzeFullFillSeeded(t *testing.T) {
+	result := analysis.Analyze(randomizeLSBs(photoLikeImage(500, 500), 1.0))
 	assert.Equal(t, "LIKELY_STEGO", result.Verdict)
 }
 
