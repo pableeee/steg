@@ -2,21 +2,65 @@ package steg
 
 import (
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"image"
 	"image/draw"
+	"io"
+	"math"
 
 	"github.com/pableeee/steg/cursors"
 	"golang.org/x/crypto/argon2"
 )
 
+// validateCarrier checks everything about the carrier and the settings that
+// Encode, Decode, EncodeParallel and DecodeParallel need before they touch a
+// pixel: the image type (see Encode) and validateSettings on its dimensions.
+func validateCarrier(m image.Image, bitsPerChannel, channels int) error {
+	if err := cursors.CheckImage(m); err != nil {
+		return fmt.Errorf("steg: %w", err)
+	}
+	b := m.Bounds()
+	return validateSettings(b.Dx(), b.Dy(), bitsPerChannel, channels)
+}
+
+// validateSettings checks the encoding settings and the carrier dimensions:
+// bitsPerChannel in 1..8, channels in 1..3, positive dimensions, at most
+// cursors.MaxPixels pixels (the order indexes pixels with uint32), and a
+// capacity the format can describe (the container length field is a uint32).
+// The pixel limit keeps the capacity in bits below 2^32 × 24, far inside int64.
+func validateSettings(w, h, bitsPerChannel, channels int) error {
+	if bitsPerChannel < 1 || bitsPerChannel > 8 {
+		return fmt.Errorf("steg: bits per channel must be between 1 and 8, got %d", bitsPerChannel)
+	}
+	if channels < 1 || channels > 3 {
+		return fmt.Errorf("steg: channels must be between 1 and 3 (1=R, 2=R+G, 3=R+G+B), got %d", channels)
+	}
+	if w <= 0 || h <= 0 {
+		return fmt.Errorf("steg: invalid image dimensions %dx%d", w, h)
+	}
+	n, err := cursors.PixelCount(w, h)
+	if err != nil {
+		return fmt.Errorf("steg: image %dx%d is too large: at most %d pixels are supported",
+			w, h, int64(cursors.MaxPixels))
+	}
+	totalBytes := int64(n) * int64(channels*bitsPerChannel) / 8
+	// The container length field covers the 4-byte real-length prefix plus the
+	// capacity: totalBytes - Overhead + 4.
+	if totalBytes-Overhead+4 > math.MaxUint32 || totalBytes > math.MaxInt {
+		return fmt.Errorf("steg: image %dx%d at %d channel(s) × %d bit(s) holds %d bytes, "+
+			"more than the format's 4 GiB limit; use fewer channels or bits per channel",
+			w, h, channels, bitsPerChannel, totalBytes)
+	}
+	return nil
+}
+
 // cursorOptions builds the RNGCursor option slice for the given configuration.
-// channels: 1 = R only, 2 = R+G, 3 = R+G+B.
-func cursorOptions(seed int64, bitsPerChannel, channels int) []cursors.Option {
+// channels: 1 = R only, 2 = R+G, 3 = R+G+B. order is the traversal order from
+// prepareEncode/prepareDecode; it is shared, never copied or modified.
+func cursorOptions(order []uint32, bitsPerChannel, channels int) []cursors.Option {
 	opts := []cursors.Option{
-		cursors.WithSeed(seed),
+		cursors.WithSharedPoints(order),
 		cursors.WithBitsPerChannel(bitsPerChannel),
 	}
 	if channels >= 2 {
@@ -38,27 +82,92 @@ func gcd(a, b int) int {
 func lcm(a, b int) int         { return a / gcd(a, b) * b }
 func lcmBytes(bpb, bc int) int { return lcm(bpb, bc) / bpb }
 
-// deriveSeed returns the Fisher-Yates pixel-traversal seed for the given password.
-// SHA-256 is sufficient here: the seed only determines which pixels carry data,
-// not any cryptographic secret. An attacker who knows the password can already
-// decode; one who does not cannot determine the traversal order.
-func deriveSeed(pass []byte) (int64, error) {
-	if len(pass) == 0 {
-		return 0, fmt.Errorf("password must not be empty")
-	}
-	h := sha256.Sum256(pass)
-	return int64(binary.BigEndian.Uint64(h[:8])), nil
+// saltBytes is the size of the plaintext random salt at the start of the stream.
+const saltBytes = 16
+
+// saltPixels returns k = ceil(128 / bitsPerPixel), the number of pixels that
+// hold salt bits. They are the public prefix of the traversal order. The last
+// of them may also hold the first bits of the encrypted container.
+func saltPixels(bitsPerPixel int) int {
+	return (saltBytes*8 + bitsPerPixel - 1) / bitsPerPixel
 }
 
-// deriveMainKeys stretches pass using Argon2id with a per-image random salt.
-// Returns encKey (16-byte AES-128 key), macKey (32-byte HMAC-SHA256 key), payloadNonce (4-byte CTR nonce).
-// 52 bytes: 16 (AES-128 enc key) + 32 (HMAC-SHA256 mac key) + 4 (cipher nonce).
-func deriveMainKeys(pass, salt []byte) (encKey, macKey []byte, payloadNonce uint32, err error) {
-	derived := argon2.IDKey(pass, salt, 2, 64*1024, 4, 52)
-	encKey = derived[0:16]
-	macKey = derived[16:48]
-	payloadNonce = binary.BigEndian.Uint32(derived[48:52])
-	return encKey, macKey, payloadNonce, nil
+// mainKeys is everything derived from the password and the per-image salt.
+type mainKeys struct {
+	encKey   []byte   // AES-128 key for the payload stream cipher
+	macKey   []byte   // HMAC-SHA256 key for the container tag
+	nonce    uint32   // CTR nonce for the payload stream cipher
+	orderKey [32]byte // ChaCha8 key for the secret part of the pixel order
+}
+
+// deriveMainKeys stretches pass using Argon2id with the per-image random salt.
+// Output layout (84 bytes): [0:16] encKey, [16:48] macKey, [48:52] nonce
+// (big-endian uint32), [52:84] orderKey.
+func deriveMainKeys(pass, salt []byte) mainKeys {
+	derived := argon2.IDKey(pass, salt, 2, 64*1024, 4, 84)
+	k := mainKeys{
+		encKey: derived[0:16],
+		macKey: derived[16:48],
+		nonce:  binary.BigEndian.Uint32(derived[48:52]),
+	}
+	copy(k.orderKey[:], derived[52:84])
+	return k
+}
+
+// prepareEncode writes a fresh random salt to the public salt pixels of m,
+// derives the main keys from it, and returns them with the complete pixel
+// order. prepareDecode is its mirror. Both the sequential and the parallel
+// paths obtain their order here and nowhere else, so they cannot drift apart.
+func prepareEncode(m draw.Image, pass []byte, bitsPerChannel, channels int) (mainKeys, []uint32, error) {
+	var salt [saltBytes]byte
+	if _, err := rand.Read(salt[:]); err != nil {
+		return mainKeys{}, nil, err
+	}
+	return prepareOrder(m, pass, bitsPerChannel, channels, &salt, true)
+}
+
+// prepareDecode reads the salt from the public salt pixels of m, derives the
+// main keys from it, and returns them with the complete pixel order.
+func prepareDecode(m draw.Image, pass []byte, bitsPerChannel, channels int) (mainKeys, []uint32, error) {
+	var salt [saltBytes]byte
+	return prepareOrder(m, pass, bitsPerChannel, channels, &salt, false)
+}
+
+// prepareOrder computes the public prefix of the order, writes salt to it (or
+// reads salt from it) through a raw, unencrypted cursor, runs Argon2id on the
+// salt, and finishes the order with the derived orderKey. The caller must have
+// run validateCarrier.
+func prepareOrder(m draw.Image, pass []byte, bitsPerChannel, channels int,
+	salt *[saltBytes]byte, write bool) (mainKeys, []uint32, error) {
+	if len(pass) == 0 {
+		return mainKeys{}, nil, fmt.Errorf("password must not be empty")
+	}
+	k := saltPixels(bitsPerChannel * channels)
+	b := m.Bounds()
+	order, err := cursors.NewPixelOrder(b.Dx(), b.Dy(), k)
+	if err != nil {
+		return mainKeys{}, nil, fmt.Errorf("steg: image too small: %w", err)
+	}
+
+	// Stream bits 0–127 all live in order[:k], which is already final. The
+	// cursor is dropped before order[k:] are shuffled under it.
+	cur, err := cursors.NewRNGCursor(m, cursorOptions(order, bitsPerChannel, channels)...)
+	if err != nil {
+		return mainKeys{}, nil, err
+	}
+	rw := cursors.CursorAdapter(cur)
+	if write {
+		_, err = rw.Write(salt[:])
+	} else {
+		_, err = io.ReadFull(rw, salt[:])
+	}
+	if err != nil {
+		return mainKeys{}, nil, err
+	}
+
+	keys := deriveMainKeys(pass, salt[:])
+	cursors.FinishPixelOrder(order, k, keys.orderKey)
+	return keys, order, nil
 }
 
 // Overhead is the number of bytes every encoded image spends on framing:
@@ -68,7 +177,9 @@ const Overhead = 56
 
 // CapacityBytes returns the maximum real payload size, in bytes, that m can
 // hold with the given encoding settings. It returns 0 for images too small to
-// hold the framing overhead.
+// hold the framing overhead and for settings or dimensions Encode rejects
+// (bitsPerChannel outside 1..8, channels outside 1..3, too many pixels). It
+// looks only at m's bounds, not its type.
 //
 // This is the single source of truth for capacity; callers must not reimplement
 // the arithmetic, or they will drift from the encoder and produce payloads it
@@ -81,7 +192,11 @@ func CapacityBytes(m image.Image, bitsPerChannel, channels int) int {
 // CapacityForDims is CapacityBytes for an image whose dimensions are known but
 // which has not been decoded yet.
 func CapacityForDims(w, h, bitsPerChannel, channels int) int {
-	total := w * h * channels * bitsPerChannel / 8
+	if validateSettings(w, h, bitsPerChannel, channels) != nil {
+		return 0
+	}
+	// validateSettings guarantees this fits an int.
+	total := int(int64(w) * int64(h) * int64(channels*bitsPerChannel) / 8)
 	if total <= Overhead {
 		return 0
 	}

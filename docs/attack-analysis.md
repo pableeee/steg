@@ -2,37 +2,45 @@
 
 This document catalogues known attack surfaces against the `steg` tool's
 steganography and encryption scheme, framed as cryptopals-style exercises.
-Each section describes the theoretical basis, the exploit path, expected
-difficulty, and a results section to be filled in after implementation.
+Each section gives the theory, the exploit path, and measured results. The
+tools live in `cmd/attack1` (steganalysis) and `cmd/attack4` (dictionary
+attack); both are built on the library's exported API, so they track the
+current format instead of re-implementing it.
+
+All measurements below were taken on 2026-11-11 with the current working tree,
+on a 32-core Linux (WSL2) machine.
 
 ---
 
 ## Background: Cryptographic Design
 
 ```
-Password
+(width, height, bitsPerPixel) → k = ceil(128 / bitsPerPixel)
     │
-    ▼  Argon2id(pass, FIXED_SALT="github.com/pableeee/steg/v1", t=1, m=64MiB)
-    │    → bsSeed   (8B)  — Fisher-Yates pixel traversal seed
-    │    → bsEncKey (16B) — bootstrap AES-128 key
-    │    → bsNonce  (4B)  — bootstrap CTR nonce   ← CONSTANT PER PASSWORD
+    ▼  NewPixelOrder: first k Fisher-Yates steps driven by
+    │  ChaCha8(publicOrderKey)  → public salt pixels points[:k]
+    │  publicOrderKey = SHA-256("github.com/pableeee/steg/v2 salt positions")
     │
-    ▼  crypto/rand → randomSalt (16B)
-    │    → encrypted with bootstrap cipher (key=bsEncKey, nonce=bsNonce)
-    │    → written to image LSB bits 0–127
+    ▼  crypto/rand → randomSalt (16 B), written in PLAINTEXT to bits 0–127
     │
-    ▼  Argon2id(pass, randomSalt, t=1, m=64MiB)
-         → encKey       (16B) — payload AES-128-CTR key
-         → macKey       (32B) — HMAC-SHA256 key
-         → payloadNonce (4B)  — unique per encode (randomSalt drives this)
+    ▼  Argon2id(pass, randomSalt, t=2, m=64 MiB, p=4, 84 B)
+    │    → encKey   (16 B) — payload AES-128-CTR key
+    │    → macKey   (32 B) — HMAC-SHA256 key
+    │    → nonce    (4 B)  — payload CTR nonce
+    │    → orderKey (32 B) — ChaCha8 key for the rest of the pixel order
+    │
+    ▼  FinishPixelOrder: Fisher-Yates steps k..N−1 driven by ChaCha8(orderKey)
+    │
+    ▼  AES-128-CTR(encKey, nonce) over stream bits 128..end
+         container = [length][4 B real length | payload | random padding][HMAC]
 ```
 
-On-image binary layout (in Fisher-Yates pixel bit order):
+On-image layout (stream bit `b` lives in pixel `order[b / bitsPerPixel]`):
 
 ```
 Bits        Size     Cipher              Field
 ──────────────────────────────────────────────────────────
-0–127       16 B     AES-CTR bootstrap   enc(randomSalt)
+0–127       16 B     none (plaintext)    randomSalt
 128–159      4 B     AES-CTR payload     container length (LE uint32)
 160–191      4 B     AES-CTR payload     real payload length (LE uint32)
 192–…        N B     AES-CTR payload     real payload bytes
@@ -40,191 +48,124 @@ Bits        Size     Cipher              Field
 …–(…+256)   32 B     AES-CTR payload     HMAC-SHA256 tag
 ```
 
+The salt pixels depend only on the image size and encoding settings, so
+anyone can read the salt. Everything after them depends on Argon2id output:
+locating, decrypting or verifying any payload bit for a candidate password
+costs one Argon2id call. The encoder always fills the whole carrier, so every
+used LSB of every pixel carries salt, ciphertext or tag.
+
+Decoding reads the salt, runs Argon2id, finishes the order, and calls
+`container.ReadPayload`, which rejects a container length larger than the
+carrier can hold before reading the payload, then verifies the HMAC.
+
 ---
 
-## Attack 1: Steganalysis (Chi-Square Test)
+## Attack 1: Steganalysis (Chi-Square + RS)
 
 ### Theory
 
-Natural images have uneven distributions of pixel LSB values: adjacent grey
-levels `(2k, 2k+1)` appear with different frequencies because the image
-content is correlated. LSB steganography replaces those bits with (pseudo-)
-random cipher output, which equalises the pair frequencies.
-
-The chi-square test measures this equalisation:
+**Chi-square.** Natural images have uneven frequencies for adjacent grey
+levels `(2k, 2k+1)` because image content is correlated. LSB embedding
+replaces those bits with cipher output, which equalises each pair. The test
+computes
 
 ```
 χ² = Σ (observed_i − expected_i)² / expected_i
 ```
 
-A high p-value (> 0.05) suggests the LSBs have been homogenised — a
-steganalysis signal detectable **without knowing the password**.
+over the 128 pairs of each channel. A high p-value (> 0.05) means the pairs are
+suspiciously uniform.
+
+**RS analysis** (Fridrich, Goljan, Du). Pixels are grouped in fours along a
+row; each group is classified as regular (R) or singular (S) by whether the
+positive flip (`x ^ 1`) or the negative flip (1↔2, 3↔4, …) on positions 0 and 2
+raises its roughness. In a clean photograph `Rm ≈ Rnm`. LSB embedding pulls
+`Rm` toward `Sm` while pushing `Rnm` up, so the asymmetry `Rm − Rnm` turns
+**negative**. `steg/analysis` flags a channel when `Rm − Rnm < −0.02`.
+
+An earlier version of `steg detect` flagged `Rm − Rnm > 0.01`, the wrong sign,
+which never fired on images this tool produces; `cmd/attack1` carried its own
+copy of that logic. Both now use `steg/analysis`, the single implementation.
 
 ### Exploit Path
 
 1. Load the suspect image.
-2. For each colour channel (R, G, B), collect all pixel values.
-3. Build a histogram of pair counts: `count[2k]` and `count[2k+1]` for k = 0..127.
-4. Chi-square statistic over the 128 pairs.
-5. Convert to a p-value; threshold at 0.05.
+2. Run `analysis.Analyze`: chi-square and RS on R, G and B.
+3. Report per-channel statistics and the verdict
+   (`CLEAN` = 0/6 flags, `LIKELY_STEGO` = 6/6, otherwise `SUSPICIOUS`).
 
-No password, no pixel-order knowledge required. Works on the whole image.
+No password and no pixel-order knowledge required. The pseudorandom order does
+not help: both tests look at the whole image, and full-capacity padding means
+every pixel's LSBs are randomised regardless of payload size.
 
-### Notes
-
-- The Fisher-Yates pixel ordering does **not** prevent steganalysis because
-  the statistical properties of the overall LSB set are unchanged regardless
-  of traversal order.
-- Random padding (fills the entire image capacity) amplifies the signal: even
-  a 1-byte payload causes all remaining pixels to receive uniformly random
-  LSBs.
-- The `steg detect` command already implements this; re-implementing it
-  independently confirms the design.
+```sh
+go run ./cmd/attack1 clean.png stego.png   # several images → comparison table
+```
 
 ### Results
 
-| Image | Channels | Bits/ch | Chi-square p (R/G/B) | RS asym (R/G/B) | Verdict |
-|-------|----------|---------|---------------------|----------------|---------|
-| `test/dude.png` (clean) | 3 | 1 | 0.00 / 0.00 / 0.00 | -0.0045 / -0.0017 / -0.0055 | CLEAN (0/6) |
-| `steg_a.png` (19B payload) | 3 | 1 | 0.03 / 0.29 / 1.00 | -0.04 / -0.04 / -0.04 | SUSPICIOUS (2/6 chi) |
+Stego images encoded with `steg encode` defaults (3 channels, 1 bit/channel,
+19-byte payload, password `hunter2`).
+
+| Image | Chi-square p (R/G/B) | RS asym (R/G/B) | Verdict |
+|-------|---------------------|-----------------|---------|
+| `dude.png` 1024×1536, clean | 0.0000 / 0.0000 / 0.0000 | −0.0045 / −0.0017 / −0.0055 | CLEAN (0/6) |
+| `dude.png` stego | 0.6728 / 0.9193 / 1.0000 | −0.0424 / −0.0402 / −0.0416 | LIKELY_STEGO (6/6) |
+| synthetic 512×512 gradient + noise, clean | 0.0000 / 0.0000 / 0.0000 | +0.0040 / +0.0076 / +0.0028 | CLEAN (0/6) |
+| synthetic 512×512 stego | 0.7093 / 0.9901 / 0.9900 | −0.1816 / −0.1763 / −0.1753 | LIKELY_STEGO (6/6) |
 
 **Observations:**
-- Clean image: all chi-square p ≈ 0, all RS asymmetries negative and small — correct CLEAN verdict.
-- Stego image: G and B chi-square p become suspicious because filling the whole image with random
-  padding homogenises those channels even though only R was not directly modified (format conversion
-  during encode/decode changed G/B statistics).
-- RS asymmetry is strongly *negative* for stego images (Rm < Rnm), the opposite sign from the
-  theoretical expectation. This is because the random padding fills the entire image capacity,
-  randomising all LSBs uniformly — the RS test catches this as suspicious but with inverted sign.
-  The built-in `steg detect` command uses a `> 0.01` threshold so it misses this; the attack
-  implementation could be extended to also flag large *negative* asymmetries.
+- RS separates clean from stego cleanly on `dude.png`: −0.002 to −0.006
+  clean against −0.040 to −0.042 stego, either side of the −0.02 threshold.
+- With randomised LSBs, each channel's chi-square p-value is roughly uniform
+  on [0, 1], so a single channel can land below 0.05 by chance. A second
+  encode of `dude.png` gave R p = 0.0760; a value below 0.05 would have dropped
+  the verdict to SUSPICIOUS (5/6). RS does not have this problem.
+- Detection is the primary weakness of the scheme and is not fixable by
+  cryptography: the payload is safe, but its presence is evident. See README
+  "Next steps" for embedding strategies that reduce detectability;
+  `cmd/attack1` is meant to grow into the benchmark comparing them.
 
 ---
 
-## Attack 2: Bootstrap Cipher Nonce Reuse (Two-Time Pad)
+## Historical: Bootstrap Cipher (Attacks 2 and 3)
 
-### Theory
+Before commit c69a626 the 16-byte salt was not stored in plaintext. It was
+encrypted with a "bootstrap" AES-CTR cipher whose key and nonce came from
+`Argon2id(pass, fixed application salt)`, so the bootstrap keystream was the
+same for every image encoded with a given password. Two consequences:
 
-The bootstrap cipher uses key `bsEncKey` and nonce `bsNonce`, both derived
-from `Argon2id(pass, FIXED_SALT)`. For a given password these values are
-**constant**. The bootstrap keystream `KS_bs` is therefore identical for
-every encode with that password.
+- **Two-time pad (Attack 2):** XOR-ing the salt regions of two images with the
+  same password gave `salt_A ⊕ salt_B`.
+- **Salt recovery by CPA (Attack 3):** anyone who could encode with the
+  password and observe their own salt recovered the keystream and could read
+  any other image's salt without the first Argon2id call.
 
-Each image's first 128 bits of LSB data hold:
+Neither leaked payload data (each image's payload keys came from its own
+salt), and a decoder needed two Argon2id calls. Commit c69a626 removed the
+bootstrap cipher: the salt is stored in plaintext (it is not secret) and a
+single Argon2id over the per-image salt derives all keys. The `cmd/attack2`
+and `cmd/attack3` tools attacked a component that no longer exists and were
+removed; they remain in git history.
 
-```
-C_i = randomSalt_i ⊕ KS_bs
-```
+## Historical: Password-Derived Traversal Order
 
-XOR-ing two images encoded with the same password:
+The pixel order used to come from `SHA-256(password)` seeding Go's `math/rand`
+(v1). That generator reduces its seed modulo 2^31 − 1, so there were only about
+2^31 possible orders, and computing the order for a candidate password cost one
+SHA-256, not an Argon2id call.
 
-```
-C_A ⊕ C_B = randomSalt_A ⊕ randomSalt_B
-```
+This was harmless while the encoder fills the whole carrier: every pixel
+carries data, so knowing the order tells an attacker nothing about which
+pixels to look at. It would have broken any future bounded-padding mode, where
+a cheap order lets an attacker test candidate orders against the statistics of
+the pixels they select.
 
-This is the **two-time pad** problem from Set 3, Challenge 19/20. The
-plaintexts here are uniformly random salts (not ASCII), so letter-frequency
-attacks do not apply directly — but the structural weakness enables a
-chosen-plaintext attack (see Attack 3).
-
-### Exploit Path (demonstrating the leak)
-
-1. Encode two files `A` and `B` with the **same password** into two carrier
-   images.
-2. Extract the first 128 bits of LSB data from each image in pixel order
-   (requires knowing `bsSeed`, which requires the password — acceptable
-   since we own both images in this demo).
-3. XOR the two 16-byte values: `C_A ⊕ C_B`.
-4. Verify that `C_A ⊕ C_B = randomSalt_A ⊕ randomSalt_B` by independently
-   computing each salt (instrument the encoder to emit them).
-
-### Expected Outcome
-
-The XOR of two encoded images' bootstrap regions equals the XOR of their
-random salts — a direct consequence of keystream reuse.
-
-### Notes
-
-- The payload bytes (bits 128+) do **not** have this problem: each image uses
-  unique main keys derived from its unique `randomSalt`.
-- The fix is to generate the bootstrap nonce randomly (stored in the image
-  before the encrypted salt) rather than deriving it from the fixed-salt KDF.
-
-### Results
-
-| Image pair | `C_A ⊕ C_B` (hex) | `salt_A ⊕ salt_B` (hex) | Match? |
-|------------|-------------------|------------------------|--------|
-| steg_a + steg_b (password "hunter2") | `b6ec52e9594b6f123b61b539f9e0237e` | `b6ec52e9594b6f123b61b539f9e0237e` | ✓ |
-
-**Observations:**
-- XOR identity confirmed — bootstrap keystream `KS_bs` cancels out exactly.
-- `KS_bs` = `e920916134b0b976fc3b4a2857a43a99` — same value for every encode with password "hunter2".
-- Re-deriving `randomSalt_B` from `KS_bs` via XOR succeeds, demonstrating the CPA shortcut.
-
----
-
-## Attack 3: Bootstrap CPA — Recovering a Target Salt
-
-### Theory
-
-Extends Attack 2. If the attacker:
-
-- Knows the password `P`, AND
-- Can create a stego image with `P` while observing the internal `randomSalt`
-  (grey-box / instrumented encoder),
-
-then they can recover the bootstrap keystream:
-
-```
-KS_bs = C_own ⊕ randomSalt_own
-```
-
-and use it to decrypt any target image's salt:
-
-```
-randomSalt_target = C_target ⊕ KS_bs
-```
-
-With `randomSalt_target` and `P` they run `Argon2id(P, randomSalt_target)` to
-derive the target's main keys and decrypt its payload — without running the
-standard `Decode` path.
-
-### Practical Relevance
-
-If you already know `P`, you can call `steg decode` directly. This attack
-matters in a grey-box auditing scenario: it demonstrates that the bootstrap
-region leaks the keystream to anyone with encode access + instrumentation,
-bypassing the two-Argon2id decode path.
-
-### Exploit Path
-
-1. Instrument `steg/encode.go` to log `randomSalt` after `rand.Read`.
-2. Encode a file with password `P` → record `randomSalt_own` and the
-   resulting image `I_own`.
-3. Extract `C_own` (first 16 LSB bytes) from `I_own`.
-4. Compute `KS_bs = C_own ⊕ randomSalt_own`.
-5. Extract `C_target` from the target image `I_target` (same password `P`).
-6. Compute `randomSalt_target = C_target ⊕ KS_bs`.
-7. Derive main keys: `Argon2id(P, randomSalt_target)`.
-8. Decrypt payload from `I_target` and verify HMAC.
-
-### Results
-
-| Step | Value | Notes |
-|------|-------|-------|
-| `randomSalt_A` | `b805d1d8522bd105f5b650e37bb1ec0d` | recovered via bootstrap decrypt of image A |
-| `C_A` (first 16 LSB bytes) | `512540b9669b6873098d1acb2c15d694` | extracted from image A |
-| `KS_bs` | `e920916134b0b976fc3b4a2857a43a99` | `C_A ⊕ randomSalt_A` |
-| `C_target` | `e7c912503fd0076132ecaff2d5f5f5ea` | extracted from target image B |
-| `randomSalt_target` | `0ee983310b60be17ced7e5da8251cf73` | `C_target ⊕ KS_bs` |
-| Payload decrypted? | ✓ "another secret message\n" (23 bytes) | HMAC passed |
-
-**Observations:**
-- Salt recovery via XOR is instantaneous — no second Argon2id call needed to recover the salt.
-- Still requires Argon2id(P, randomSalt_target) to get the main keys, so attack cost is one
-  Argon2id instead of two — a 2× speedup for the key derivation phase.
-- The main practical value: demonstrates the bootstrap keystream is a shared secret derivable
-  by any party with encode access and the ability to observe their own randomSalt.
+Fixed in the current (not yet committed) working tree: only the salt pixels use
+a public order; the order of all later pixels is a ChaCha8-driven Fisher-Yates
+shuffle keyed by 32 bytes of Argon2id output (`cursors/order.go`). The legacy
+`cursors.WithSeed` option and its `math/rand` code have been removed, and no
+production code imports `math/rand` v1.
 
 ---
 
@@ -232,60 +173,74 @@ bypassing the two-Argon2id decode path.
 
 ### Theory
 
-The HMAC tag (last 32 bytes of the payload cipher stream) acts as a
-password-verification oracle. For each candidate password `P_c`:
-
-1. `Argon2id(P_c, fixedSalt)` → bootstrap keys
-2. Decrypt first 16 LSB bytes → `randomSalt_c`
-3. `Argon2id(P_c, randomSalt_c)` → main keys
-4. Decrypt container → attempt HMAC verification
-
-If HMAC passes, `P_c` is the correct password. The oracle is constant-time
-(`hmac.Equal`) so timing attacks are not applicable.
+The HMAC tag is a password-verification oracle. For each candidate password
+`P_c`, a full decode attempt succeeds only if `P_c` is correct. `cmd/attack4`
+calls `steg.Decode` on a fresh copy of the carrier per candidate, so it does
+exactly what the real decoder does and cannot drift from the format. The tag is
+compared with `hmac.Equal`, so timing attacks do not apply.
 
 ### Cost per Candidate
 
-Each attempt requires **two** Argon2id calls (64 MiB each, `t=1`):
+1. Read the salt from the public salt pixels. This needs no password, so an
+   attacker gains nothing by doing it once outside the loop: it is negligible
+   next to step 2.
+2. **One** `Argon2id(P_c, salt, t=2, m=64 MiB, p=4)`.
+3. Build the secret part of the pixel order (Fisher-Yates over all remaining
+   pixels).
+4. Decrypt the 4-byte container length. For a wrong candidate this is an
+   essentially random uint32; anything above the carrier's capacity is rejected
+   before the payload is read or the HMAC computed. The chance that a random
+   length passes is about capacity / 2^32 (≈ 1.4 × 10⁻⁴ for a 1024×1536
+   carrier), so almost every wrong candidate stops here.
 
-- ~100–200 ms per candidate on modern CPU hardware
-- A 100k-word dictionary takes ~3–6 hours
-- A 1M-word dictionary takes ~30–60 hours
+Measured on this machine (throwaway benchmark): Argon2id ≈ 16 ms per call;
+building the order ≈ 2 ms for 512×512 and ≈ 20 ms for 1024×1536. In 200 wrong
+passwords against a 128×128 stego image, all 200 were rejected by the length
+bound and none reached the HMAC.
 
-This is the primary practical attack against `steg`-encrypted images when
-the password is weak.
+The attacker must also know the encoding settings (`-c`, `-b`): they decide
+the salt pixels and the order. With the wrong settings the correct password
+is not found (checked: `attack4 -c 1` on a 3-channel image reports not found).
+There are at most 3 × 8 = 24 settings, so not knowing them multiplies the cost
+by at most 24.
 
 ### Exploit Path
 
-1. Collect a wordlist (e.g. `rockyou.txt`).
-2. For each candidate:
-   a. Run bootstrap KDF.
-   b. Extract and decrypt `randomSalt` from the image.
-   c. Run payload KDF.
-   d. Decrypt container length + padded payload.
-   e. Verify HMAC.
-   f. On success: extract real payload length and return plaintext.
-3. Report elapsed time per attempt and total.
+```sh
+go run ./cmd/attack4 [-c 3] [-b 1] stego.png wordlist.txt
+```
 
-### Notes
-
-- Running Argon2id twice per candidate (vs. once in a simpler design) is an
-  accidental defence: the two-stage KDF roughly doubles attacker cost.
-- Raising `time` from 1 to 2–3 would further harden against this at modest
-  legitimate-use cost (~200–400 ms per decode instead of ~100 ms).
-- GPU acceleration of Argon2id is limited by the 64 MiB memory-per-instance
-  requirement — this is the core defence.
+For each candidate: copy the carrier, call `steg.Decode`, report success on
+the first candidate that decodes. Prints candidates/s, time per candidate and
+total.
 
 ### Results
 
-| Wordlist | Candidates tried | Time/candidate | Total time | Found? | Password |
-|----------|-----------------|----------------|-----------|--------|---------|
-| 10-word custom list | 7 | ~559 ms | 3.9 s | ✓ | "hunter2" |
+Carriers encoded with `steg encode -p hunter2` (defaults: 3 channels,
+1 bit/channel), 19-byte payload. "hit" wordlist: 7 entries with `hunter2` sixth;
+"miss" wordlist: 10 wrong entries, including `Hunter2` and `hunter3`.
+`attack4` runs one candidate at a time.
+
+| Image | Wordlist | Candidates tried | Time/candidate | Total | Found? |
+|-------|----------|-----------------|----------------|-------|--------|
+| synthetic 512×512 | hit | 6 | 32 ms | 191 ms | yes, `hunter2`, payload recovered |
+| synthetic 512×512 | miss | 10 | 29 ms | 292 ms | no |
+| `dude.png` 1024×1536 | hit | 6 | 96 ms | 574 ms | yes, `hunter2`, payload recovered |
+| `dude.png` 1024×1536 | miss | 10 | 68 ms | 675 ms | no |
 
 **Observations:**
-- ~1.79 candidates/s on this machine — this is purely Argon2id bottlenecked (2 calls × ~280 ms each).
-- The 64 MiB memory requirement limits GPU parallelism significantly.
-- Recovered payload: "top secret message\n" (19 bytes) — HMAC verified.
-- A 1M-word rockyou dictionary at this rate would take ~155 hours single-threaded.
+- The previous version of `attack4` re-implemented the old two-KDF pipeline by
+  hand and reported "not found" for images the current build decodes. The
+  rewrite calls `steg.Decode` and finds the password.
+- The cost of a wrong candidate is one Argon2id plus building the order; the
+  order grows with image size and is about a third of the time on 1024×1536. The
+  correct candidate costs more because it decrypts and MACs the whole
+  carrier (~590 KB for `dude.png`).
+- At ~68 ms per candidate, a 1M-word dictionary takes about 19 hours on one
+  stream against a `dude.png`-sized image. Argon2id's 64 MiB per instance
+  bounds how many candidates an attacker can run in parallel, particularly on
+  GPUs, but a multi-core CPU can still run several streams at once.
+- This remains the primary practical attack for weak passwords.
 
 ---
 
@@ -293,8 +248,8 @@ the password is weak.
 
 ### Theory
 
-`container.WritePayload` computes HMAC over **plaintext** bytes, then
-encrypts both the data and the tag together (MAC-then-Encrypt, MtE):
+`container.WritePayload` computes the HMAC over the **plaintext**, then
+encrypts the data and the tag together (MAC-then-Encrypt, MtE):
 
 ```go
 hashFn.Write(buf[:n])   // HMAC over plaintext
@@ -303,39 +258,65 @@ w.Write(buf[:n])        // write ciphertext (encrypted plaintext)
 w.Write(checksum)       // write encrypted HMAC tag
 ```
 
-Modern best practice (TLS 1.3, AEAD) is Encrypt-then-MAC (EtM). MtE is
-known to enable padding oracle attacks under CBC mode.
+Modern practice (TLS 1.3, AEAD) is Encrypt-then-MAC. MtE is known to enable
+padding-oracle attacks under CBC mode.
 
 ### Why This Is Safe Here (But Still a Design Smell)
 
-AES-CTR has no padding. There is no padding oracle. The HMAC-SHA256 tag
-still provides strong integrity once decrypted: a wrong password produces
-a random-looking tag that will fail `hmac.Equal` with overwhelming probability.
+AES-CTR has no padding, so there is no padding oracle. A ciphertext bit flip
+in CTR flips exactly the same plaintext bit, and any change to the plaintext
+or the encrypted tag makes HMAC verification fail. The decoder returns no
+plaintext before the tag is verified, so a flipped bit yields only a generic
+error. A flip in the length field is caught even earlier, by the length bound,
+or makes the reader take the wrong bytes as the tag.
 
 The risk would materialise if the cipher were ever swapped to CBC mode
 without revisiting the MAC ordering.
 
 ### Exercise
 
-Confirm by experiment that a 1-bit flip in the ciphertext:
-1. Produces a 1-bit flip in the corresponding plaintext byte (CTR stream
-   property), AND
-2. Causes HMAC verification failure (integrity holds).
+Flip one ciphertext bit in an encoded image and check that:
+1. exactly the corresponding plaintext bit changes (CTR property), and
+2. decoding fails (integrity holds).
 
 ### Results
 
-| Flip position | Plaintext changed? | HMAC fail? | Notes |
-|--------------|--------------------|-----------|-------|
-| | | | |
+Throwaway test (deleted afterwards) using the library internals to locate
+stream bits: 128×128 random opaque carrier, defaults (3 channels, 1 bit/ch,
+49 152 stream bits), 19-byte payload. For each row the raw LSB holding that
+stream bit was flipped, the stream decrypted with the original keys and
+compared with the unmodified stream, and `steg.Decode` called.
+
+| Stream bit | Region | Plaintext bits changed | Decode result |
+|-----------|--------|------------------------|---------------|
+| 5 | salt (plaintext) | n/a: different salt, different keys | rejected: length 2566749578 exceeds max 6092 |
+| 130 | container length, low byte | 1 (bit 130) | rejected: length 6124 exceeds max 6092 |
+| 158 | container length, high byte | 1 (bit 158) | rejected: length 33560524 exceeds max 6092 |
+| 165 | real-length prefix | 1 (bit 165) | checksum validation failed |
+| 192 | payload byte 0 | 1 (bit 192) | checksum validation failed |
+| 275 | payload byte 10 | 1 (bit 275) | checksum validation failed |
+| 20000 | padding | 1 (bit 20000) | checksum validation failed |
+| 48896 | HMAC tag, first bit | 1 (bit 48896) | checksum validation failed |
+| 49151 | HMAC tag, last bit | 1 (bit 49151) | checksum validation failed |
+
+Black-box check on the same image: 300 trials, each flipping the LSB of one
+random channel of one random pixel. **300/300 decodes failed** (297 at the
+HMAC check, 3 at the length bound). Because the encoder fills the carrier,
+every LSB is part of the stream, so no flip goes unnoticed.
+
+**Observations:** the CTR bit-flip property holds (one ciphertext bit changes
+exactly one plaintext bit, at the same position), and integrity holds for
+every region, including padding and the tag itself. No fix needed.
 
 ---
 
 ## Summary Table
 
-| # | Attack | Requires Password | Practical? | Severity |
-|---|--------|------------------|-----------|---------|
-| 1 | Chi-square steganalysis | No | Yes | Medium — detects presence |
-| 2 | Two-time pad leak (`C_A⊕C_B`) | Yes (to extract bits) | Demo only | Low — leaks salt XOR |
-| 3 | Bootstrap CPA salt recovery | Yes + grey-box encode | Grey-box only | Medium — bypasses decode path |
-| 4 | Dictionary / brute-force | No (finding it) | Yes, for weak passwords | High |
-| 5 | MtE bit-flip confirmation | Yes (to decrypt) | No direct exploit | Informational |
+| # | Attack | Requires password | Practical? | Status |
+|---|--------|------------------|-----------|--------|
+| 1 | Chi-square + RS steganalysis | No | Yes | Open: presence detected 6/6 on a full-capacity encode |
+| 2 | Two-time pad on bootstrap salt | Yes | — | Fixed in c69a626 (bootstrap removed); tool removed |
+| 3 | Bootstrap CPA salt recovery | Yes + grey-box encode | — | Fixed in c69a626; tool removed |
+| – | Cheap `math/rand` traversal order (~2^31 orders) | No | Only with bounded padding | Fixed (uncommitted): ChaCha8 keyed by Argon2id |
+| 4 | Dictionary / brute force | No (finding it) | Yes, for weak passwords | Mitigated: one Argon2id (t=2, 64 MiB) per candidate |
+| 5 | MtE bit flip | — | No | Integrity holds (300/300 flips rejected); informational |

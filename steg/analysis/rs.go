@@ -9,8 +9,10 @@ import (
 // of img. It applies a flipping mask to groups of 4 adjacent horizontal pixels
 // and measures the asymmetry between the positive and negative mask responses.
 //
-// A positive Asymmetry (Rm > Rnm) is the signature of LSB embedding.
-// Values > 0.01 are considered suspicious.
+// In a clean photograph Rm ≈ Rnm, so Asymmetry = Rm − Rnm sits near zero.
+// LSB embedding pulls Rm down toward Sm while pushing Rnm up, so embedding
+// drives Asymmetry negative (Fridrich, Goljan, Du). A channel is flagged when
+// Asymmetry < RSSuspiciousAsymmetry.
 func RSAnalysis(img image.Image) []RSResult {
 	b := img.Bounds()
 	w := b.Dx()
@@ -34,6 +36,17 @@ func flipNeg(x uint8) uint8 {
 	}
 	return x + 1 // odd → even (255 wraps to 0 in uint8 arithmetic)
 }
+
+// RSSuspiciousAsymmetry is the Asymmetry (Rm − Rnm) below which a channel is
+// flagged. Calibrated on a 1024×1536 photograph: clean channels measured
+// −0.0017 to −0.0055, and the same photo after a default full-capacity encode
+// measured −0.0398 to −0.0484. −0.02 sits between the two with a margin of
+// about 0.015 on the clean side and 0.02 on the stego side.
+//
+// The statistic is a fraction over w×h/4 pixel groups, so its variance grows
+// as the image shrinks; on small images (roughly below 512×512) clean
+// channels can cross this threshold by chance.
+const RSSuspiciousAsymmetry = -0.02
 
 // roughness returns the sum of absolute differences between adjacent pixels.
 func roughness(a, b, c, d uint8) float64 {
@@ -90,6 +103,6 @@ func channelRS(name string, vals []uint8, width int) RSResult {
 		Snm:     snm / total,
 	}
 	res.Asymmetry = res.Rm - res.Rnm
-	res.Suspicious = res.Asymmetry > 0.01
+	res.Suspicious = res.Asymmetry < RSSuspiciousAsymmetry
 	return res
 }

@@ -4,6 +4,15 @@
 **Status:** Accepted
 **Deciders:** pableeee
 
+> **Note (2026-11-11):** `cursors.GenerateSequence` and the seed-based pixel order
+> this record describes no longer exist. The order is now built by
+> `cursors/order.go` (`NewPixelOrder` / `FinishPixelOrder`: a public ChaCha8 prefix
+> for the salt pixels, finished under an Argon2id-derived key), and both the
+> sequential and the parallel paths obtain it from `prepareEncode` /
+> `prepareDecode` in `steg/steg.go`. The on-image layout below is also historical;
+> see `docs/TECHNICAL_SPEC.md` for the current format. The shared-points,
+> per-worker-stack and chunk-alignment decisions still hold.
+
 ---
 
 ## Context

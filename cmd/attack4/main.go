@@ -1,60 +1,61 @@
-// Attack 4: Dictionary Attack with HMAC Oracle
+// Attack 4: Dictionary Attack with the HMAC as Password Oracle
 //
-// Uses HMAC-SHA256 verification as a password oracle. For each candidate:
+// For each candidate password the tool runs the library's own decoder,
+// steg.Decode, on a fresh copy of the carrier. A decode that returns without
+// error passed HMAC-SHA256 verification, so the candidate is the password.
+// Calling the real decode path (instead of re-implementing it) keeps this tool
+// in step with the on-image format: it cannot report "not found" for an image
+// the current build can decode.
 //
-//  1. Argon2id(candidate, fixedSalt)  → bootstrap keys
-//  2. Decrypt 16-byte salt from image LSBs
-//  3. Argon2id(candidate, recoveredSalt) → main keys
-//  4. Decrypt container + verify HMAC
+// Cost per candidate, as steg.Decode does it:
 //
-// HMAC pass = correct password. Two Argon2id calls per candidate (~100–200 ms
-// each on CPU) make this expensive; Argon2id's 64 MiB memory requirement
-// limits GPU parallelism.
+//  1. Read the 16-byte salt from the public salt pixels. Their positions depend
+//     only on the image size and encoding settings, so anyone can read the salt
+//     without the password; an attacker gains nothing by hoisting this step out
+//     of the loop, since it is negligible next to step 2.
+//  2. One Argon2id(candidate, salt, t=2, m=64 MiB, p=4). This dominates.
+//  3. Build the secret part of the pixel order (ChaCha8 Fisher-Yates over all
+//     pixels after the salt pixels), keyed by Argon2id output.
+//  4. Decrypt the 4-byte container length. For a wrong candidate it is an
+//     essentially random uint32, and anything above the carrier's capacity is
+//     rejected before the payload is read or the HMAC computed; that rejects
+//     almost every wrong candidate. The rest fail HMAC verification.
 //
 // Usage:
 //
-//	go run ./cmd/attack4 <image.png> <wordlist.txt> [-c channels] [-b bits]
+//	go run ./cmd/attack4 [-c channels] [-b bits] <image.png> <wordlist.txt>
 //
 // Flags:
 //
-//	-c  number of channels used during encoding (default 1)
-//	-b  bits per channel used during encoding (default 1)
+//	-c  number of channels used during encoding (default 3, as steg encode)
+//	-b  bits per channel used during encoding (default 1, as steg encode)
 package main
 
 import (
 	"bufio"
-	"encoding/binary"
 	"flag"
 	"fmt"
 	"image"
 	"image/draw"
 	_ "image/png"
-	"io"
 	"os"
 	"time"
 
-	"crypto/hmac"
-	"crypto/sha256"
-
-	"github.com/pableeee/steg/cipher"
-	"github.com/pableeee/steg/cursors"
-	"golang.org/x/crypto/argon2"
+	"github.com/pableeee/steg/steg"
 )
-
-var appSalt = []byte("github.com/pableeee/steg/v1")
 
 func main() {
 	channels := flag.Int("c", 3, "channels used during encoding (1–3)")
-	bitsPerCh := flag.Int("b", 1, "bits per channel used during encoding (1,2,4,8)")
+	bitsPerCh := flag.Int("b", 1, "bits per channel used during encoding (1–8)")
 	flag.Parse()
 
 	args := flag.Args()
 	if len(args) < 2 {
-		fmt.Fprintf(os.Stderr, "usage: attack4 [flags] <image.png> <wordlist.txt>\n")
+		fmt.Fprintf(os.Stderr, "usage: attack4 [-c channels] [-b bits] <image.png> <wordlist.txt>\n")
 		os.Exit(1)
 	}
 
-	img, err := loadDrawImage(args[0])
+	carrier, err := loadRGBA(args[0])
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "load image: %v\n", err)
 		os.Exit(1)
@@ -68,7 +69,7 @@ func main() {
 	defer wl.Close()
 
 	fmt.Printf("=== Attack 4: Dictionary Attack ===\n\n")
-	fmt.Printf("Image:    %s  (%dx%d)\n", args[0], img.Bounds().Dx(), img.Bounds().Dy())
+	fmt.Printf("Image:    %s  (%dx%d)\n", args[0], carrier.Bounds().Dx(), carrier.Bounds().Dy())
 	fmt.Printf("Wordlist: %s\n", args[1])
 	fmt.Printf("Encoding: %d channel(s), %d bit(s)/channel\n\n", *channels, *bitsPerCh)
 
@@ -83,19 +84,15 @@ func main() {
 		}
 		tried++
 
-		payload, err := tryPassword(img, []byte(candidate), *bitsPerCh, *channels)
-		if tried%100 == 0 {
-			elapsed := time.Since(start)
-			fmt.Printf("\r  tried %d  (%.1f/s)   ", tried, float64(tried)/elapsed.Seconds())
-		}
+		payload, err := steg.Decode(clone(carrier), []byte(candidate), *bitsPerCh, *channels)
+		elapsed := time.Since(start)
+		fmt.Printf("\r  tried %d  (%.2f/s, %s/candidate)   ",
+			tried, float64(tried)/elapsed.Seconds(), perCandidate(elapsed, tried))
 
 		if err == nil {
-			elapsed := time.Since(start)
-			fmt.Printf("\r\n✓ PASSWORD FOUND: \"%s\"\n\n", candidate)
-			fmt.Printf("  Tried:    %d candidates\n", tried)
-			fmt.Printf("  Elapsed:  %s\n", elapsed.Round(time.Millisecond))
-			fmt.Printf("  Rate:     %.2f candidates/s\n\n", float64(tried)/elapsed.Seconds())
-			fmt.Printf("  Payload (%d bytes):\n%s\n", len(payload), string(payload))
+			fmt.Printf("\n\nPASSWORD FOUND: %q\n\n", candidate)
+			printStats(tried, elapsed)
+			fmt.Printf("\n  Payload (%d bytes):\n%s\n", len(payload), string(payload))
 			return
 		}
 	}
@@ -105,114 +102,35 @@ func main() {
 		os.Exit(1)
 	}
 
-	elapsed := time.Since(start)
-	fmt.Printf("\r\n✗ Password not found in wordlist.\n")
-	fmt.Printf("  Tried: %d candidates in %s\n", tried, elapsed.Round(time.Millisecond))
+	fmt.Printf("\n\nPassword not found in wordlist.\n\n")
+	printStats(tried, time.Since(start))
 }
 
-// tryPassword attempts to decode the image with the given password.
-// Returns the plaintext payload on success, or an error if the HMAC fails.
-func tryPassword(img draw.Image, pass []byte, bitsPerChannel, channels int) ([]byte, error) {
-	// Step 1: bootstrap keys.
-	bsSeed, bsEncKey, bsNonce := deriveBootstrapKeys(pass)
-
-	// Step 2: decrypt random salt from image LSB bits 0–127.
-	cur := newCursor(img, bsSeed, bitsPerChannel, channels)
-	bsCipher, err := cipher.NewCipher(bsNonce, bsEncKey)
-	if err != nil {
-		return nil, err
-	}
-	bsAdapter := cursors.CursorAdapter(cursors.CipherMiddleware(cur, bsCipher))
-	var randomSalt [16]byte
-	if _, err = io.ReadFull(bsAdapter, randomSalt[:]); err != nil {
-		return nil, err
-	}
-
-	// Step 3: derive main keys from the recovered salt.
-	encKey, macKey, payloadNonce := deriveMainKeys(pass, randomSalt[:])
-
-	// Step 4: decrypt payload and verify HMAC (the oracle).
-	cur2 := newCursor(img, bsSeed, bitsPerChannel, channels)
-	pCipher, err := cipher.NewCipher(payloadNonce, encKey)
-	if err != nil {
-		return nil, err
-	}
-	payloadCM := cursors.CipherMiddleware(cur2, pCipher)
-	if _, err = payloadCM.Seek(128, io.SeekStart); err != nil {
-		return nil, err
-	}
-	adapter := cursors.CursorAdapter(payloadCM)
-
-	// Read container length.
-	lenBuf := make([]byte, 4)
-	if _, err = io.ReadFull(adapter, lenBuf); err != nil {
-		return nil, err
-	}
-	containerLen := binary.LittleEndian.Uint32(lenBuf)
-
-	// Read padded payload.
-	paddedBuf := make([]byte, containerLen)
-	if _, err = io.ReadFull(adapter, paddedBuf); err != nil {
-		return nil, err
-	}
-
-	// Read HMAC tag.
-	tag := make([]byte, 32)
-	if _, err = io.ReadFull(adapter, tag); err != nil {
-		return nil, err
-	}
-
-	// Verify HMAC — this is the oracle.
-	mac := hmac.New(sha256.New, macKey)
-	mac.Write(paddedBuf)
-	if !hmac.Equal(tag, mac.Sum(nil)) {
-		return nil, fmt.Errorf("hmac mismatch")
-	}
-
-	// Extract real payload (first 4 bytes = LE real length).
-	if len(paddedBuf) < 4 {
-		return nil, fmt.Errorf("payload too short")
-	}
-	realLen := binary.LittleEndian.Uint32(paddedBuf[:4])
-	if int(realLen) > len(paddedBuf)-4 {
-		return nil, fmt.Errorf("corrupt length")
-	}
-	return paddedBuf[4 : 4+realLen], nil
+func printStats(tried int, elapsed time.Duration) {
+	fmt.Printf("  Tried:          %d candidates\n", tried)
+	fmt.Printf("  Total:          %s\n", elapsed.Round(time.Millisecond))
+	fmt.Printf("  Per candidate:  %s\n", perCandidate(elapsed, tried))
+	fmt.Printf("  Rate:           %.2f candidates/s\n", float64(tried)/elapsed.Seconds())
 }
 
-// ─── helpers ──────────────────────────────────────────────────────────────────
-
-func newCursor(img draw.Image, bsSeed int64, bitsPerChannel, channels int) *cursors.RNGCursor {
-	opts := []cursors.Option{
-		cursors.WithSeed(bsSeed),
-		cursors.WithBitsPerChannel(bitsPerChannel),
+func perCandidate(elapsed time.Duration, tried int) time.Duration {
+	if tried == 0 {
+		return 0
 	}
-	if channels >= 2 {
-		opts = append(opts, cursors.UseGreenBit())
-	}
-	if channels >= 3 {
-		opts = append(opts, cursors.UseBlueBit())
-	}
-	return cursors.NewRNGCursor(img, opts...)
+	return (elapsed / time.Duration(tried)).Round(time.Millisecond)
 }
 
-func deriveBootstrapKeys(pass []byte) (bsSeed int64, bsEncKey []byte, bsNonce uint32) {
-	derived := argon2.IDKey(pass, appSalt, 1, 64*1024, 4, 28)
-	bsSeed = int64(binary.BigEndian.Uint64(derived[0:8]))
-	bsEncKey = derived[8:24]
-	bsNonce = binary.BigEndian.Uint32(derived[24:28])
-	return
+// clone returns an independent copy of m, so that no candidate can observe
+// state left in the carrier by a previous one.
+func clone(m *image.RGBA) *image.RGBA {
+	c := *m
+	c.Pix = append([]uint8(nil), m.Pix...)
+	return &c
 }
 
-func deriveMainKeys(pass, salt []byte) (encKey, macKey []byte, payloadNonce uint32) {
-	derived := argon2.IDKey(pass, salt, 1, 64*1024, 4, 52)
-	encKey = derived[0:16]
-	macKey = derived[16:48]
-	payloadNonce = binary.BigEndian.Uint32(derived[48:52])
-	return
-}
-
-func loadDrawImage(path string) (draw.Image, error) {
+// loadRGBA decodes path into an *image.RGBA at origin (0,0), the same
+// conversion steg decode applies before decoding.
+func loadRGBA(path string) (*image.RGBA, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err

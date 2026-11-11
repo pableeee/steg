@@ -2,6 +2,8 @@
 
 **steg** is a command-line steganography tool written in Go. It hides an arbitrary file inside a PNG, BMP, or TIFF image by modifying the least-significant bits of selected color channels in a pseudorandom pixel sequence. The number of bits per channel (1–8) and the number of channels (R / R+G / R+G+B) are configurable, trading capacity for visual detectability. The hidden data is encrypted and authenticated, so the carrier image looks near-identical to the original while the payload is unreadable and tamper-evident without the correct password.
 
+> **On-image format change.** The pixel traversal order is now derived from the per-image salt and the password through Argon2id (see [Security design](#security-design)). Images encoded by earlier builds cannot be decoded by this one, and vice versa: decode an older image with the binary that created it. A mismatch fails the same way a wrong password does.
+
 [![Go Reference](https://pkg.go.dev/badge/github.com/pableeee/steg.svg)](https://pkg.go.dev/github.com/pableeee/steg)
 [![Test](https://github.com/pableeee/steg/actions/workflows/test.yml/badge.svg)](https://github.com/pableeee/steg/actions/workflows/test.yml)
 [![Release](https://github.com/pableeee/steg/actions/workflows/release.yml/badge.svg)](https://github.com/pableeee/steg/actions/workflows/release.yml)
@@ -30,15 +32,16 @@
 ## Features
 
 - **Authenticated encryption** — AES-128-CTR encryption with HMAC-SHA256; a wrong password returns an error, never garbled data.
-- **Strong key derivation** — Argon2id (time=2, mem=64 MiB, threads=4) derives independent encryption and MAC keys plus the cipher nonce from the password and per-image random salt in a single call.
-- **Random salt per encode** — `crypto/rand` generates a fresh 16-byte salt on every encode, stored in plaintext in the image header; Argon2id derives all crypto keys and the cipher nonce from the password and this salt, so each encode produces a unique keystream even with the same password and carrier.
-- **Password-keyed pixel traversal** — pixels are visited in a Fisher-Yates-shuffled order derived from the password; an observer without the password cannot locate which pixels carry data.
+- **Strong key derivation** — Argon2id (time=2, mem=64 MiB, threads=4) derives independent encryption and MAC keys, the cipher nonce and the pixel-order key from the password and per-image random salt in a single call.
+- **Random salt per encode** — `crypto/rand` generates a fresh 16-byte salt on every encode, stored in plaintext at publicly known pixel positions; Argon2id derives all keys and the cipher nonce from the password and this salt, so each encode produces a unique keystream even with the same password and carrier.
+- **Keyed pixel traversal** — after the salt pixels, pixels are visited in a Fisher-Yates order driven by ChaCha8 under a key from Argon2id, so recomputing the order for a guessed password costs a full KDF call. (While the encoder fills the whole carrier this hides nothing about where the data is; see [Security design](#security-design).)
+- **Safe CLI writes** — `encode` refuses transparent carriers, and verifies that the image it wrote decodes back to the payload before putting it at the output path.
 - **Configurable capacity vs. detectability** — `--bits-per-channel` (1–8 LSBs per channel) and `--channels` (1=R, 2=R+G, 3=R+G+B) let you trade off payload capacity against visual impact. At 1 bit/channel no pixel changes by more than ±1.
 - **`capacity` command** — prints a table of usable byte capacity for every (channels × bits-per-channel) combination for a given image.
 - **`test-visual` command** — generates carrier images filled to capacity at every encoding intensity for side-by-side visual comparison.
 - **`detect` command** — runs chi-square and RS steganalysis on any image and reports a per-channel verdict (`CLEAN` / `SUSPICIOUS` / `LIKELY_STEGO`).
 - **Multiple image formats** — PNG, BMP, and TIFF are supported as both input and output.
-- **Parallel mode** — a worker-pool implementation (`-P`) scales encode/decode across all available CPUs, giving up to ~2.5× speedup on large images.
+- **Parallel mode** — a worker-pool implementation (`-P`) spreads encode/decode across all available CPUs; on large images it is about 2.5–3.7× faster than the sequential path (see [Performance](#performance)).
 - **Interoperable modes** — images encoded with the sequential path can be decoded with the parallel path and vice versa.
 
 ---
@@ -113,13 +116,25 @@ steg encode -i carrier.png -f secret.txt -o output.png -p "my passphrase"
 
 | Flag | Short | Default | Description |
 |---|---|---|---|
-| `--input_image` | `-i` | — | Carrier image (PNG, BMP, or TIFF) |
-| `--input_file` | `-f` | — | File to hide |
-| `--output_image` | `-o` | — | Output image containing the hidden data |
+| `--input_image` | `-i` | required | Carrier image (PNG, BMP, or TIFF) |
+| `--input_file` | `-f` | required | File to hide |
+| `--output_image` | `-o` | required | Output image; the extension picks the format and must be `.png`, `.bmp`, `.tif` or `.tiff` |
 | `--password` | `-p` | prompt | Passphrase; see [Supplying the password](#supplying-the-password) |
 | `--bits-per-channel` | `-b` | `1` | Number of LSBs to use per color channel (1–8) |
 | `--channels` | `-c` | `3` | Color channels to use: 1=R, 2=R+G, 3=R+G+B |
-| `--parallel` | `-P` | off | Use parallel worker pool (faster on large images) |
+| `--parallel` | `-P` | off | Use parallel worker pool (see [Performance](#performance)) |
+
+What `encode` does, in order:
+
+1. **Checks the output extension.** Anything other than `.png`, `.bmp`, `.tif` or `.tiff` (case-insensitive) is rejected before any other work; a lossy format such as JPEG would destroy the hidden bits.
+2. **Checks the carrier.** The carrier is loaded and rejected if any pixel is not fully opaque, whatever the output format:
+   ```
+   Error: carrier image transparent.png has transparency (non-opaque pixels); hidden data cannot be stored reliably in transparent pixels. Remove the alpha channel first (flatten the image onto an opaque background)
+   ```
+   Flatten the image onto an opaque background in an image editor (or remove its alpha channel) and try again.
+3. **Reads the payload file.** These checks happen before the password prompt, so an unusable carrier or a missing file fails before you type anything.
+4. **Asks for the password** (with confirmation) if it was not supplied another way.
+5. **Embeds, then verifies.** A payload larger than the carrier's capacity is rejected here. The result is written to a temporary file next to the output, decoded through the same code path `steg decode` uses, and compared byte for byte with the payload. Only if they match is the temporary file renamed onto the output path. On any failure nothing is written, and an existing file at the output path is left untouched.
 
 ### Decode
 
@@ -131,12 +146,16 @@ steg decode -i output.png -o recovered.txt -p "my passphrase"
 
 | Flag | Short | Default | Description |
 |---|---|---|---|
-| `--input_image` | `-i` | — | Image containing the hidden data |
-| `--output_file` | `-o` | — | Path for the recovered file |
+| `--input_image` | `-i` | required | Image containing the hidden data |
+| `--output_file` | `-o` | required | Path for the recovered file |
 | `--password` | `-p` | prompt | Passphrase; see [Supplying the password](#supplying-the-password) |
 | `--bits-per-channel` | `-b` | `1` | Must match the value used during encode |
 | `--channels` | `-c` | `3` | Must match the value used during encode |
 | `--parallel` | `-P` | off | Use parallel worker pool (faster on large images) |
+
+The output file is created only after the payload has been decoded and authenticated, so a wrong password leaves nothing behind and an existing file at that path is left untouched. The recovered file is written to a temporary file with mode `0600` (owner read/write only, subject to your umask) and renamed into place, so it is never left half-written and never world-readable; an existing file it replaces also ends up `0600`. If the output path is a symlink, device or FIFO (for example `-o /dev/stdout`), the data is written through it in place instead.
+
+A missing required flag prints the command's usage; any other error (wrong password, unreadable file) prints only the error.
 
 ### Capacity
 
@@ -149,10 +168,10 @@ steg capacity -i carrier.png
 ```
 carrier.png — 1920 × 1080 px
 
-                        1 bits/ch      2 bits/ch      4 bits/ch      8 bits/ch
-  1 channel  (R)       253.11 KB     506.23 KB       1.01 MB       2.01 MB
-  2 channels (R+G)     506.23 KB       1.01 MB       2.01 MB       4.01 MB
-  3 channels (R+G+B)   759.34 KB       1.49 MB       3.02 MB       6.03 MB
+                            1 bits/ch      2 bits/ch      4 bits/ch      8 bits/ch
+  1 channel  (R)            253.07 KB      506.20 KB     1012.45 KB        1.98 MB
+  2 channels (R+G)          506.20 KB     1012.45 KB        1.98 MB        3.96 MB
+  3 channels (R+G+B)        759.32 KB        1.48 MB        2.97 MB        5.93 MB
 
 Overhead: 56 B (16 plaintext-salt + 4 container-length + 4 real-length + 32 HMAC).
 ```
@@ -165,7 +184,7 @@ Generate carrier images filled to capacity at every intensity for side-by-side c
 steg test-visual -i carrier.png -o ./visual/ -p "mypass"
 ```
 
-Writes up to 12 PNGs (`visual_ch{1-3}_b{1,2,4,8}.png`) into the output directory.
+Writes up to 12 PNGs (`visual_ch{1-3}_b{1,2,4,8}.png`) into the output directory. Like `encode`, it rejects carriers with transparent pixels.
 
 ### Detect
 
@@ -179,21 +198,39 @@ steg detect -i image.png
 |---|---|---|
 | `--input_image` | `-i` | Image to analyse (PNG, BMP, TIFF) |
 
-Example output:
+Example output for a 1024×1536 photograph after a default encode (3 channels, 1 bit/channel) of a 31-byte text file:
 
 ```
-Chi-square analysis (high p-value = suspicious):
-  R: χ²=127.17      p=0.4790  [SUSPICIOUS]
-  G: χ²=1583.51     p=0.0000  [CLEAN]
-  B: χ²=2274.04     p=0.0000  [CLEAN]
+Chi-square analysis (p-value > 0.05 = suspicious):
+  R: χ²=143.06      df=127  p=0.1563  [SUSPICIOUS]
+  G: χ²=114.34      df=115  p=0.4997  [SUSPICIOUS]
+  B: χ²=66.95       df=80   p=0.8509  [SUSPICIOUS]
 
-RS analysis (positive asymmetry = suspicious):
-  R: Rm=0.4992  Sm=0.5008  R-m=0.5440  S-m=0.4560  asymmetry=-0.0448  [CLEAN]
+RS analysis (asymmetry < -0.02 = suspicious):
+  R: Rm=0.4996  Sm=0.5004  R-m=0.5435  S-m=0.4565  asymmetry=-0.0439  [SUSPICIOUS]
+  G: Rm=0.4999  Sm=0.5001  R-m=0.5420  S-m=0.4580  asymmetry=-0.0421  [SUSPICIOUS]
+  B: Rm=0.4991  Sm=0.5009  R-m=0.5443  S-m=0.4557  asymmetry=-0.0452  [SUSPICIOUS]
+
+Verdict: LIKELY_STEGO
+```
+
+The same photograph before encoding:
+
+```
+Chi-square analysis (p-value > 0.05 = suspicious):
+  R: χ²=454.94      df=127  p=0.0000  [CLEAN]
+  G: χ²=1583.51     df=115  p=0.0000  [CLEAN]
+  B: χ²=2274.04     df=80   p=0.0000  [CLEAN]
+
+RS analysis (asymmetry < -0.02 = suspicious):
+  R: Rm=0.5196  Sm=0.4804  R-m=0.5241  S-m=0.4759  asymmetry=-0.0045  [CLEAN]
   G: Rm=0.5206  Sm=0.4794  R-m=0.5223  S-m=0.4777  asymmetry=-0.0017  [CLEAN]
   B: Rm=0.5191  Sm=0.4809  R-m=0.5246  S-m=0.4754  asymmetry=-0.0055  [CLEAN]
 
-Verdict: SUSPICIOUS
+Verdict: CLEAN
 ```
+
+A tiny payload does not help: the encoder always fills the whole carrier (see [Next steps](#next-steps)).
 
 ### Example
 
@@ -230,7 +267,7 @@ steg detect -i suspected_steg.png
 The usable payload capacity depends on the image dimensions and the chosen `--channels` / `--bits-per-channel` settings:
 
 ```
-max_payload = max(0, floor( width × height × channels × bitsPerChannel / 8 ) − 40)  bytes
+max_payload = max(0, floor( width × height × channels × bitsPerChannel / 8 ) − 56)  bytes
 ```
 
 The 56-byte overhead covers: 16-byte plaintext salt + 4-byte encrypted container length + 4-byte encrypted real-length prefix + 32-byte encrypted HMAC tag.
@@ -239,10 +276,10 @@ Default settings (3 channels, 1 bit/channel):
 
 | Image size | Pixels | Max payload |
 |---|---|---|
-| 100 × 100 | 10,000 | ~3.6 KB |
-| 500 × 500 | 250,000 | ~91.5 KB |
-| 1920 × 1080 (FHD) | 2,073,600 | ~759 KB |
-| 3840 × 2160 (4K) | 8,294,400 | ~2.97 MB |
+| 100 × 100 | 10,000 | 3,694 B (~3.6 KB) |
+| 500 × 500 | 250,000 | 93,694 B (~91.5 KB) |
+| 1920 × 1080 (FHD) | 2,073,600 | 777,544 B (~759 KB) |
+| 3840 × 2160 (4K) | 8,294,400 | 3,110,344 B (~2.97 MB) |
 
 Use `steg capacity -i <image>` to print a full table for all (channels × bits-per-channel) combinations at once. If the payload exceeds the image capacity, encode returns an error.
 
@@ -250,14 +287,16 @@ Use `steg capacity -i <image>` to print a full table for all (channels × bits-p
 
 ## Performance
 
-Benchmarks run on an AMD Ryzen 9 9950X3D (32 logical cores, Go 1.24, `GOMAXPROCS=32`). Key-derivation time (Argon2id, ~10 ms) dominates at small sizes.
+Benchmarks run on an AMD Ryzen 9 9950X3D (32 logical cores, Go 1.25, `GOMAXPROCS=32`). Key-derivation time (Argon2id, ~17 ms) dominates at small sizes.
 
 | Image | Payload | Encode seq | Encode par | Decode seq | Decode par |
 |---|---|---|---|---|---|
-| 100 × 100 | 1 KB | 10.1 ms | 10.2 ms | 11.6 ms | 10.2 ms |
-| 500 × 500 | 50 KB | 18.7 ms | 13.5 ms | 15.8 ms | 12.8 ms |
-| 2000 × 2000 | 500 KB | 213 ms | 126 ms | 173 ms | 118 ms |
-| 3840 × 2160 (4K) | 2 MB | 833 ms | 327 ms | 759 ms | 306 ms |
+| 100 × 100 | 1 KB | 16.6 ms | 16.7 ms | 16.7 ms | 16.6 ms |
+| 500 × 500 | 50 KB | 24.3 ms | 20.0 ms | 22.9 ms | 19.3 ms |
+| 2000 × 2000 | 500 KB | 162 ms | 65 ms | 147 ms | 55 ms |
+| 3840 × 2160 (4K) | 2 MB | 495 ms | 143 ms | 454 ms | 122 ms |
+
+Both directions scale with `-P` on large images. What remains serial is Argon2id and the Fisher-Yates shuffle that builds the pixel order (about 90 ms at 4K); both are fixed by the format. The cursor reads and writes the image's pixel bytes directly, and parallel workers own disjoint, pixel-aligned ranges of the order, so they need no lock.
 
 Run the benchmarks yourself:
 
@@ -274,22 +313,23 @@ go test ./steg/ -bench=BenchmarkDecodeBySize -benchtime=3s -benchmem
 
 | Component | Algorithm | Notes |
 |---|---|---|
-| Pixel-traversal seed | SHA-256(password), first 8 bytes | Not a crypto secret — determines which pixels carry data |
-| Per-image salt | `crypto/rand` (16 bytes) | Stored in plaintext at image bits 0–127; unique per encode |
-| Key derivation | Argon2id | time=2, mem=64 MiB, threads=4; keyed with password + randomSalt |
+| Salt pixel positions | ChaCha8 under a fixed public key (SHA-256 of `"github.com/pableeee/steg/v2 salt positions"`) | Public by design: the first k = ⌈128 / bits-per-pixel⌉ pixels of the order depend only on image size and settings |
+| Per-image salt | `crypto/rand` (16 bytes) | Stored in plaintext at stream bits 0–127, in the salt pixels; unique per encode |
+| Key derivation | Argon2id | time=2, mem=64 MiB, threads=4, 84-byte output; keyed with password + salt |
 | Encryption key | KDF output bytes 0–15 | 16-byte AES-128 key |
 | MAC key | KDF output bytes 16–47 | 32-byte HMAC-SHA256 key |
 | Payload nonce | KDF output bytes 48–51 | 4-byte AES-CTR nonce; unique per encode via random salt |
+| Order key | KDF output bytes 52–83 | 32-byte ChaCha8 key that finishes the Fisher-Yates pixel order after the salt pixels |
 | Stream cipher | AES-128-CTR | Custom bit-addressable CTR; seekable keystream |
 | Authentication | HMAC-SHA256 | Keyed with independent MAC key; constant-time comparison |
 
 ### Threat model
 
 - **Confidentiality** — AES-128-CTR with a strong KDF-derived key. An attacker without the password sees only pseudorandom bits across a pseudorandomly-ordered set of pixels.
-- **Integrity / authentication** — HMAC-SHA256 over the plaintext payload, encrypted alongside it. A wrong password or any bit-flip in the encrypted region produces a MAC failure; no plaintext is returned.
+- **Integrity / authentication** — HMAC-SHA256 over the plaintext padded block (real-length prefix, payload and padding), encrypted alongside it. A wrong password or any bit-flip in the encrypted region produces a MAC failure; no plaintext is returned.
 - **Resistance to brute force** — Argon2id with 64 MiB memory requirement makes offline dictionary attacks expensive, even on GPU hardware.
 - **Keystream uniqueness** — A fresh `crypto/rand` 16-byte salt is generated on every encode and stored in plaintext in the image header. Argon2id derives the cipher nonce from the password and this salt, so each encode produces a unique payload keystream even when the same password and carrier are reused.
-- **Pixel deniability** — Without the password, an attacker cannot determine which pixels carry data (the traversal order is derived from SHA-256 of the password).
+- **Pixel order** — The salt has to be found before any key exists, so the salt pixel positions are public by design: anyone can compute them from the image size and settings. Everything after them is placed by a Fisher-Yates shuffle keyed with Argon2id output, so recomputing the order for a guessed password costs a full KDF call (previously the order came from SHA-256 of the password, which made guesses cheap). Be clear about what this buys today: nothing. The encoder fills the whole carrier, so every pixel carries data and the secret order hides nothing about *where* the data is. It starts to matter with bounded padding ([Next steps](#next-steps), item 2), when only part of the image is written; this change was its prerequisite.
 
 ### What steg does not protect against
 
@@ -299,7 +339,7 @@ go test ./steg/ -bench=BenchmarkDecodeBySize -benchtime=3s -benchmem
 
 ## On-image layout
 
-Bits are stored in the shuffled pixel sequence, green channel before blue within each pixel:
+The hidden data is one bit stream. Stream bit `b` lives in pixel `order[b / bitsPerPixel]`; within a pixel the bits run through the active channels in the order R, G, B, and within each channel through its N low bits from the most significant of them down. The stream layout is:
 
 ```
 Bit offset           Size        Cipher                  Field
@@ -312,7 +352,14 @@ Bit offset           Size        Cipher                  Field
 192 + (N+P)×8        256 bits    AES-128-CTR (payload)   HMAC-SHA256 tag
 ```
 
-A single AES-128-CTR payload cipher (`AES-CTR(encKey, payloadNonce)`) encrypts everything from bit 128 onward. The 16-byte `randomSalt` at bits 0–127 is stored in plaintext — an attacker who sees it still cannot derive any keys without the password. Argon2id takes the password and `randomSalt` and produces all key material (encKey, macKey, payloadNonce) in a single call, so no bootstrap cipher is needed. Every encode writes the full image capacity, so the LSB distribution is uniformly disturbed regardless of payload size.
+A single AES-128-CTR payload cipher (`AES-CTR(encKey, payloadNonce)`) encrypts everything from bit 128 onward. The 16-byte `randomSalt` at bits 0–127 is stored in plaintext — an attacker who sees it still cannot derive any keys without the password. Argon2id takes the password and `randomSalt` and produces all key material (encKey, macKey, payloadNonce, orderKey) in a single call, so no bootstrap cipher is needed. Every encode writes the full image capacity, so the LSB distribution is uniformly disturbed regardless of payload size.
+
+The pixel order (`cursors/order.go`) is built in two parts of one Fisher-Yates shuffle over all pixels:
+
+1. **Public prefix.** The first k = ⌈128 / bitsPerPixel⌉ steps are driven by ChaCha8 under a fixed public key. These k pixels hold the salt (the last of them may also hold the first encrypted bits).
+2. **Secret suffix.** After the salt is written (encode) or read (decode) and Argon2id has run, the remaining steps are driven by ChaCha8 under `orderKey`.
+
+Both the sequential and the parallel paths get the order from `prepareEncode` / `prepareDecode` in `steg/steg.go`. The exact algorithm, including the bounded random draw, is in [docs/TECHNICAL_SPEC.md](docs/TECHNICAL_SPEC.md).
 
 ---
 
@@ -320,18 +367,22 @@ A single AES-128-CTR payload cipher (`AES-CTR(encKey, payloadNonce)`) encrypts e
 
 ```
 ┌─────────────────────────────────────────────────┐
-│  cmd/steg  (Cobra CLI, PNG I/O)                 │
+│  cmd/steg  (Cobra CLI, PNG/BMP/TIFF I/O,        │
+│  transparency check, verify-after-write)        │
 └──────────────────┬──────────────────────────────┘
                    │ draw.Image + password
 ┌──────────────────▼──────────────────────────────┐
 │  steg.Encode / Decode / EncodeParallel /        │
-│  DecodeParallel  (orchestration, deriveKeys)    │
+│  DecodeParallel  (orchestration)                │
+│  prepareEncode/prepareDecode: public order →    │
+│  salt → Argon2id → keys → finished order        │
 └──────┬────────────────────────────┬─────────────┘
-       │ seed                       │ encKey, macKey
+       │ pixel order                │ encKey, nonce
 ┌──────▼────────────┐   ┌───────────▼─────────────┐
-│  RNGCursor        │   │  cipher.NewCipher       │
-│  pixel traversal  │   │  AES-128-CTR, seekable  │
-│  pixel cache      │   │  bit/byte-level XOR     │
+│  order.go         │   │  cipher.NewCipher       │
+│  ChaCha8 shuffle  │   │  AES-128-CTR, seekable  │
+│  RNGCursor        │   │  bit/byte-level XOR     │
+│  direct Pix I/O   │   │                         │
 └──────┬────────────┘   └───────────┬─────────────┘
        │ Cursor                     │ StreamCipherBlock
 ┌──────▼────────────────────────────▼─────────────┐
@@ -352,10 +403,10 @@ A single AES-128-CTR payload cipher (`AES-CTR(encKey, payloadNonce)`) encrypts e
 
 | Package | Responsibility |
 |---|---|
-| `cmd/steg` | Cobra CLI; PNG/BMP/TIFF file I/O; `encode`, `decode`, `capacity`, `test-visual`, and `detect` subcommands |
-| `steg` | Encode/decode orchestration; Argon2id key derivation; parallel worker pool |
+| `cmd/steg` | Cobra CLI; PNG/BMP/TIFF file I/O; transparency check; verify-after-write; `encode`, `decode`, `capacity`, `test-visual`, and `detect` subcommands |
+| `steg` | Encode/decode orchestration; carrier and settings validation; salt handling and Argon2id key derivation (`prepareEncode` / `prepareDecode`); capacity; parallel worker pool |
 | `steg/container` | Payload framing (length prefix + HMAC tag); constant-time tag verification |
-| `cursors` | `RNGCursor` (Fisher-Yates pixel traversal, write-back pixel cache), `CursorAdapter` (byte↔bit bridge), `CipherMiddleware` (transparent encrypt/decrypt) |
+| `cursors` | `order.go` (pixel order: public ChaCha8 prefix for the salt, keyed suffix — format-defining), `RNGCursor` (bit↔pixel mapping over a given order; reads and writes the `Pix` bytes of `*image.RGBA` / `*image.NRGBA` directly), `CursorAdapter` (byte↔bit bridge), `CipherMiddleware` (transparent encrypt/decrypt) |
 | `cipher` | AES-128 CTR stream cipher; bit- and byte-addressable keystream; seekable |
 | `steg/analysis` | Chi-square and RS steganalysis detectors; `Analyze()` returns a combined verdict |
 | `mocks` | Auto-generated gomock mocks for `Cursor` and `StreamCipherBlock` interfaces |
@@ -404,8 +455,11 @@ go test ./steg/ -bench=BenchmarkDecodeBySize -benchtime=3s -benchmem
 ```
 .
 ├── cipher/          # AES-128-CTR stream cipher
-├── cmd/steg/        # CLI entry point (Cobra)
-├── cursors/         # RNGCursor, CursorAdapter, CipherMiddleware
+├── cmd/
+│   ├── steg/        # CLI entry point (Cobra)
+│   ├── attack1/     # Steganalysis report over one or more images (built on steg/analysis)
+│   └── attack4/     # Dictionary attack using the real decode path as password oracle
+├── cursors/         # Pixel order, RNGCursor, CursorAdapter, CipherMiddleware
 ├── docs/            # Technical spec, ADRs, release notes
 ├── mocks/           # Auto-generated gomock mocks
 ├── steg/            # Encode/decode orchestration, container framing
@@ -440,7 +494,11 @@ Two GitHub Actions workflows:
 | MAC-then-Encrypt ordering | Low | HMAC is computed over plaintext before encryption. Unconventional (Encrypt-then-MAC is preferred), but not exploitable in this threat model since the tag is inside the encrypted channel. |
 | No streaming decode | Medium | `ReadPayload` allocates the full payload in memory before returning. Very large payloads may cause high memory usage. The declared length is clamped to the carrier's capacity first, so a wrong password cannot trigger an oversized allocation. |
 | Lossy formats unsupported | High | JPEG and other lossy formats destroy LSB data. Only lossless formats (PNG, BMP, TIFF) are supported. |
-| Statistical steganalysis | Medium | Modifying the LSBs of color channels across a pseudorandom pixel set produces a detectable statistical signature. The built-in `detect` command uses chi-square and RS analysis to surface this. Chi-square reliably detects full-fill encoding; RS analysis effectiveness varies with the carrier image's natural LSB distribution. Higher bits-per-channel settings make signatures more pronounced. |
+| Transparent carriers rejected | Low | `encode` and `test-visual` refuse a carrier with any non-opaque pixel, for every output format: PNG and BMP store straight alpha, so saving would destroy bits hidden in translucent pixels. Flatten the image onto an opaque background first. |
+| Library carriers: `*image.RGBA` / `*image.NRGBA` only | Low | `steg.Encode`, `Decode`, `EncodeParallel` and `DecodeParallel` reject every other `draw.Image` type (error wraps `cursors.ErrUnsupportedImage`) before touching a pixel, because color conversion (premultiplication, luma, 16-bit truncation) would destroy the hidden bits. Convert first with `draw.Draw` into an `*image.RGBA`. An `*image.NRGBA` with translucent pixels round-trips in memory; the CLI's transparency rule is about saving to files. The CLI converts every input itself. |
+| Size limits | Low | At most 2³²−1 pixels per carrier (the pixel order uses 4-byte indices), and at most 4 GiB of capacity (the container length field is 32 bits). Invalid settings (bits per channel outside 1–8, channels outside 1–3) are rejected by the library as well as the CLI. |
+| Images from earlier builds | Low | The pixel order changed and there is no format version field; an older image fails to decode exactly as with a wrong password. Decode it with the binary that created it. |
+| Statistical steganalysis | Medium | Modifying the LSBs of color channels across a pseudorandom pixel set produces a detectable statistical signature. The built-in `detect` command uses chi-square and RS analysis to surface this. Because the encoder always fills the carrier, both chi-square and RS analysis flag every channel written to on a natural photograph. RS analysis is less reliable on small images. Higher bits-per-channel settings make signatures more pronounced. |
 
 ---
 
@@ -450,15 +508,15 @@ The `detect` command runs two complementary statistical tests against the image'
 
 ### Chi-square test
 
-Compares the histogram of pixel value pairs `(2k, 2k+1)` per channel. In a natural image these pairs are unequal; LSB embedding equalises them. A high p-value (> 0.05) for a channel is flagged as suspicious.
+Compares the histogram of pixel value pairs `(2k, 2k+1)` per channel. In a natural image these pairs are unequal; LSB embedding equalises them. Only pairs that occur in the image count: the degrees of freedom are the number of occupied pairs minus one (shown as `df`), and the p-value is the exact chi-square upper tail. A high p-value (> 0.05) for a channel is flagged as suspicious. A channel with fewer than two occupied pairs is reported as `too few distinct values to test` and not flagged.
 
-**Performance:** correctly identifies which channels were written to. On a real photo encoded at full capacity with R+G+B, all three channels are flagged; untouched channels remain at p ≈ 0.0000.
+**Performance:** correctly identifies which channels were written to; untouched channels stay at p ≈ 0.0000. On a channel fully overwritten with random bits the p-value is roughly uniform between 0 and 1, so each written channel falls below 0.05 about 5% of the time by chance. A full-capacity R+G+B encode therefore reads `LIKELY_STEGO` most of the time (about 86% in our estimate) and `SUSPICIOUS` otherwise; RS analysis does not have this variance.
 
 ### RS analysis
 
-Measures local pixel smoothness using regular (`R`) and singular (`S`) group fractions under a positive and a negative flipping mask. LSB embedding biases `Rm` above `Rnm`; a positive asymmetry (`Rm − Rnm > 0.01`) is flagged as suspicious.
+Measures local pixel smoothness using regular (`R`) and singular (`S`) group fractions under a positive (`Rm`, `Sm`) and a negative (`R-m`, `S-m`) flipping mask. In a clean photograph `Rm ≈ R-m`. LSB embedding pulls `Rm` down toward `Sm` while pushing `R-m` up, so the reported asymmetry `Rm − R-m` turns negative (Fridrich, Goljan, Du). A channel with asymmetry below `−0.02` is flagged as suspicious.
 
-**Performance:** reliable on natural photographs where the clean baseline asymmetry is near zero. On images whose natural LSB distribution is already skewed (e.g. heavily processed or synthetic images), the clean asymmetry may be deeply negative and encoding moves it toward zero rather than above the threshold — in which case chi-square remains the primary signal.
+**Performance:** on a 1024×1536 photograph the clean channels measure −0.002 to −0.006, and the same photo after a default full-capacity encode measures −0.040 to −0.048. All three stego channels are flagged and none of the clean ones are. Because the tool always fills the whole carrier, every image it produces shows this shift on every channel it writes to. The statistic is noisier on small images (below roughly 512×512), where a clean channel can cross the threshold by chance. Images whose LSB plane is already artificial (for example, synthetic images with all-even values) can have a large clean asymmetry and are not a meaningful baseline.
 
 ### Verdict thresholds
 
@@ -535,6 +593,11 @@ as well by rounding up to a fixed multiple (for example 4 KiB) or to a
 fraction of the capacity. Combined with matching this drastically reduces the
 footprint.
 
+The prerequisite is now in place: the pixel order after the salt is keyed by
+Argon2id output rather than by a cheap hash of the password, so once only part
+of the image is written, computing which pixels carry data requires the
+password, and testing a password guess costs a full KDF call.
+
 ### 3. Adaptive embedding
 
 Skip smooth regions, where any LSB change stands out, and embed only in
@@ -546,8 +609,9 @@ channel.
 ### 4. Close the loop with `detect`
 
 Have `encode` run the steganalysis on its own output and warn when the result
-is detectable, and fix the open RS threshold issue. Without this the three
-items above cannot be measured. A benchmark in `cmd/attack1` comparing
+is detectable. (The RS test's threshold had the wrong sign; that is fixed, so
+both tests now give a usable signal.) Without this the three items above cannot
+be measured. A benchmark in `cmd/attack1` comparing
 replacement, matching, and adaptive embedding across a set of images would
 make the trade-offs concrete.
 
