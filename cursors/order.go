@@ -3,7 +3,7 @@ package cursors
 import (
 	"crypto/sha256"
 	"fmt"
-	"image"
+	"math"
 	"math/rand/v2"
 )
 
@@ -16,48 +16,66 @@ import (
 // which a decoder must locate before it can derive any key.
 var publicOrderKey = sha256.Sum256([]byte("github.com/pableeee/steg/v2 salt positions"))
 
+// MaxPixels is the largest number of pixels a carrier may have: the order
+// stores each pixel as a uint32 index (4 bytes per pixel rather than the 16 of
+// an image.Point), so indices must stay below 2^32 (and fit an int on 32-bit
+// platforms).
+const MaxPixels = min(math.MaxUint32, math.MaxInt)
+
+// PixelCount returns width×height, or an error if either dimension is not
+// positive or the product exceeds MaxPixels. It never overflows.
+func PixelCount(width, height int) (int, error) {
+	if width <= 0 || height <= 0 {
+		return 0, fmt.Errorf("cursors: invalid image dimensions %dx%d", width, height)
+	}
+	if int64(width) > MaxPixels/int64(height) {
+		return 0, fmt.Errorf("cursors: image %dx%d has more than %d pixels", width, height, int64(MaxPixels))
+	}
+	return width * height, nil
+}
+
 // NewPixelOrder returns the pixel indices of a width×height image in row-major
 // order with the first publicLen steps of a Fisher-Yates shuffle applied, driven
-// by a ChaCha8 stream under the public key. points[:publicLen] therefore depend
-// only on the dimensions and publicLen; points[publicLen:] are not yet shuffled
+// by a ChaCha8 stream under the public key. order[:publicLen] therefore depend
+// only on the dimensions and publicLen; order[publicLen:] are not yet shuffled
 // and must be finished with FinishPixelOrder before use.
 //
-// Points cover [0,width)×[0,height); RNGCursor offsets them by Bounds().Min.
-func NewPixelOrder(width, height, publicLen int) ([]image.Point, error) {
-	if width <= 0 || height <= 0 {
-		return nil, fmt.Errorf("cursors: invalid image dimensions %dx%d", width, height)
+// Index i is the pixel at (i % width, i / width) relative to Bounds().Min.
+func NewPixelOrder(width, height, publicLen int) ([]uint32, error) {
+	n, err := PixelCount(width, height)
+	if err != nil {
+		return nil, err
 	}
-	n := width * height
 	if publicLen < 0 || publicLen > n {
 		return nil, fmt.Errorf("cursors: image has %d pixels, need at least %d", n, publicLen)
 	}
-	points := make([]image.Point, n)
-	for i := range points {
-		points[i] = image.Point{X: i % width, Y: i / width}
+	order := make([]uint32, n)
+	for i := range order {
+		order[i] = uint32(i)
 	}
-	shuffleRange(points, 0, publicLen, publicOrderKey)
-	return points, nil
+	shuffleRange(order, 0, publicLen, publicOrderKey)
+	return order, nil
 }
 
 // FinishPixelOrder continues the Fisher-Yates shuffle started by NewPixelOrder
-// over points[publicLen:], driven by a ChaCha8 stream keyed with orderKey. The
+// over order[publicLen:], driven by a ChaCha8 stream keyed with orderKey. The
 // result is a permutation of all pixels whose public prefix is unchanged.
-func FinishPixelOrder(points []image.Point, publicLen int, orderKey [32]byte) {
-	shuffleRange(points, publicLen, len(points), orderKey)
+func FinishPixelOrder(order []uint32, publicLen int, orderKey [32]byte) {
+	shuffleRange(order, publicLen, len(order), orderKey)
 }
 
 // shuffleRange performs Fisher-Yates steps from..to-1 over the whole slice:
-// step i swaps points[i] with points[i+uniform(n-i)]. The last step (i = n-1)
+// step i swaps order[i] with order[i+uniform(n-i)]. The last step (i = n-1)
 // is always the identity and is skipped, so it consumes no stream output.
-func shuffleRange(points []image.Point, from, to int, key [32]byte) {
-	n := len(points)
+func shuffleRange(order []uint32, from, to int, key [32]byte) {
+	n := len(order)
 	if to > n-1 {
 		to = n - 1
 	}
 	src := rand.NewChaCha8(key)
 	for i := from; i < to; i++ {
 		j := i + int(uniform(src, uint64(n-i)))
-		points[i], points[j] = points[j], points[i]
+		order[i], order[j] = order[j], order[i]
 	}
 }
 

@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
-	"image"
 	"image/draw"
 	"io"
 	"runtime"
@@ -22,13 +21,14 @@ const payloadStreamOffset = 20
 // firstChunkShift returns how many extra bytes the first worker chunk must carry
 // so that every subsequent chunk boundary lands on a pixel boundary.
 //
-// Workers read-modify-write whole pixels: a cursor loads a pixel with img.At(),
-// updates the bits it owns, and stores it back with img.Set(). If a boundary
-// falls mid-pixel, the workers on either side both load, modify, and store that
-// pixel, and whichever stores last silently discards the other's bits — the
-// image then fails MAC verification on decode. A shared mutex does not help,
-// because each individual At and Set is already serialised; it is the
-// load-modify-store sequence that must not interleave.
+// Encode workers write the image's Pix bytes without any lock. That is safe
+// only because no two workers touch the same pixel: setting a bit is a
+// load-modify-store of a whole byte, so if a boundary fell mid-pixel the workers
+// on either side could both rewrite the same channel byte (always, when
+// bitsPerChannel > 1), and whichever stored last would silently discard the
+// other's bits — the image would then fail MAC verification on decode, and the
+// race detector would flag it. A mutex around each access would not help: it is
+// the load-modify-store sequence that must not interleave.
 //
 // Chunk sizes are already multiples of lcm(8, bitsPerPixel)/8 bytes, so the only
 // misalignment comes from the header: the payload starts at bit
@@ -56,16 +56,15 @@ type decJob struct {
 }
 
 // newWorkerStack creates a per-worker cipher+cursor stack. Each worker has its
-// own independent cipher and cursor state over the shared points slice. imgMu,
-// when non-nil, is shared across concurrent workers to serialise
-// img.At()/img.Set() calls.
-func newWorkerStack(m draw.Image, keys mainKeys, points []image.Point,
-	bitsPerChannel, channels int, imgMu *sync.Mutex) (io.ReadWriteSeeker, error) {
-	opts := cursorOptions(points, bitsPerChannel, channels)
-	if imgMu != nil {
-		opts = append(opts, cursors.WithImageMutex(imgMu))
+// own independent cipher and cursor state over the shared order slice and the
+// shared image. Workers need no lock: the dispatch loops hand them
+// pixel-aligned chunks (see firstChunkShift), so they write disjoint bytes.
+func newWorkerStack(m draw.Image, keys mainKeys, order []uint32,
+	bitsPerChannel, channels int) (io.ReadWriteSeeker, error) {
+	cur, err := cursors.NewRNGCursor(m, cursorOptions(order, bitsPerChannel, channels)...)
+	if err != nil {
+		return nil, err
 	}
-	cur := cursors.NewRNGCursor(m, opts...)
 	c, err := cipher.NewCipher(keys.nonce, keys.encKey)
 	if err != nil {
 		return nil, err
@@ -75,8 +74,12 @@ func newWorkerStack(m draw.Image, keys mainKeys, points []image.Point,
 
 // EncodeParallel encodes r into m using a parallel worker pool.
 // The on-image layout is identical to Encode, so DecodeParallel and Decode
-// can both decode images written by EncodeParallel (and vice-versa).
+// can both decode images written by EncodeParallel (and vice-versa). Carrier
+// types and settings are validated as in Encode.
 func EncodeParallel(m draw.Image, pass []byte, r io.Reader, bitsPerChannel, channels int) error {
+	if err := validateCarrier(m, bitsPerChannel, channels); err != nil {
+		return err
+	}
 	realPayload, err := io.ReadAll(r)
 	if err != nil {
 		return err
@@ -101,9 +104,6 @@ func EncodeParallel(m draw.Image, pass []byte, r io.Reader, bitsPerChannel, chan
 	hashFn.Write(padded)
 	tag := hashFn.Sum(nil)
 
-	// Shared mutex serialises img.At()/img.Set() across concurrent workers.
-	imgMu := &sync.Mutex{}
-
 	numWorkers := runtime.GOMAXPROCS(0)
 	jobChan := make(chan encJob, numWorkers*2)
 	errChan := make(chan error, numWorkers)
@@ -122,7 +122,7 @@ func EncodeParallel(m draw.Image, pass []byte, r io.Reader, bitsPerChannel, chan
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			adapter, werr := newWorkerStack(m, keys, points, bitsPerChannel, channels, imgMu)
+			adapter, werr := newWorkerStack(m, keys, points, bitsPerChannel, channels)
 			if werr != nil {
 				fail(werr)
 				return
@@ -136,9 +136,6 @@ func EncodeParallel(m draw.Image, pass []byte, r io.Reader, bitsPerChannel, chan
 					fail(werr2)
 					return
 				}
-			}
-			if _, ferr := adapter.Seek(0, io.SeekStart); ferr != nil {
-				fail(ferr)
 			}
 		}()
 	}
@@ -180,7 +177,7 @@ dispatch:
 	// Both run after wg.Wait(), so although each may share a pixel with the
 	// payload region, no concurrent writer can clobber it.
 	// The salt region (bytes 0–15) was written by prepareEncode.
-	seqAdapter, err := newWorkerStack(m, keys, points, bitsPerChannel, channels, nil)
+	seqAdapter, err := newWorkerStack(m, keys, points, bitsPerChannel, channels)
 	if err != nil {
 		return err
 	}
@@ -197,16 +194,17 @@ dispatch:
 	if _, err = seqAdapter.Seek(payloadStreamOffset+totalLen, io.SeekStart); err != nil {
 		return err
 	}
-	if _, err = seqAdapter.Write(tag); err != nil {
-		return err
-	}
-	_, err = seqAdapter.Seek(0, io.SeekStart)
+	_, err = seqAdapter.Write(tag)
 	return err
 }
 
 // DecodeParallel decodes a message from m using a parallel worker pool.
-// Images encoded by Encode (sequential) are fully compatible.
+// Images encoded by Encode (sequential) are fully compatible. Carrier types
+// and settings are validated as in Decode.
 func DecodeParallel(m draw.Image, pass []byte, bitsPerChannel, channels int) ([]byte, error) {
+	if err := validateCarrier(m, bitsPerChannel, channels); err != nil {
+		return nil, err
+	}
 	// Read the plaintext salt (stream bytes 0–15) and derive the keys and the
 	// full pixel order.
 	keys, points, err := prepareDecode(m, pass, bitsPerChannel, channels)
@@ -215,7 +213,7 @@ func DecodeParallel(m draw.Image, pass []byte, bitsPerChannel, channels int) ([]
 	}
 
 	// Read the 4-byte container length field at byte 16 (after the plaintext salt).
-	seqAdapter, err := newWorkerStack(m, keys, points, bitsPerChannel, channels, nil)
+	seqAdapter, err := newWorkerStack(m, keys, points, bitsPerChannel, channels)
 	if err != nil {
 		return nil, err
 	}
@@ -261,7 +259,7 @@ func DecodeParallel(m draw.Image, pass []byte, bitsPerChannel, channels int) ([]
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			adapter, werr := newWorkerStack(m, keys, points, bitsPerChannel, channels, nil)
+			adapter, werr := newWorkerStack(m, keys, points, bitsPerChannel, channels)
 			if werr != nil {
 				fail(werr)
 				return

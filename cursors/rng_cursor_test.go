@@ -3,6 +3,8 @@ package cursors_test
 import (
 	"bytes"
 	"image"
+	"image/color"
+	"image/draw"
 	"io"
 	"testing"
 
@@ -28,6 +30,13 @@ func writeAndReadAll(t *testing.T, rw io.ReadWriteSeeker, payload []byte) []byte
 	return readBuf
 }
 
+func mustCursor(t *testing.T, img *image.RGBA, opts ...cursors.Option) *cursors.RNGCursor {
+	t.Helper()
+	c, err := cursors.NewRNGCursor(img, opts...)
+	require.NoError(t, err)
+	return c
+}
+
 func capacityInBits(width, height int, totalBitsPerPixel int) int {
 	return width * height * totalBitsPerPixel
 }
@@ -36,7 +45,7 @@ func TestRNGCursor(t *testing.T) {
 	t.Run("1. Basic Read/Write Consistency", func(t *testing.T) {
 		img := image.NewRGBA(image.Rect(0, 0, 10, 10))
 		// Use R and G bits => 2 bits per pixel
-		cur := cursors.NewRNGCursor(img,
+		cur := mustCursor(t, img,
 			cursors.UseGreenBit(),
 		)
 
@@ -55,17 +64,17 @@ func TestRNGCursor(t *testing.T) {
 		// 1 bit per pixel for simplicity. Each cursor builds its own copy of
 		// the order from the same key, so agreement means the order is
 		// deterministic, not merely shared.
-		order := func() []image.Point {
+		order := func() []uint32 {
 			points, err := cursors.NewPixelOrder(5, 5, 3)
 			require.NoError(t, err)
 			cursors.FinishPixelOrder(points, 3, [32]byte{42})
 			return points
 		}
-		cur1 := cursors.NewRNGCursor(img,
+		cur1 := mustCursor(t, img,
 			cursors.WithSharedPoints(order()),
 		)
 
-		cur2 := cursors.NewRNGCursor(img,
+		cur2 := mustCursor(t, img,
 			cursors.WithSharedPoints(order()),
 		)
 
@@ -88,7 +97,7 @@ func TestRNGCursor(t *testing.T) {
 	t.Run("3. Boundary Conditions", func(t *testing.T) {
 		img := image.NewRGBA(image.Rect(0, 0, 2, 2))
 		// 1 bit per pixel => capacity = 4 bits = 0.5 byte
-		cur := cursors.NewRNGCursor(img)
+		cur := mustCursor(t, img)
 
 		adapter := cursors.CursorAdapter(cur)
 
@@ -102,7 +111,7 @@ func TestRNGCursor(t *testing.T) {
 	t.Run("4. Multiple Channel Configurations", func(t *testing.T) {
 		img := image.NewRGBA(image.Rect(0, 0, 3, 3))
 		// Test using R and B with multiple bits in B
-		cur := cursors.NewRNGCursor(img,
+		cur := mustCursor(t, img,
 			cursors.UseGreenBit(),
 			cursors.UseBlueBit(),
 		)
@@ -117,7 +126,7 @@ func TestRNGCursor(t *testing.T) {
 	t.Run("5. Stability with Different Image Sizes", func(t *testing.T) {
 		// Small image
 		smallImg := image.NewRGBA(image.Rect(0, 0, 1, 1))
-		curSmall := cursors.NewRNGCursor(smallImg)
+		curSmall := mustCursor(t, smallImg)
 
 		adapterSmall := cursors.CursorAdapter(curSmall)
 		payload := []byte{0x0F} // 8 bits, but we only have 1 bit capacity, should fail
@@ -126,7 +135,7 @@ func TestRNGCursor(t *testing.T) {
 
 		// Larger image
 		largeImg := image.NewRGBA(image.Rect(0, 0, 50, 50))
-		curLarge := cursors.NewRNGCursor(largeImg,
+		curLarge := mustCursor(t, largeImg,
 			cursors.UseGreenBit(),
 		)
 		adapterLarge := cursors.CursorAdapter(curLarge)
@@ -136,20 +145,69 @@ func TestRNGCursor(t *testing.T) {
 		readBack := writeAndReadAll(t, adapterLarge, payloadLarge)
 		assert.Equal(t, payloadLarge, readBack)
 	})
+}
 
-	// t.Run("6. Behavior Under Different Bit Depths", func(t *testing.T) {
-	// 	// Suppose we have an image with 16-bit depth (like RGBA64).
-	// 	// If your code supports it, you might need a NRGBA64 image:
-	// 	img := image.NewNRGBA64(image.Rect(0, 0, 10, 10))
-	// 	// Let's assume that RNGCursor can handle bitDepth as an option, like WithBitDepth(16)
-	// 	cur := cursors.NewRNGCursor(img,
-	// 		cursors.UseGreenBit(),
-	// 	)
+// TestRNGCursorRejectsUnsupported checks the constructor refuses carriers it
+// cannot address exactly and settings outside 1..8 bits per channel.
+func TestRNGCursorRejectsUnsupported(t *testing.T) {
+	r := image.Rect(0, 0, 4, 4)
+	for _, img := range []draw.Image{
+		image.NewGray(r), image.NewRGBA64(r), image.NewNRGBA64(r),
+		image.NewPaletted(r, color.Palette{color.Black, color.White}),
+		(*image.RGBA)(nil),
+	} {
+		_, err := cursors.NewRNGCursor(img)
+		require.ErrorIs(t, err, cursors.ErrUnsupportedImage, "%T", img)
+		require.ErrorIs(t, cursors.CheckImage(img), cursors.ErrUnsupportedImage, "%T", img)
+	}
+	for _, bpc := range []int{0, 9, -1} {
+		_, err := cursors.NewRNGCursor(image.NewRGBA(r), cursors.WithBitsPerChannel(bpc))
+		require.Error(t, err, "bpc=%d", bpc)
+	}
+	_, err := cursors.NewRNGCursor(image.NewRGBA(r), cursors.WithSharedPoints(make([]uint32, 17)))
+	require.Error(t, err, "order longer than the image")
+}
 
-	// 	adapter := cursors.CursorAdapter(cur)
+// TestRNGCursorWritesExactBits checks the cursor stores bits in the Pix bytes
+// of both supported types, including NRGBA pixels with alpha < 255 (which a
+// premultiplying At/Set round trip would destroy), and never touches alpha.
+func TestRNGCursorWritesExactBits(t *testing.T) {
+	r := image.Rect(0, 0, 8, 8)
+	nrgba := image.NewNRGBA(r)
+	for i := range nrgba.Pix {
+		nrgba.Pix[i] = byte(i * 37)
+	}
+	for i := 3; i < len(nrgba.Pix); i += 4 {
+		nrgba.Pix[i] = byte(i % 3 * 60) // alpha 0, 60, 120
+	}
+	rgba := image.NewRGBA(r)
+	copy(rgba.Pix, nrgba.Pix)
 
-	// 	payload := []byte("16bit-depth-test")
-	// 	readBack := writeAndReadAll(t, adapter, payload)
-	// 	assert.Equal(t, payload, readBack, "Should correctly handle reading/writing with 16-bit depth images")
-	// })
+	for _, img := range []draw.Image{nrgba, rgba} {
+		var pix []uint8
+		switch m := img.(type) {
+		case *image.NRGBA:
+			pix = m.Pix
+		case *image.RGBA:
+			pix = m.Pix
+		}
+		alpha := make([]byte, 0, 64)
+		for i := 3; i < len(pix); i += 4 {
+			alpha = append(alpha, pix[i])
+		}
+		cur, err := cursors.NewRNGCursor(img, cursors.UseGreenBit(), cursors.UseBlueBit(),
+			cursors.WithBitsPerChannel(8))
+		require.NoError(t, err)
+		payload := make([]byte, 64*3)
+		for i := range payload {
+			payload[i] = byte(255 - i)
+		}
+		readBack := writeAndReadAll(t, cursors.CursorAdapter(cur), payload)
+		require.Equal(t, payload, readBack, "%T", img)
+		// Row-major, 8 bits per channel: the payload is the RGB bytes verbatim.
+		for p := 0; p < 64; p++ {
+			require.Equal(t, payload[p*3:p*3+3], pix[p*4:p*4+3], "%T pixel %d", img, p)
+			require.Equal(t, alpha[p], pix[p*4+3], "%T alpha of pixel %d", img, p)
+		}
+	}
 }

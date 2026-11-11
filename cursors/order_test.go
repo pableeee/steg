@@ -9,12 +9,21 @@ import (
 	"github.com/pableeee/steg/cursors"
 )
 
-func fullOrder(t *testing.T, w, h, publicLen int, key [32]byte) []image.Point {
+func fullOrder(t *testing.T, w, h, publicLen int, key [32]byte) []uint32 {
 	t.Helper()
-	points, err := cursors.NewPixelOrder(w, h, publicLen)
+	order, err := cursors.NewPixelOrder(w, h, publicLen)
 	require.NoError(t, err)
-	cursors.FinishPixelOrder(points, publicLen, key)
-	return points
+	cursors.FinishPixelOrder(order, publicLen, key)
+	return order
+}
+
+// toPoints maps pixel indices back to coordinates: index i is (i%w, i/w).
+func toPoints(order []uint32, w int) []image.Point {
+	out := make([]image.Point, len(order))
+	for i, idx := range order {
+		out[i] = image.Pt(int(idx)%w, int(idx)/w)
+	}
+	return out
 }
 
 // TestPixelOrderGolden pins the traversal order, which is part of the on-image
@@ -26,7 +35,9 @@ func TestPixelOrderGolden(t *testing.T) {
 		key[i] = byte(i)
 	}
 	// 43 = ceil(128/3): the salt prefix length at the default 3 bits/pixel.
-	points := fullOrder(t, 64, 48, 43, key)
+	// The vectors are coordinates, pinned before the order was stored as
+	// indices; comparing through toPoints shows the permutation is unchanged.
+	points := toPoints(fullOrder(t, 64, 48, 43, key), 64)
 
 	pts := func(xy ...int) []image.Point {
 		out := make([]image.Point, 0, len(xy)/2)
@@ -50,7 +61,7 @@ func TestPixelOrderIsPermutation(t *testing.T) {
 		{1, 1, 0}, {1, 1, 1}, {1, 2, 1}, {2, 1, 2}, {1, 43, 43}, {13, 1, 5},
 		{7, 3, 0}, {3, 7, 21}, {64, 48, 43}, {100, 37, 128}, {37, 100, 16},
 	} {
-		points := fullOrder(t, tc.w, tc.h, tc.k, [32]byte{1, 2, 3})
+		points := toPoints(fullOrder(t, tc.w, tc.h, tc.k, [32]byte{1, 2, 3}), tc.w)
 		require.Len(t, points, tc.w*tc.h)
 		seen := make(map[image.Point]bool, len(points))
 		for _, p := range points {
@@ -87,4 +98,19 @@ func TestNewPixelOrderRejectsTooFewPixels(t *testing.T) {
 
 	_, err = cursors.NewPixelOrder(1, 43, 43)
 	require.NoError(t, err)
+}
+
+// TestPixelCountLimits checks the uint32 index limit is enforced without
+// overflowing the multiplication.
+func TestPixelCountLimits(t *testing.T) {
+	n, err := cursors.PixelCount(65536, 65535)
+	require.NoError(t, err)
+	require.Equal(t, 65536*65535, n)
+
+	for _, d := range [][2]int{{65536, 65536}, {1 << 40, 1 << 40}, {1 << 62, 4}, {0, 5}, {5, -1}} {
+		_, err := cursors.PixelCount(d[0], d[1])
+		require.Error(t, err, "%dx%d", d[0], d[1])
+		_, err = cursors.NewPixelOrder(d[0], d[1], 0)
+		require.Error(t, err, "%dx%d", d[0], d[1])
+	}
 }

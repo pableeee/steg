@@ -1,48 +1,66 @@
 package cursors
 
 import (
+	"errors"
 	"fmt"
 	"image"
-	"image/color"
 	"image/draw"
 	"io"
-	"sync"
 )
 
+// ErrUnsupportedImage is returned (wrapped) for carriers other than
+// *image.RGBA and *image.NRGBA.
+var ErrUnsupportedImage = errors.New("unsupported image type")
+
+// CheckImage reports whether img is a carrier the cursor can address: an
+// *image.RGBA or *image.NRGBA. Both store 8 bits per channel in their Pix
+// slice, which the cursor reads and writes directly, so every value
+// round-trips exactly. Other types would go through color conversion
+// (premultiplication, luma, 16-bit truncation) that destroys hidden bits.
+func CheckImage(img image.Image) error {
+	_, _, _, err := pixBuffer(img)
+	return err
+}
+
+// pixBuffer returns img's pixel bytes, its stride and its bounds. pix[0] is
+// the pixel at bounds.Min (true for sub-images too), and each pixel is 4
+// bytes in R, G, B, A order.
+func pixBuffer(img image.Image) (pix []uint8, stride int, bounds image.Rectangle, err error) {
+	switch m := img.(type) {
+	case *image.RGBA:
+		if m != nil {
+			return m.Pix, m.Stride, m.Rect, nil
+		}
+	case *image.NRGBA:
+		if m != nil {
+			return m.Pix, m.Stride, m.Rect, nil
+		}
+	}
+	return nil, 0, image.Rectangle{}, fmt.Errorf(
+		"%w %T: only *image.RGBA and *image.NRGBA carriers are supported; convert it first",
+		ErrUnsupportedImage, img)
+}
+
+// RNGCursor addresses the hidden bits of an image as a bit stream: stream bit
+// b lives in pixel order[b / bitsPerPixel], in the used channels from R to B
+// and, within a channel, from the most significant used bit to bit 0.
+//
+// It reads and writes the image's Pix bytes directly. Cursors that touch
+// disjoint pixels of the same image may therefore run concurrently: they
+// write distinct bytes, which is not a data race.
 type RNGCursor struct {
-	img            draw.Image
+	pix    []uint8
+	stride int
+	width  int
+
 	cursor         int64
 	bitMask        BitColor
 	bitCount       uint
 	bitsPerChannel int
-	useBits        []BitColor
-	points         []image.Point
-	maxBits        int64 // capacity in bits: len(points) × bits per pixel
-
-	// min is the image's origin. points are generated in the range
-	// [0,Dx)×[0,Dy) and offset by min on access, so sub-images whose bounds do
-	// not start at (0,0) address their own pixels rather than falling outside
-	// the image and silently reading zeroes.
-	min image.Point
-
-	// imgMu, when non-nil, is locked around every img.At() and img.Set() call.
-	// Set via WithImageMutex to eliminate data races when multiple cursors share
-	// the same draw.Image (e.g. parallel encode workers).
-	imgMu *sync.Mutex
-
-	// pixel cache — amortises img.At() and img.Set() across the bits of one pixel.
-	// Write-back: img.Set() is deferred until the cursor leaves the current pixel
-	// (via loadPixel or Flush), so each pixel costs one At + one Set regardless
-	// of how many of its bits are modified.
-	pixelCached bool
-	dirty       bool
-	cacheIdx    int64
-	cacheX      int
-	cacheY      int
-	cacheR      uint32
-	cacheG      uint32
-	cacheB      uint32
-	cacheA      uint32
+	bitsPerPixel   int64
+	chanOff        []int    // byte offset within a pixel of each used channel
+	order          []uint32 // traversal order; nil means row-major
+	maxBits        int64    // capacity in bits: pixels in the order × bitsPerPixel
 }
 
 type Option func(*RNGCursor)
@@ -59,52 +77,64 @@ func UseBlueBit() Option {
 	}
 }
 
-// WithSharedPoints sets the traversal order: stream bit b lives in pixel
-// points[b / bitsPerPixel]. Points are in [0,Dx)×[0,Dy) and are offset by the
-// image's Bounds().Min on access. The slice is read, never modified, so several
-// cursors may share it. Without this option the cursor walks the image in
-// row-major order.
-func WithSharedPoints(points []image.Point) Option {
-	return func(c *RNGCursor) { c.points = points }
+// WithSharedPoints sets the traversal order: stream bit b lives in the pixel
+// with index order[b / bitsPerPixel], where index i is the pixel at
+// (i % width, i / width) relative to the image's Bounds().Min. The slice is
+// read, never modified, so several cursors may share it. Without this option
+// the cursor walks the image in row-major order.
+func WithSharedPoints(order []uint32) Option {
+	return func(c *RNGCursor) { c.order = order }
 }
 
 func WithBitsPerChannel(n int) Option {
 	return func(c *RNGCursor) { c.bitsPerChannel = n }
 }
 
-// WithImageMutex sets a shared mutex that will be locked around every img.At()
-// and img.Set() call. Pass the same *sync.Mutex to all cursors that share an
-// image to eliminate data races in parallel encode/decode scenarios.
-func WithImageMutex(mu *sync.Mutex) Option {
-	return func(c *RNGCursor) { c.imgMu = mu }
-}
-
-func NewRNGCursor(img draw.Image, options ...Option) *RNGCursor {
-	c := &RNGCursor{img: img, bitMask: R_Bit, bitsPerChannel: 1}
+// NewRNGCursor returns a cursor over img, which must be an *image.RGBA or
+// *image.NRGBA (see CheckImage). The cursor uses the R channel plus any
+// channels added by options, and 1 bit per channel unless WithBitsPerChannel
+// says otherwise (1..8).
+func NewRNGCursor(img draw.Image, options ...Option) (*RNGCursor, error) {
+	pix, stride, b, err := pixBuffer(img)
+	if err != nil {
+		return nil, err
+	}
+	c := &RNGCursor{pix: pix, stride: stride, width: b.Dx(), bitMask: R_Bit, bitsPerChannel: 1}
 	for _, opt := range options {
 		opt(c)
 	}
-
-	b := img.Bounds()
-	c.min = b.Min
-	if c.points == nil {
-		c.points = make([]image.Point, 0, b.Dx()*b.Dy())
-		for y := 0; y < b.Dy(); y++ {
-			for x := 0; x < b.Dx(); x++ {
-				c.points = append(c.points, image.Point{X: x, Y: y})
-			}
-		}
+	if c.bitsPerChannel < 1 || c.bitsPerChannel > 8 {
+		return nil, fmt.Errorf("cursors: bits per channel must be 1..8, got %d", c.bitsPerChannel)
 	}
-	for _, color := range Colors {
+
+	numPixels := int64(0)
+	if !b.Empty() {
+		n, err := PixelCount(b.Dx(), b.Dy())
+		if err != nil {
+			return nil, err
+		}
+		numPixels = int64(n)
+	}
+	if c.order != nil {
+		// Capacity follows the order, not the image bounds, so a slice shorter
+		// than the image can never be indexed past its end. An order longer
+		// than the image cannot be a permutation of its pixels.
+		if int64(len(c.order)) > numPixels {
+			return nil, fmt.Errorf("cursors: order has %d entries but the image has %d pixels",
+				len(c.order), numPixels)
+		}
+		numPixels = int64(len(c.order))
+	}
+
+	for i, color := range Colors {
 		if c.bitMask&color == color {
 			c.bitCount++
-			c.useBits = append(c.useBits, color)
+			c.chanOff = append(c.chanOff, i) // R, G, B are bytes 0, 1, 2 of a pixel
 		}
 	}
-	// Capacity follows the point slice, not the image bounds, so a slice shorter
-	// than the image can never be indexed past its end.
-	c.maxBits = int64(len(c.points)) * int64(c.bitCount) * int64(c.bitsPerChannel)
-	return c
+	c.bitsPerPixel = int64(c.bitCount) * int64(c.bitsPerChannel)
+	c.maxBits = numPixels * c.bitsPerPixel
+	return c, nil
 }
 
 func (c *RNGCursor) BitCount() uint { return c.bitCount }
@@ -115,47 +145,20 @@ func (c *RNGCursor) validateBounds(n int64) bool {
 	return n < c.maxBits
 }
 
-// Flush writes the cached pixel to the image if it has been modified.
-// Must be called after the final WriteByte before the cursor is abandoned.
-func (c *RNGCursor) Flush() {
-	if c.dirty {
-		px := color.RGBA{uint8(c.cacheR), uint8(c.cacheG), uint8(c.cacheB), uint8(c.cacheA)}
-		if c.imgMu != nil {
-			c.imgMu.Lock()
-			c.img.Set(c.cacheX, c.cacheY, px)
-			c.imgMu.Unlock()
-		} else {
-			c.img.Set(c.cacheX, c.cacheY, px)
-		}
-		c.dirty = false
+// pixelOffset returns the offset in pix of the first byte of the pixelIdx-th
+// pixel of the traversal.
+func (c *RNGCursor) pixelOffset(pixelIdx int64) int {
+	idx := int(pixelIdx)
+	if c.order != nil {
+		idx = int(c.order[pixelIdx])
 	}
-}
-
-// loadPixel flushes the current dirty pixel (if any) then loads pixelIdx into cache.
-func (c *RNGCursor) loadPixel(pixelIdx int64) {
-	c.Flush()
-	pt := c.points[pixelIdx].Add(c.min)
-	var r, g, b, a uint32
-	if c.imgMu != nil {
-		c.imgMu.Lock()
-		r, g, b, a = c.img.At(pt.X, pt.Y).RGBA()
-		c.imgMu.Unlock()
-	} else {
-		r, g, b, a = c.img.At(pt.X, pt.Y).RGBA()
-	}
-	c.cacheIdx = pixelIdx
-	c.cacheX, c.cacheY = pt.X, pt.Y
-	c.cacheR, c.cacheG, c.cacheB, c.cacheA = r, g, b, a
-	c.pixelCached = true
+	return (idx/c.width)*c.stride + (idx%c.width)*4
 }
 
 func (c *RNGCursor) Seek(n int64, whence int) (int64, error) {
 	if !c.validateBounds(n) {
 		return c.cursor, fmt.Errorf("out of bounds: %w", io.EOF)
 	}
-
-	c.Flush()
-	c.pixelCached = false
 
 	switch whence {
 	case io.SeekStart:
@@ -179,96 +182,67 @@ func (c *RNGCursor) Seek(n int64, whence int) (int64, error) {
 }
 
 // ReadByte reads 8 bits MSB-first from the cursor.
-// Slot arithmetic accounts for bitsPerChannel: each pixel holds
-// bitCount*bitsPerChannel bit slots, ordered by channel then by bit
-// position within the channel (MSB-first within each channel's N bits).
+// Each pixel holds bitCount*bitsPerChannel bit slots, ordered by channel then
+// by bit position within the channel (MSB-first within each channel's N bits).
 func (c *RNGCursor) ReadByte() (byte, error) {
-	bitsPerPixel := int64(c.bitCount) * int64(c.bitsPerChannel)
-	pixelIdx := c.cursor / bitsPerPixel
-	slotInPixel := int(c.cursor % bitsPerPixel)
+	pixelIdx := c.cursor / c.bitsPerPixel
+	slotInPixel := int(c.cursor % c.bitsPerPixel)
+	off := -1
 	var out uint8
 
 	for i := 7; i >= 0; i-- {
 		if c.cursor >= c.maxBits {
 			return 0, fmt.Errorf("out of bounds: %w", io.EOF)
 		}
-		if !c.pixelCached || pixelIdx != c.cacheIdx {
-			c.loadPixel(pixelIdx)
+		if off < 0 {
+			off = c.pixelOffset(pixelIdx)
 		}
 		channelIdx := slotInPixel / c.bitsPerChannel
 		bitInChannel := (c.bitsPerChannel - 1) - (slotInPixel % c.bitsPerChannel)
-		var val uint32
-		switch c.useBits[channelIdx] {
-		case R_Bit:
-			val = c.cacheR
-		case G_Bit:
-			val = c.cacheG
-		case B_Bit:
-			val = c.cacheB
-		}
-		out |= uint8((val>>bitInChannel)&1) << i
+		val := c.pix[off+c.chanOff[channelIdx]]
+		out |= ((val >> bitInChannel) & 1) << i
 		c.cursor++
 		slotInPixel++
-		if slotInPixel >= int(bitsPerPixel) {
+		if int64(slotInPixel) == c.bitsPerPixel {
 			slotInPixel = 0
 			pixelIdx++
+			off = -1
 		}
 	}
 	return out, nil
 }
 
-// WriteByte writes 8 bits MSB-first to the cursor.
-// Uses write-back caching: img.Set() is deferred until the cursor moves to the
-// next pixel or Flush() is called — one Set per pixel regardless of bit count.
-// Slot arithmetic accounts for bitsPerChannel: each pixel holds
-// bitCount*bitsPerChannel bit slots, ordered by channel then by bit
-// position within the channel (MSB-first within each channel's N bits).
+// WriteByte writes 8 bits MSB-first to the cursor, with the same slot layout
+// as ReadByte. Bits are stored in the image immediately; there is nothing to
+// flush.
 func (c *RNGCursor) WriteByte(b byte) error {
-	bitsPerPixel := int64(c.bitCount) * int64(c.bitsPerChannel)
-	pixelIdx := c.cursor / bitsPerPixel
-	slotInPixel := int(c.cursor % bitsPerPixel)
+	pixelIdx := c.cursor / c.bitsPerPixel
+	slotInPixel := int(c.cursor % c.bitsPerPixel)
+	off := -1
 
 	for i := 7; i >= 0; i-- {
 		if c.cursor >= c.maxBits {
 			return fmt.Errorf("out of bounds: %w", io.EOF)
 		}
-		if !c.pixelCached || pixelIdx != c.cacheIdx {
-			c.loadPixel(pixelIdx) // flushes previous dirty pixel
+		if off < 0 {
+			off = c.pixelOffset(pixelIdx)
 		}
 		channelIdx := slotInPixel / c.bitsPerChannel
 		bitInChannel := (c.bitsPerChannel - 1) - (slotInPixel % c.bitsPerChannel)
-		bit := (b >> i) & 1
-		mask := uint32(1) << bitInChannel
-		switch c.useBits[channelIdx] {
-		case R_Bit:
-			if bit == 1 {
-				c.cacheR |= mask
-			} else {
-				c.cacheR &^= mask
-			}
-		case G_Bit:
-			if bit == 1 {
-				c.cacheG |= mask
-			} else {
-				c.cacheG &^= mask
-			}
-		case B_Bit:
-			if bit == 1 {
-				c.cacheB |= mask
-			} else {
-				c.cacheB &^= mask
-			}
+		p := &c.pix[off+c.chanOff[channelIdx]]
+		mask := uint8(1) << bitInChannel
+		if (b>>i)&1 == 1 {
+			*p |= mask
+		} else {
+			*p &^= mask
 		}
-		c.dirty = true
 		c.cursor++
 		slotInPixel++
-		if slotInPixel >= int(bitsPerPixel) {
+		if int64(slotInPixel) == c.bitsPerPixel {
 			slotInPixel = 0
 			pixelIdx++
+			off = -1
 		}
 	}
-	// Flush the last modified pixel so that any reader that follows immediately
-	// (without an intervening seek) sees the correct image data.
-	c.Flush()
 	return nil
 }

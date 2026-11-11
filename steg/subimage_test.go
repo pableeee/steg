@@ -3,8 +3,6 @@ package steg_test
 import (
 	"bytes"
 	"image"
-	"image/color"
-	"image/draw"
 	"testing"
 
 	"github.com/pableeee/steg/steg"
@@ -12,9 +10,9 @@ import (
 )
 
 // TestSubImageRoundTrip covers carriers whose bounds do not start at (0,0).
-// The cursor generates its pixel sequence over [0,Dx)×[0,Dy) and offsets by
-// Bounds().Min on access; without that offset it addresses coordinates outside
-// the sub-image, where At returns the zero color and Set is a no-op.
+// The pixel order indexes [0,Dx)×[0,Dy), and the cursor maps an index to an
+// offset in the sub-image's Pix slice, which starts at Bounds().Min and has the
+// parent's Stride; getting either wrong addresses the wrong pixels.
 func TestSubImageRoundTrip(t *testing.T) {
 	full := newNoisyImage(256, 256)
 	sub, ok := full.SubImage(image.Rect(64, 64, 192, 192)).(*image.RGBA)
@@ -121,53 +119,35 @@ func TestSubImageParallelRoundTrip(t *testing.T) {
 	}
 }
 
-// unclippedView reports bounds of r but forwards At/Set to the full image
-// without clipping to r. (*image.RGBA).SubImage silently drops out-of-bounds
-// Sets, which would hide a cursor addressing pixels outside its carrier; this
-// view lets such writes land so the test below can see them.
-type unclippedView struct {
-	full *image.RGBA
-	r    image.Rectangle
-}
-
-func (v unclippedView) ColorModel() color.Model     { return v.full.ColorModel() }
-func (v unclippedView) Bounds() image.Rectangle     { return v.r }
-func (v unclippedView) At(x, y int) color.Color     { return v.full.At(x, y) }
-func (v unclippedView) Set(x, y int, c color.Color) { v.full.Set(x, y, c) }
-
 // TestSubImageParallelWritesStayInBounds verifies EncodeParallel only touches
-// pixels inside the carrier's bounds, both for a real sub-image and for a view
-// that does not clip writes.
+// pixels inside the carrier's bounds. The cursor writes the shared Pix slice
+// directly, without the clipping (*image.RGBA).Set applies, so a cursor that
+// addressed pixels outside its sub-image would show up here as modified
+// pixels in the parent.
 func TestSubImageParallelWritesStayInBounds(t *testing.T) {
-	carriers := map[string]func(full *image.RGBA, r image.Rectangle) draw.Image{
-		"SubImage":  func(full *image.RGBA, r image.Rectangle) draw.Image { return full.SubImage(r).(*image.RGBA) },
-		"Unclipped": func(full *image.RGBA, r image.Rectangle) draw.Image { return unclippedView{full, r} },
-	}
-	for cname, mk := range carriers {
-		for _, tc := range subImageCases {
-			t.Run(cname+"/"+tc.name, func(t *testing.T) {
-				full := newNoisyImage(tc.fullW, tc.fullH)
-				before := make([]byte, len(full.Pix))
-				copy(before, full.Pix)
+	for _, tc := range subImageCases {
+		t.Run(tc.name, func(t *testing.T) {
+			full := newNoisyImage(tc.fullW, tc.fullH)
+			before := make([]byte, len(full.Pix))
+			copy(before, full.Pix)
 
-				sub := mk(full, tc.rect)
-				payload := subImagePayload(tc.payloadLen)
-				require.NoError(t, steg.EncodeParallel(sub, []byte("testpass"), bytes.NewReader(payload), tc.bitsPerChannel, tc.channels))
+			sub := full.SubImage(tc.rect).(*image.RGBA)
+			payload := subImagePayload(tc.payloadLen)
+			require.NoError(t, steg.EncodeParallel(sub, []byte("testpass"), bytes.NewReader(payload), tc.bitsPerChannel, tc.channels))
 
-				changedInside := false
-				for y := full.Bounds().Min.Y; y < full.Bounds().Max.Y; y++ {
-					for x := full.Bounds().Min.X; x < full.Bounds().Max.X; x++ {
-						off := full.PixOffset(x, y)
-						same := bytes.Equal(before[off:off+4], full.Pix[off:off+4])
-						if image.Pt(x, y).In(tc.rect) {
-							changedInside = changedInside || !same
-							continue
-						}
-						require.True(t, same, "pixel (%d,%d) outside sub-image bounds was modified", x, y)
+			changedInside := false
+			for y := full.Bounds().Min.Y; y < full.Bounds().Max.Y; y++ {
+				for x := full.Bounds().Min.X; x < full.Bounds().Max.X; x++ {
+					off := full.PixOffset(x, y)
+					same := bytes.Equal(before[off:off+4], full.Pix[off:off+4])
+					if image.Pt(x, y).In(tc.rect) {
+						changedInside = changedInside || !same
+						continue
 					}
+					require.True(t, same, "pixel (%d,%d) outside sub-image bounds was modified", x, y)
 				}
-				require.True(t, changedInside, "EncodeParallel modified no pixel inside the sub-image")
-			})
-		}
+			}
+			require.True(t, changedInside, "EncodeParallel modified no pixel inside the sub-image")
+		})
 	}
 }

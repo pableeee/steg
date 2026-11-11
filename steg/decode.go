@@ -11,7 +11,13 @@ import (
 	"github.com/pableeee/steg/steg/container"
 )
 
+// Decode extracts the payload Encode or EncodeParallel hid in m with the same
+// pass and settings. m must be an *image.RGBA or *image.NRGBA (see Encode);
+// other types and invalid settings are rejected.
 func Decode(m draw.Image, pass []byte, bitsPerChannel, channels int) ([]byte, error) {
+	if err := validateCarrier(m, bitsPerChannel, channels); err != nil {
+		return nil, err
+	}
 	// Read the plaintext salt from stream bits 0–127, derive the keys from it,
 	// and get the full pixel order.
 	keys, points, err := prepareDecode(m, pass, bitsPerChannel, channels)
@@ -19,7 +25,10 @@ func Decode(m draw.Image, pass []byte, bitsPerChannel, channels int) ([]byte, er
 		return nil, err
 	}
 
-	cur := cursors.NewRNGCursor(m, cursorOptions(points, bitsPerChannel, channels)...)
+	cur, err := cursors.NewRNGCursor(m, cursorOptions(points, bitsPerChannel, channels)...)
+	if err != nil {
+		return nil, err
+	}
 	payloadCipher, err := cipher.NewCipher(keys.nonce, keys.encKey)
 	if err != nil {
 		return nil, err
