@@ -223,6 +223,10 @@ Equivalent byte-level formulation: for stream byte `i ≥ 16`,
 stored[i] = data[i] XOR bitReverse8( KS(i div 16)[i mod 16] )
 ```
 
+The counter is a uint32, so the keystream covers 2³² blocks (64 GiB). Seeking
+past that returns an error rather than wrapping and reusing keystream; no
+carrier the format accepts gets close (section 10).
+
 ---
 
 ## 7. Stream layout and container framing
@@ -318,6 +322,12 @@ Default settings (`ch = 3`, `bpc = 1`):
 `steg capacity -i <image>` prints the 3 × 4 table of every channel / bits-per-
 channel combination.
 
+Valid settings are `bpc` in 1..8 and `ch` in 1..3. A carrier may have at most
+2³²−1 pixels (the order stores 4-byte pixel indices), and `total − 56 + 4`
+must fit the 32-bit container length field, so capacity is at most 4 GiB.
+`CapacityBytes` / `CapacityForDims` return 0 for anything outside these limits,
+and all four entry points reject such input before touching a pixel.
+
 ---
 
 ## 11. Encode and decode procedures
@@ -347,11 +357,18 @@ channel combination.
 `Encode` and `Decode` share `prepareEncode` / `prepareDecode` in
 `steg/steg.go` with the parallel paths, so all four obtain the identical order.
 
-Library callers may pass a `draw.Image` whose bounds do not start at (0,0);
-the cursor offsets every point by `Bounds().Min`. The cursor reads pixels with
-`At().RGBA()` and writes them back as `color.RGBA` built from the low byte of
-each 16-bit component, which is exact for 8-bit opaque images such as the
-`*image.RGBA` the CLI always uses.
+The carrier must be an `*image.RGBA` or `*image.NRGBA`; every other
+`draw.Image` is rejected (error wrapping `cursors.ErrUnsupportedImage`) before
+any pixel is touched, together with invalid settings (section 10). The cursor
+reads and writes the R, G and B bytes of the image's `Pix` slice directly, so
+values round-trip exactly with no color conversion; alpha is never touched, and
+an `*image.NRGBA` with translucent pixels works. Bounds need not start at
+(0,0): order index `i` is the pixel at `(i mod W, i div W)` relative to
+`Bounds().Min`, addressed through the image's stride, so sub-images work.
+
+For `*image.RGBA` this is bit-identical to the earlier implementation that went
+through `At().RGBA()` and `Set(color.RGBA{…})` (each 8-bit channel `c` reads as
+`c × 0x101`, whose low byte is `c`); `cursors/reference_test.go` checks it.
 
 ---
 
@@ -374,14 +391,14 @@ as `Encode` / `Decode`; the four are interchangeable.
   smallest `r ≥ 0` with `(160 + 8r) mod bpp = 0`; the first chunk is `r` bytes
   longer, which puts every later boundary on a pixel boundary. Without it two
   encode workers would read-modify-write the same pixel and one would silently
-  discard the other's bits. (A mutex around `At`/`Set` does not prevent that;
-  the whole load-modify-store sequence would have to be atomic.)
+  discard the other's bits. (A mutex around each pixel access would not
+  prevent that; the whole read-modify-write of a pixel would have to be
+  atomic.) With aligned chunks every worker owns whole pixels, so workers write
+  disjoint bytes of `Pix` and need no lock.
 * On encode the HMAC is computed over the whole padded block before dispatch.
   After all workers finish, a single sequential stack writes the length field
   (byte 16) and the tag (byte `20 + L`); both may share a pixel with a worker's
-  region, which is safe because no worker is running any more. Encode workers
-  share one mutex around `img.At` / `img.Set` to avoid data races on the
-  underlying pixel array.
+  region, which is safe because no worker is running any more.
 * On decode the length is read and bounded first (`L ≤ cap + 4`), then workers
   fill the buffer and the tag is verified over the assembled block.
 
@@ -400,13 +417,13 @@ as `Encode` / `Decode`; the four are interchangeable.
 │  prepareEncode/prepareDecode: public order → salt → Argon2id   │
 │  → encKey, macKey, nonce, orderKey → finished order            │
 └───────┬───────────────────────────────────────┬──────────────┘
-        │ []image.Point (order)                 │ encKey, nonce
+        │ []uint32 (order)                      │ encKey, nonce
 ┌───────▼─────────────────────┐   ┌─────────────▼──────────────┐
 │  cursors/order.go           │   │  cipher.NewCipher          │
 │  NewPixelOrder (public)     │   │  AES-128-CTR, bit-indexed, │
 │  FinishPixelOrder (keyed)   │   │  seekable                  │
 │  cursors.RNGCursor          │   │                            │
-│  bit↔pixel mapping, cache   │   │                            │
+│  bit↔pixel mapping on Pix   │   │                            │
 └───────┬─────────────────────┘   └─────────────┬──────────────┘
         │ Cursor                                │ StreamCipherBlock
 ┌───────▼───────────────────────────────────────▼──────────────┐
@@ -430,8 +447,8 @@ Notes on the layers:
 * `CipherMiddleware.Seek` seeks the cipher and the cursor to the same bit
   position, which is what makes the keystream index equal the stream bit
   position (section 6).
-* `RNGCursor` caches one pixel and writes it back once when the cursor leaves
-  it, so each pixel costs one `At` and one `Set` regardless of `bpp`.
+* `RNGCursor` reads and writes the carrier's `Pix` bytes directly; there is no
+  pixel cache and nothing to flush.
 
 ---
 
@@ -455,9 +472,15 @@ These are properties of the `steg` command, not of the format.
   `steg decode` uses, compares the result byte for byte with the payload, and
   only then renames it onto the output path. On any failure the temporary file
   is removed and an existing output file is left untouched.
+* `encode` requires `-i`, `-f` and `-o`; `decode` requires `-i` and `-o`. A
+  missing flag prints usage; runtime errors print only the error.
+* `encode` picks the output format from the extension (`.png`, `.bmp`,
+  `.tif`, `.tiff`, case-insensitive) and rejects any other extension before
+  doing anything else.
 * `decode` decodes fully before creating the output file, so a wrong password
-  leaves nothing behind.
-* Output format is chosen by extension: `.bmp`, `.tif`/`.tiff`, otherwise PNG.
+  leaves nothing behind. The payload is written to a temporary sibling with
+  mode `0600`, synced and renamed into place. An output path that is a
+  symlink, device or FIFO (e.g. `/dev/stdout`) is written through in place.
 
 ---
 
@@ -535,5 +558,6 @@ chunk without coordinating cipher state.
 | MAC-then-encrypt | Low | See section 15. |
 | No streaming decode | Medium | The full padded block (carrier capacity + 4 bytes) is held in memory. The length is bounded by capacity before allocation, so a wrong password cannot trigger an oversized allocation. |
 | Transparent carriers rejected (CLI) | Low | Carriers with any non-opaque pixel are refused; flatten them first. |
-| 8-bit pixels only | Low | The cursor writes `color.RGBA` built from the low byte of each component. The CLI converts every carrier to 8-bit RGBA, so a 16-bit input comes out as 8-bit; library callers passing a `draw.Image` with deeper components would get wrong pixels. |
+| 8-bit carriers only | Low | The library accepts only `*image.RGBA` and `*image.NRGBA` and rejects other types. The CLI converts every carrier to 8-bit RGBA, so a 16-bit or grayscale input comes out as 8-bit RGB. |
+| Size limits | Low | At most 2³²−1 pixels and 4 GiB of capacity per carrier (section 10). |
 | Lossy formats unsupported | High | JPEG and other lossy formats destroy LSB data. Only PNG, BMP and TIFF are supported. |

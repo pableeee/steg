@@ -41,7 +41,7 @@
 - **`test-visual` command** — generates carrier images filled to capacity at every encoding intensity for side-by-side visual comparison.
 - **`detect` command** — runs chi-square and RS steganalysis on any image and reports a per-channel verdict (`CLEAN` / `SUSPICIOUS` / `LIKELY_STEGO`).
 - **Multiple image formats** — PNG, BMP, and TIFF are supported as both input and output.
-- **Parallel mode** — a worker-pool implementation (`-P`) spreads encode/decode across all available CPUs. Parallel decode is up to ~3.4× faster on large images; parallel encode is currently slower than sequential (see [Performance](#performance)).
+- **Parallel mode** — a worker-pool implementation (`-P`) spreads encode/decode across all available CPUs; on large images it is about 2.5–3.7× faster than the sequential path (see [Performance](#performance)).
 - **Interoperable modes** — images encoded with the sequential path can be decoded with the parallel path and vice versa.
 
 ---
@@ -116,9 +116,9 @@ steg encode -i carrier.png -f secret.txt -o output.png -p "my passphrase"
 
 | Flag | Short | Default | Description |
 |---|---|---|---|
-| `--input_image` | `-i` | — | Carrier image (PNG, BMP, or TIFF) |
-| `--input_file` | `-f` | — | File to hide |
-| `--output_image` | `-o` | — | Output image containing the hidden data |
+| `--input_image` | `-i` | required | Carrier image (PNG, BMP, or TIFF) |
+| `--input_file` | `-f` | required | File to hide |
+| `--output_image` | `-o` | required | Output image; the extension picks the format and must be `.png`, `.bmp`, `.tif` or `.tiff` |
 | `--password` | `-p` | prompt | Passphrase; see [Supplying the password](#supplying-the-password) |
 | `--bits-per-channel` | `-b` | `1` | Number of LSBs to use per color channel (1–8) |
 | `--channels` | `-c` | `3` | Color channels to use: 1=R, 2=R+G, 3=R+G+B |
@@ -126,14 +126,15 @@ steg encode -i carrier.png -f secret.txt -o output.png -p "my passphrase"
 
 What `encode` does, in order:
 
-1. **Checks the carrier.** The carrier is loaded and rejected if any pixel is not fully opaque, whatever the output format:
+1. **Checks the output extension.** Anything other than `.png`, `.bmp`, `.tif` or `.tiff` (case-insensitive) is rejected before any other work; a lossy format such as JPEG would destroy the hidden bits.
+2. **Checks the carrier.** The carrier is loaded and rejected if any pixel is not fully opaque, whatever the output format:
    ```
    Error: carrier image transparent.png has transparency (non-opaque pixels); hidden data cannot be stored reliably in transparent pixels. Remove the alpha channel first (flatten the image onto an opaque background)
    ```
    Flatten the image onto an opaque background in an image editor (or remove its alpha channel) and try again.
-2. **Reads the payload file.** Both checks happen before the password prompt, so an unusable carrier or a missing file fails before you type anything.
-3. **Asks for the password** (with confirmation) if it was not supplied another way.
-4. **Embeds, then verifies.** A payload larger than the carrier's capacity is rejected here. The result is written to a temporary file next to the output, decoded through the same code path `steg decode` uses, and compared byte for byte with the payload. Only if they match is the temporary file renamed onto the output path. On any failure nothing is written, and an existing file at the output path is left untouched.
+3. **Reads the payload file.** These checks happen before the password prompt, so an unusable carrier or a missing file fails before you type anything.
+4. **Asks for the password** (with confirmation) if it was not supplied another way.
+5. **Embeds, then verifies.** A payload larger than the carrier's capacity is rejected here. The result is written to a temporary file next to the output, decoded through the same code path `steg decode` uses, and compared byte for byte with the payload. Only if they match is the temporary file renamed onto the output path. On any failure nothing is written, and an existing file at the output path is left untouched.
 
 ### Decode
 
@@ -145,14 +146,16 @@ steg decode -i output.png -o recovered.txt -p "my passphrase"
 
 | Flag | Short | Default | Description |
 |---|---|---|---|
-| `--input_image` | `-i` | — | Image containing the hidden data |
-| `--output_file` | `-o` | — | Path for the recovered file |
+| `--input_image` | `-i` | required | Image containing the hidden data |
+| `--output_file` | `-o` | required | Path for the recovered file |
 | `--password` | `-p` | prompt | Passphrase; see [Supplying the password](#supplying-the-password) |
 | `--bits-per-channel` | `-b` | `1` | Must match the value used during encode |
 | `--channels` | `-c` | `3` | Must match the value used during encode |
 | `--parallel` | `-P` | off | Use parallel worker pool (faster on large images) |
 
-The output file is created only after the payload has been decoded and authenticated, so a wrong password leaves nothing behind.
+The output file is created only after the payload has been decoded and authenticated, so a wrong password leaves nothing behind and an existing file at that path is left untouched. The recovered file is written to a temporary file with mode `0600` (owner read/write only, subject to your umask) and renamed into place, so it is never left half-written and never world-readable; an existing file it replaces also ends up `0600`. If the output path is a symlink, device or FIFO (for example `-o /dev/stdout`), the data is written through it in place instead.
+
+A missing required flag prints the command's usage; any other error (wrong password, unreadable file) prints only the error.
 
 ### Capacity
 
@@ -195,18 +198,18 @@ steg detect -i image.png
 |---|---|---|
 | `--input_image` | `-i` | Image to analyse (PNG, BMP, TIFF) |
 
-Example output for a 1024×1536 photograph after a default encode (3 channels, 1 bit/channel) of a 33-byte text file:
+Example output for a 1024×1536 photograph after a default encode (3 channels, 1 bit/channel) of a 31-byte text file:
 
 ```
-Chi-square analysis (high p-value = suspicious):
-  R: χ²=118.18      p=0.7003  [SUSPICIOUS]
-  G: χ²=110.55      p=0.8505  [SUSPICIOUS]
-  B: χ²=124.63      p=0.5430  [SUSPICIOUS]
+Chi-square analysis (p-value > 0.05 = suspicious):
+  R: χ²=143.06      df=127  p=0.1563  [SUSPICIOUS]
+  G: χ²=114.34      df=115  p=0.4997  [SUSPICIOUS]
+  B: χ²=66.95       df=80   p=0.8509  [SUSPICIOUS]
 
 RS analysis (asymmetry < -0.02 = suspicious):
-  R: Rm=0.4988  Sm=0.5012  R-m=0.5442  S-m=0.4558  asymmetry=-0.0454  [SUSPICIOUS]
-  G: Rm=0.5004  Sm=0.4996  R-m=0.5414  S-m=0.4586  asymmetry=-0.0410  [SUSPICIOUS]
-  B: Rm=0.4998  Sm=0.5002  R-m=0.5433  S-m=0.4567  asymmetry=-0.0435  [SUSPICIOUS]
+  R: Rm=0.4996  Sm=0.5004  R-m=0.5435  S-m=0.4565  asymmetry=-0.0439  [SUSPICIOUS]
+  G: Rm=0.4999  Sm=0.5001  R-m=0.5420  S-m=0.4580  asymmetry=-0.0421  [SUSPICIOUS]
+  B: Rm=0.4991  Sm=0.5009  R-m=0.5443  S-m=0.4557  asymmetry=-0.0452  [SUSPICIOUS]
 
 Verdict: LIKELY_STEGO
 ```
@@ -214,10 +217,10 @@ Verdict: LIKELY_STEGO
 The same photograph before encoding:
 
 ```
-Chi-square analysis (high p-value = suspicious):
-  R: χ²=454.94      p=0.0000  [CLEAN]
-  G: χ²=1583.51     p=0.0000  [CLEAN]
-  B: χ²=2274.04     p=0.0000  [CLEAN]
+Chi-square analysis (p-value > 0.05 = suspicious):
+  R: χ²=454.94      df=127  p=0.0000  [CLEAN]
+  G: χ²=1583.51     df=115  p=0.0000  [CLEAN]
+  B: χ²=2274.04     df=80   p=0.0000  [CLEAN]
 
 RS analysis (asymmetry < -0.02 = suspicious):
   R: Rm=0.5196  Sm=0.4804  R-m=0.5241  S-m=0.4759  asymmetry=-0.0045  [CLEAN]
@@ -288,12 +291,12 @@ Benchmarks run on an AMD Ryzen 9 9950X3D (32 logical cores, Go 1.25, `GOMAXPROCS
 
 | Image | Payload | Encode seq | Encode par | Decode seq | Decode par |
 |---|---|---|---|---|---|
-| 100 × 100 | 1 KB | 17.6 ms | 17.2 ms | 16.8 ms | 16.9 ms |
-| 500 × 500 | 50 KB | 32.9 ms | 50.5 ms | 28.0 ms | 21.9 ms |
-| 2000 × 2000 | 500 KB | 407 ms | 889 ms | 248 ms | 103 ms |
-| 3840 × 2160 (4K) | 2 MB | 954 ms | 1955 ms | 773 ms | 228 ms |
+| 100 × 100 | 1 KB | 16.6 ms | 16.7 ms | 16.7 ms | 16.6 ms |
+| 500 × 500 | 50 KB | 24.3 ms | 20.0 ms | 22.9 ms | 19.3 ms |
+| 2000 × 2000 | 500 KB | 162 ms | 65 ms | 147 ms | 55 ms |
+| 3840 × 2160 (4K) | 2 MB | 495 ms | 143 ms | 454 ms | 122 ms |
 
-Parallel decode scales well. Parallel encode is currently about twice as slow as sequential on large images, and gets slower as workers are added; the likely cause is that encode workers share one mutex around every pixel read and write (decode workers do not). Use `-P` for decode; for encode it does not help today.
+Both directions scale with `-P` on large images. What remains serial is Argon2id and the Fisher-Yates shuffle that builds the pixel order (about 90 ms at 4K); both are fixed by the format. The cursor reads and writes the image's pixel bytes directly, and parallel workers own disjoint, pixel-aligned ranges of the order, so they need no lock.
 
 Run the benchmarks yourself:
 
@@ -379,7 +382,7 @@ Both the sequential and the parallel paths get the order from `prepareEncode` / 
 │  order.go         │   │  cipher.NewCipher       │
 │  ChaCha8 shuffle  │   │  AES-128-CTR, seekable  │
 │  RNGCursor        │   │  bit/byte-level XOR     │
-│  pixel cache      │   │                         │
+│  direct Pix I/O   │   │                         │
 └──────┬────────────┘   └───────────┬─────────────┘
        │ Cursor                     │ StreamCipherBlock
 ┌──────▼────────────────────────────▼─────────────┐
@@ -401,9 +404,9 @@ Both the sequential and the parallel paths get the order from `prepareEncode` / 
 | Package | Responsibility |
 |---|---|
 | `cmd/steg` | Cobra CLI; PNG/BMP/TIFF file I/O; transparency check; verify-after-write; `encode`, `decode`, `capacity`, `test-visual`, and `detect` subcommands |
-| `steg` | Encode/decode orchestration; salt handling and Argon2id key derivation (`prepareEncode` / `prepareDecode`); capacity; parallel worker pool |
+| `steg` | Encode/decode orchestration; carrier and settings validation; salt handling and Argon2id key derivation (`prepareEncode` / `prepareDecode`); capacity; parallel worker pool |
 | `steg/container` | Payload framing (length prefix + HMAC tag); constant-time tag verification |
-| `cursors` | `order.go` (pixel order: public ChaCha8 prefix for the salt, keyed suffix — format-defining), `RNGCursor` (bit↔pixel mapping over a given order, write-back pixel cache), `CursorAdapter` (byte↔bit bridge), `CipherMiddleware` (transparent encrypt/decrypt) |
+| `cursors` | `order.go` (pixel order: public ChaCha8 prefix for the salt, keyed suffix — format-defining), `RNGCursor` (bit↔pixel mapping over a given order; reads and writes the `Pix` bytes of `*image.RGBA` / `*image.NRGBA` directly), `CursorAdapter` (byte↔bit bridge), `CipherMiddleware` (transparent encrypt/decrypt) |
 | `cipher` | AES-128 CTR stream cipher; bit- and byte-addressable keystream; seekable |
 | `steg/analysis` | Chi-square and RS steganalysis detectors; `Analyze()` returns a combined verdict |
 | `mocks` | Auto-generated gomock mocks for `Cursor` and `StreamCipherBlock` interfaces |
@@ -492,6 +495,8 @@ Two GitHub Actions workflows:
 | No streaming decode | Medium | `ReadPayload` allocates the full payload in memory before returning. Very large payloads may cause high memory usage. The declared length is clamped to the carrier's capacity first, so a wrong password cannot trigger an oversized allocation. |
 | Lossy formats unsupported | High | JPEG and other lossy formats destroy LSB data. Only lossless formats (PNG, BMP, TIFF) are supported. |
 | Transparent carriers rejected | Low | `encode` and `test-visual` refuse a carrier with any non-opaque pixel, for every output format: PNG and BMP store straight alpha, so saving would destroy bits hidden in translucent pixels. Flatten the image onto an opaque background first. |
+| Library carriers: `*image.RGBA` / `*image.NRGBA` only | Low | `steg.Encode`, `Decode`, `EncodeParallel` and `DecodeParallel` reject every other `draw.Image` type (error wraps `cursors.ErrUnsupportedImage`) before touching a pixel, because color conversion (premultiplication, luma, 16-bit truncation) would destroy the hidden bits. Convert first with `draw.Draw` into an `*image.RGBA`. An `*image.NRGBA` with translucent pixels round-trips in memory; the CLI's transparency rule is about saving to files. The CLI converts every input itself. |
+| Size limits | Low | At most 2³²−1 pixels per carrier (the pixel order uses 4-byte indices), and at most 4 GiB of capacity (the container length field is 32 bits). Invalid settings (bits per channel outside 1–8, channels outside 1–3) are rejected by the library as well as the CLI. |
 | Images from earlier builds | Low | The pixel order changed and there is no format version field; an older image fails to decode exactly as with a wrong password. Decode it with the binary that created it. |
 | Statistical steganalysis | Medium | Modifying the LSBs of color channels across a pseudorandom pixel set produces a detectable statistical signature. The built-in `detect` command uses chi-square and RS analysis to surface this. Because the encoder always fills the carrier, both chi-square and RS analysis flag every channel written to on a natural photograph. RS analysis is less reliable on small images. Higher bits-per-channel settings make signatures more pronounced. |
 
@@ -503,9 +508,9 @@ The `detect` command runs two complementary statistical tests against the image'
 
 ### Chi-square test
 
-Compares the histogram of pixel value pairs `(2k, 2k+1)` per channel. In a natural image these pairs are unequal; LSB embedding equalises them. A high p-value (> 0.05) for a channel is flagged as suspicious.
+Compares the histogram of pixel value pairs `(2k, 2k+1)` per channel. In a natural image these pairs are unequal; LSB embedding equalises them. Only pairs that occur in the image count: the degrees of freedom are the number of occupied pairs minus one (shown as `df`), and the p-value is the exact chi-square upper tail. A high p-value (> 0.05) for a channel is flagged as suspicious. A channel with fewer than two occupied pairs is reported as `too few distinct values to test` and not flagged.
 
-**Performance:** correctly identifies which channels were written to. On a real photo encoded at full capacity with R+G+B, all three channels are flagged; untouched channels remain at p ≈ 0.0000.
+**Performance:** correctly identifies which channels were written to; untouched channels stay at p ≈ 0.0000. On a channel fully overwritten with random bits the p-value is roughly uniform between 0 and 1, so each written channel falls below 0.05 about 5% of the time by chance. A full-capacity R+G+B encode therefore reads `LIKELY_STEGO` most of the time (about 86% in our estimate) and `SUSPICIOUS` otherwise; RS analysis does not have this variance.
 
 ### RS analysis
 
