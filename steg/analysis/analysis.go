@@ -8,22 +8,28 @@ package analysis
 import "image"
 
 // ChiSquareResult holds the per-channel result of the chi-square test.
-// A high PValue (> 0.05) means the LSB distribution is suspiciously uniform.
+// A PValue above ChiSquareSuspiciousP means the LSB distribution is
+// suspiciously uniform.
+//
+// DF is the number of (2k, 2k+1) value pairs present in the channel minus one.
+// When DF < 1 the channel has too few distinct values to test: PValue is 0 and
+// Suspicious is false.
 type ChiSquareResult struct {
 	Channel    string
 	ChiSq      float64
+	DF         int
 	PValue     float64 // high = suspicious
 	Suspicious bool
 }
 
 // RSResult holds the per-channel result of the RS analysis.
 // Asymmetry = Rm - Rnm. It is near zero for a clean photograph and turns
-// negative under LSB embedding; values below -0.02 are flagged.
+// negative under LSB embedding; values below RSSuspiciousAsymmetry are flagged.
 type RSResult struct {
 	Channel    string
 	Rm, Sm     float64 // regular/singular fractions under positive mask
 	Rnm, Snm   float64 // regular/singular fractions under negative mask
-	Asymmetry  float64 // Rm - Rnm; < -0.02 = suspicious
+	Asymmetry  float64 // Rm - Rnm; < RSSuspiciousAsymmetry = suspicious
 	Suspicious bool
 }
 

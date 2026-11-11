@@ -151,6 +151,50 @@ func TestChiSquareDetectionLimits(t *testing.T) {
 	}
 }
 
+// tenLevelImage returns a w×h image whose channels each take only 10 distinct
+// values, every one in a different (2k, 2k+1) pair, like a posterised or
+// palette image.
+func tenLevelImage(w, h int) *image.RGBA {
+	rng := rand.New(rand.NewSource(3))
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	for i := 0; i < len(img.Pix); i += 4 {
+		for c := range 3 {
+			img.Pix[i+c] = uint8(10 + 24*rng.Intn(10)) // 10, 34, ..., 226: all even
+		}
+		img.Pix[i+3] = 255
+	}
+	return img
+}
+
+// TestChiSquareFewLevels checks that the degrees of freedom follow the number
+// of occupied pairs. With df fixed at 127, the stego image's χ² (around 9 for
+// 10 pairs) gave p = 1.0000 regardless of the data.
+func TestChiSquareFewLevels(t *testing.T) {
+	src := tenLevelImage(300, 300)
+	for _, r := range analysis.ChiSquare(src) {
+		assert.Equal(t, 9, r.DF, "channel %s", r.Channel)
+		assert.False(t, r.Suspicious, "clean channel %s (p=%.4f)", r.Channel, r.PValue)
+	}
+	for _, r := range analysis.ChiSquare(randomizeLSBs(src, 1)) {
+		assert.Equal(t, 9, r.DF, "channel %s", r.Channel)
+		assert.Less(t, r.PValue, 0.9999,
+			"channel %s: χ²=%.2f should not be reported as p≈1", r.Channel, r.ChiSq)
+		t.Logf("stego %s: χ²=%.2f df=%d p=%.4f", r.Channel, r.ChiSq, r.DF, r.PValue)
+	}
+}
+
+// TestChiSquareSingleLevel: a flat image occupies one pair per channel, which
+// leaves no degrees of freedom. It must not be flagged, and must not be NaN.
+func TestChiSquareSingleLevel(t *testing.T) {
+	img := image.NewRGBA(image.Rect(0, 0, 64, 64))
+	draw.Draw(img, img.Bounds(), &image.Uniform{color.RGBA{R: 7, G: 128, B: 255, A: 255}}, image.Point{}, draw.Src)
+	for _, r := range analysis.ChiSquare(img) {
+		assert.Equal(t, 0, r.DF, "channel %s", r.Channel)
+		assert.False(t, math.IsNaN(r.PValue), "channel %s", r.Channel)
+		assert.False(t, r.Suspicious, "channel %s", r.Channel)
+	}
+}
+
 // ── RS analysis tests ─────────────────────────────────────────────────────────
 
 func TestRSClean(t *testing.T) {
