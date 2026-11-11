@@ -1,8 +1,13 @@
 // Package analysis implements statistical steganalysis detectors for LSB
-// steganography. It provides two complementary tests:
+// steganography. It provides three detectors:
 //
 //   - Chi-square: detects global LSB histogram uniformity caused by embedding.
 //   - RS analysis: detects local pixel smoothness asymmetry caused by embedding.
+//   - SPAM + FLD ensemble (spam.go, ensemble.go): a trained detector that
+//     also sees LSB matching (±1), which the two tests above cannot.
+//
+// Analyze (used by steg detect) runs only the first two; the ensemble must be
+// trained on cover and stego features first (see cmd/stegbench).
 package analysis
 
 import "image"
