@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 )
 
 // StreamCipherBlock represents a block cipher in stream mode that supports
@@ -82,8 +83,26 @@ func (s *streamCipherImpl) refreshCipherBlock() {
 	payload := append(nonceBytes, counterBytes...)
 	s.currentBlock = make([]byte, s.blockSize)
 	s.block.Encrypt(s.currentBlock, payload)
-	s.minIndex = int64(s.blockSize * s.counter * 8)
-	s.maxIndex = int64((s.counter + 1) * s.blockSize * 8)
+	// Compute the bit range in int64: in uint32, counter*blockSize*8 overflows
+	// once the stream passes bit 2^32 (byte offset 512 MiB), after which the
+	// cached-block check in processBit always misses and every bit re-runs AES.
+	blockBits := int64(s.blockSize) * 8
+	s.minIndex = int64(s.counter) * blockBits
+	s.maxIndex = (int64(s.counter) + 1) * blockBits
+}
+
+// setCounterFor points the counter at the block holding stream bit n and
+// regenerates the keystream block. The counter is 32 bits wide, so the stream
+// ends after 2^32 blocks (64 GiB); past that the counter would wrap and reuse
+// keystream, so it is an error instead.
+func (s *streamCipherImpl) setCounterFor(n int64) error {
+	blk := n / (int64(s.blockSize) * 8)
+	if blk > math.MaxUint32 {
+		return fmt.Errorf("cipher: stream position %d exceeds the keystream length", n)
+	}
+	s.counter = uint32(blk)
+	s.refreshCipherBlock()
+	return nil
 }
 
 // Seek sets the current position for the next encryption/decryption operation.
@@ -106,9 +125,10 @@ func (s *streamCipherImpl) Seek(n int64, whence int) (int64, error) {
 		return 0, fmt.Errorf("not implemented")
 	}
 
-	if n > s.maxIndex || n < s.minIndex {
-		s.counter = uint32(n / int64(s.blockSize*8))
-		s.refreshCipherBlock()
+	if n >= s.maxIndex || n < s.minIndex {
+		if err := s.setCounterFor(n); err != nil {
+			return s.index, err
+		}
 	}
 	s.index = n
 
@@ -136,8 +156,9 @@ func (s *streamCipherImpl) DecryptByte(b uint8) (uint8, error) {
 // processBit processes a single bit for encryption or decryption.
 func (s *streamCipherImpl) processBit(bichi uint8) (uint8, error) {
 	if s.index >= s.maxIndex || s.index < s.minIndex {
-		s.counter = uint32(s.index / int64(s.blockSize*8))
-		s.refreshCipherBlock()
+		if err := s.setCounterFor(s.index); err != nil {
+			return 0, err
+		}
 	}
 
 	idx := (s.index / 8) % int64(s.blockSize)
