@@ -24,3 +24,4 @@ go.work
 /cmd/steg/steg
 test/*
 *.png
+/stegbench
