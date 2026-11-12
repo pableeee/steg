@@ -145,7 +145,7 @@ type toolPlan struct {
 
 // planTool picks the payload size whose padded block gives the embedding rate
 // closest to rate. Bounded padding makes the block a power-of-two bucket of
-// at least 4096 bytes, or the whole capacity (CapacityBytes + 4) when the
+// at least steg.MinPaddedBlock bytes, or the whole capacity (CapacityBytes + 4) when the
 // bucket would not fit; so only those block sizes are reachable, and the
 // payload chosen for a bucket B is B − 4 bytes, for the full capacity
 // CapacityBytes. Ties go to the smaller block.
@@ -161,7 +161,7 @@ func planTool(w, h int, rate float64) (toolPlan, error) {
 	// current best, so ties keep the smaller block.
 	full := capacity + 4
 	var cands []toolPlan
-	for b := 4096; b < full; b <<= 1 {
+	for b := steg.MinPaddedBlock; b < full; b <<= 1 {
 		cands = append(cands, toolPlan{payloadLen: b - 4, block: b, effRate: eff(b)})
 	}
 	cands = append(cands, toolPlan{payloadLen: capacity, block: full, effRate: eff(full)})

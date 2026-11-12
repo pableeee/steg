@@ -212,31 +212,39 @@ func CapacityForDims(w, h, bitsPerChannel, channels int) int {
 	return total - Overhead
 }
 
-// minPaddedBlock is the smallest padded block the encoder writes when the
-// carrier can hold more: every payload of up to minPaddedBlock-4 bytes looks
+// MinPaddedBlock is the smallest padded block the encoder writes when the
+// carrier can hold more: every payload of up to MinPaddedBlock-4 bytes looks
 // the same.
-const minPaddedBlock = 4096
+//
+// It is small on purpose. Detectability is driven by the embedding rate, and
+// a floor is paid by every short message: measured with cmd/stegbench on
+// BOSSbase (512×512, one channel, SPAM + FLD ensemble), a 4096-byte floor
+// (0.127 bpp) is detected with P_E ≈ 0.15, 256 bytes with 0.39 and 64 bytes
+// with 0.45. Below 64 the 52 bytes of salt, length and tag dominate the stream
+// and a smaller floor buys almost nothing (0.46 at 32). The price is that
+// payload sizes are distinguishable in finer steps below 4 KiB.
+const MinPaddedBlock = 64
 
 // paddedSize returns the length of the padded block (the 4-byte real-length
 // prefix, the payload and the random padding) that the encoder writes for a
 // realLen-byte payload into a carrier of the given capacity (CapacityBytes).
 //
-// The block is rounded up to a power-of-two bucket of at least minPaddedBlock
-// bytes: max(4096, nextPowerOfTwo(4 + realLen)). If that bucket does not fit
-// the carrier, the block is capacity + 4 bytes, i.e. the carrier is filled
-// completely, as for payloads near capacity or carriers whose capacity + 4 is
-// below 4096. Only the stream prefix up to the end of the tag is written; every
-// pixel past it keeps its original value.
+// The block is rounded up to a power-of-two bucket of at least MinPaddedBlock
+// bytes: max(MinPaddedBlock, nextPowerOfTwo(4 + realLen)). If that bucket does
+// not fit the carrier, the block is capacity + 4 bytes, i.e. the carrier is
+// filled completely, as for payloads near capacity or carriers whose
+// capacity + 4 is below MinPaddedBlock. Only the stream prefix up to the end
+// of the tag is written; every pixel past it keeps its original value.
 //
 // The bucket leaks only the order of magnitude of the payload size, through the
 // (encrypted) container length and through the embedding rate a steganalyst
-// could estimate. Above the 4 KiB floor it costs at most twice the bits an
-// unpadded payload would change; below it, small payloads all write 4 KiB.
-// The caller must have checked realLen <= capacity.
+// could estimate. Above the floor it costs at most twice the bits an unpadded
+// payload would change; payloads of up to MinPaddedBlock-4 bytes all write
+// MinPaddedBlock. The caller must have checked realLen <= capacity.
 func paddedSize(realLen, capacity int) int {
 	full := int64(capacity) + 4
 	need := int64(realLen) + 4
-	bucket := int64(minPaddedBlock)
+	bucket := int64(MinPaddedBlock)
 	for bucket < need && bucket < full {
 		bucket <<= 1
 	}

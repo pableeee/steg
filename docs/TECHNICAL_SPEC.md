@@ -50,7 +50,7 @@ embedded data is a single **bit stream**:
 ```
 
 The payload is followed by random padding up to a power-of-two bucket of at
-least 4 KiB, or up to the full capacity of the carrier when that bucket does
+least 64 bytes, or up to the full capacity of the carrier when that bucket does
 not fit (section 8). Only the stream prefix up to the end of the tag is
 written; every pixel after it in the order keeps its original value. At 1 bit
 per channel the encoder embeds by LSB matching (±1), at 2–8 bits by
@@ -308,7 +308,7 @@ A decoder accepts any `L ≤ cap + 4`; it does not require `L = cap + 4`.
 
 ## 8. Padding
 
-**File:** `steg/steg.go` (`paddedSize`, `minPaddedBlock`, `buildPaddedPayload`,
+**File:** `steg/steg.go` (`paddedSize`, `MinPaddedBlock`, `buildPaddedPayload`,
 `extractRealPayload`)
 
 ```
@@ -316,14 +316,14 @@ paddedBlock = LE32(R) ‖ payload ‖ crypto/rand bytes      // length paddedSiz
 ```
 
 The block length is the smallest power of two that is at least `4 + R` and at
-least `minPaddedBlock = 4096`, unless that bucket exceeds `cap + 4`, in which
+least `MinPaddedBlock = 64`, unless that bucket exceeds `cap + 4`, in which
 case it is `cap + 4` (the carrier is filled completely). As implemented:
 
 ```
 paddedSize(R, cap):
     full   = cap + 4
     need   = R + 4
-    bucket = 4096
+    bucket = MinPaddedBlock          // 64
     while bucket < need and bucket < full:
         bucket = bucket × 2
     if bucket > full: return full
@@ -334,13 +334,16 @@ Examples:
 
 | `R` (bytes) | `4 + R` | `L` (with `cap + 4 ≥ L`) |
 |---|---|---|
-| 0 … 4092 | ≤ 4096 | 4096 |
+| 0 … 60 | ≤ 64 | 64 |
+| 61 … 124 | 65 … 128 | 128 |
+| 125 | 129 | 256 |
+| 4092 | 4096 | 4096 |
 | 4093 | 4097 | 8192 |
 | 8188 | 8192 | 8192 |
 | 8189 | 8193 | 16384 |
 
 If the bucket does not fit, `L = cap + 4`: for example any payload on a
-carrier with `cap + 4 < 4096` (such as 100 × 100 at the defaults, `cap = 3694`),
+carrier with `cap + 4 < 64` (such as 16 × 16 at the defaults, `cap = 40`),
 or a 600,000-byte payload when `cap + 4` lies between 600,004 and 1,048,575.
 A bucket exactly equal to `cap + 4` is the same thing. Since `R ≤ cap`, the
 result always satisfies `4 + R ≤ L ≤ cap + 4`.
@@ -352,7 +355,9 @@ everything else, so on the image it is indistinguishable from payload.
 The bucket is an encoder choice, not part of the format: the decoder accepts
 any `L` with `4 + R ≤ L ≤ cap + 4` (section 7). Images written by the previous
 encoder, which always used `L = cap + 4`, decode unchanged, and that encoder's
-decoder reads bucketed images.
+decoder reads bucketed images. The same holds for the floor: builds with the
+earlier `minPaddedBlock = 4096` and builds with `MinPaddedBlock = 64` decode
+each other's images.
 
 ---
 
@@ -466,9 +471,10 @@ as `Encode` / `Decode`; the four are interchangeable.
   starting at stream byte 20. Each chunk is `alignment × 1024` bytes, where
   `alignment = lcm(8, bpp) / 8` bytes, so every chunk spans a whole number of
   pixels. The padded block is usually a bucket far smaller than the carrier
-  (section 8) and may fit in one chunk: a 4 KiB block does whenever
-  `alignment ≥ 4` (at the defaults, `alignment = 3`, it takes two jobs), and so
-  does the full-fill block of a small carrier. The dispatch loop then sends a
+  (section 8) and often fits in one chunk: any block of up to 1 KiB does,
+  including the 64-byte floor; a 4 KiB block does whenever `alignment ≥ 4`
+  (at the defaults, `alignment = 3`, it takes two jobs); and so does the
+  full-fill block of a small carrier. The dispatch loop then sends a
   single job clipped to the block.
 * Every encode worker, and the sequential stack that writes the length and
   tag, creates its own cursor with LSB matching at `bpc = 1` (section 3.1),
@@ -618,16 +624,44 @@ releases, so the shuffle uses its own rejection-sampling draw.
 Earlier builds padded every payload to the whole carrier, which hid the payload
 size completely (a 1-byte and a 500 KB payload produced the same disturbance)
 but made the disturbance always maximal: a 31-byte text changed 87.5% of the
-pixels of a 1024×1536 photo. Padding to a power-of-two bucket of at least
-4 KiB keeps most of the size-hiding and changes 0.62% of the pixels for the
-same payload. Above the 4 KiB floor the bucket is less than twice the length
-an unpadded block would need; below it, the floor makes every payload up to
-4,092 bytes look the same, at the cost of writing 4 KiB even for one byte.
+pixels of a 1024×1536 photo. Padding to a power-of-two bucket keeps part of
+the size-hiding: above the floor the bucket is less than twice the length an
+unpadded block would need, and below it every payload looks the same.
+
+The floor is `MinPaddedBlock = 64` bytes. A first version used 4096, which
+made every payload up to 4,092 bytes look alike but wrote 4 KiB even for one
+byte: a 31-byte text changed 0.62% of the pixels of that photo. With the
+64-byte floor it changes 260 pixels (0.0165%), and a 1,000-byte payload, now
+in the 1024 bucket, 0.16% instead of 0.62%. Detectability is driven by the
+embedding rate, and every short message pays the floor. The stream is 52
+bytes of framing (salt, length, tag) plus the block, so below 64 the framing
+dominates and a smaller floor buys almost nothing. Measured with
+`cmd/stegbench` (LSB-matching simulation, all 10,000 BOSSbase images, 512×512,
+one channel, SPAM + FLD ensemble, 5 splits) at the rate each candidate floor
+gives for a minimal message:
+
+| Floor (bytes) | Rate (bpp) | P_E |
+|---|---|---|
+| 16 | 0.0021 | 0.4716 ± 0.0014 |
+| 32 | 0.0026 | 0.4643 ± 0.0012 |
+| 64 | 0.0035 | 0.4507 ± 0.0015 |
+| 128 | 0.0055 | 0.4278 ± 0.0031 |
+| 256 | 0.0094 | 0.3894 ± 0.0045 |
+| 512 | 0.0172 | 0.3333 ± 0.0035 |
+| 1024 | 0.0328 | 0.2680 ± 0.0040 |
+| 2048 | 0.0641 | 0.1997 ± 0.0052 |
+| 4096 | 0.1266 | ≈ 0.15 (0.1500 ± 0.0063 on 2,000 images) |
+
+The real encoder agrees with the simulation (2,000 images: 0.4597 vs 0.4603
+at the 64-byte block, 0.3952 vs 0.3989 at 256, 0.1488 vs 0.1500 at 4096).
+Changing the floor is an encoder choice; the format did not change.
 
 The trade-off is a size leak. The bucket hides the payload size only to within
-a factor of two. `L` itself is encrypted, so reading it needs the password,
-but the number of changed values is roughly proportional to `L`, so a
-steganalyst who can estimate the embedding rate (or who has the original
+a factor of two, and with the 64-byte floor that holds down to small sizes:
+below 4 KiB payloads fall into buckets of 64, 128, 256, … bytes instead of
+all sharing one 4 KiB block. `L` itself is encrypted, so reading it needs
+the password, but the number of changed values is roughly proportional to
+`L`, so a steganalyst who can estimate the embedding rate (or who has the original
 carrier) learns roughly which bucket was used. A payload that falls back to
 full fill hides its size as completely as before.
 
@@ -673,7 +707,7 @@ chunk without coordinating cipher state.
 | Issue | Severity | Notes |
 |---|---|---|
 | Statistical steganalysis | Medium | At `bpc = 1` LSB matching defeats chi-square and RS analysis (`steg detect` reads `CLEAN` even at full capacity on a natural photo). It does not make the image undetectable: modern detectors (characteristic-function attacks, SRM-type rich models with a trained classifier) detect LSB matching at high embedding rates, especially in smooth regions. At `bpc ≥ 2` the encoder uses replacement, which chi-square and RS flag at high embedding rates. RS is noisier on small images (below roughly 512×512). |
-| Payload size bucketed, not hidden | Low | `L` reveals the payload size to within a factor of two (section 8). It is encrypted, but the embedding rate, which an analyst can estimate, grows with it. Full-fill payloads hide their size completely. |
+| Payload size bucketed, not hidden | Low | `L` reveals the payload size to within a factor of two (section 8), from the 64-byte floor up: below 4 KiB the buckets are 64, 128, 256, … rather than one 4 KiB block as in earlier builds. It is encrypted, but the embedding rate, which an analyst can estimate, grows with it; at these small rates that estimate is hard to make. Full-fill payloads hide their size completely. |
 | Secret order ineffective at full fill | Info | When `L = cap + 4` every pixel carries data, so the keyed order hides nothing about where the data is. With a smaller bucket it selects which pixels are touched. |
 | Output not reproducible | Info | The salt and the LSB-matching directions come from `crypto/rand`, so the same input encodes to a different image each time. |
 | Public salt positions | Info | By design: the salt pixels are computable from the image size and settings, and the salt is plaintext. Anyone can read it; it does not help guess the password. |
