@@ -25,11 +25,13 @@ func TestPaddedSize(t *testing.T) {
 		realLen, capacity int
 		want              int
 	}{
-		{"empty", 0, big, 4096},
-		{"one_byte", 1, big, 4096},
-		{"tiny", 100, big, 4096},
-		{"last_in_min_bucket", 4092, big, 4096}, // 4 + 4092 = 4096
-		{"first_over_min_bucket", 4093, big, 8192},
+		{"empty", 0, big, 64},
+		{"one_byte", 1, big, 64},
+		{"last_in_min_bucket", 60, big, 64}, // 4 + 60 = 64
+		{"first_over_min_bucket", 61, big, 128},
+		{"tiny", 100, big, 128},
+		{"exact_4096", 4092, big, 4096}, // 4 + 4092 = 4096
+		{"just_over_4096", 4093, big, 8192},
 		{"exact_8192", 8188, big, 8192}, // 4 + 8188 = 8192
 		{"just_over_8192", 8189, big, 16384},
 		{"exact_2^20", 1<<20 - 4, big, 1 << 20},
@@ -42,12 +44,19 @@ func TestPaddedSize(t *testing.T) {
 		{"bucket_exceeds_capacity_big", 600_000, 1_000_000, 1_000_004}, // bucket 2^20 > 1_000_004
 		{"bucket_fits_capacity", 500_000, 1_000_000, 524288},
 
-		// capacity + 4 below 4096: always full fill.
-		{"small_carrier_empty", 0, 881, 885},
-		{"small_carrier_payload", 10, 881, 885},
+		// capacity + 4 below the 64-byte floor: always full fill.
+		{"tiny_carrier_empty", 0, 7, 11},
+		{"tiny_carrier_payload", 5, 7, 11},
+		{"tiny_carrier_at_capacity", 7, 7, 11},
+		{"capacity_59", 0, 59, 63},
+		{"capacity_60", 0, 60, 64}, // capacity + 4 == 64: same either way
+
+		// Small carrier above the floor: buckets until one no longer fits.
+		{"small_carrier_empty", 0, 881, 64},
+		{"small_carrier_payload", 100, 881, 128},
+		{"small_carrier_last_bucket", 508, 881, 512},
+		{"small_carrier_over_last_bucket", 509, 881, 885}, // bucket 1024 > 885
 		{"small_carrier_at_capacity", 881, 881, 885},
-		{"capacity_4091", 0, 4091, 4095},
-		{"capacity_4092", 0, 4092, 4096}, // capacity + 4 == 4096: same either way
 
 		// Payload equal to capacity: full fill.
 		{"at_capacity", 374944, 374944, 374948},
@@ -63,17 +72,18 @@ func TestPaddedSize(t *testing.T) {
 }
 
 // TestPaddedSizeProperties sweeps the invariants: the block holds the payload,
-// fits the carrier, and is either a power of two >= 4096 or exactly full fill.
+// fits the carrier, and is either a power of two >= MinPaddedBlock or exactly
+// full fill.
 func TestPaddedSizeProperties(t *testing.T) {
-	for _, capacity := range []int{1, 100, 4091, 4092, 4093, 8188, 8189, 10_000, 65_532, 100_000} {
+	for _, capacity := range []int{1, 7, 59, 60, 61, 100, 881, 4091, 4092, 4093, 8188, 8189, 10_000, 65_532, 100_000} {
 		for realLen := 0; realLen <= capacity; realLen += 1 + realLen/7 {
 			got := paddedSize(realLen, capacity)
 			require.GreaterOrEqual(t, got, realLen+4)
 			require.LessOrEqual(t, got, capacity+4)
 			if got != capacity+4 {
-				require.GreaterOrEqual(t, got, minPaddedBlock)
+				require.GreaterOrEqual(t, got, MinPaddedBlock)
 				require.Zero(t, got&(got-1), "capacity %d realLen %d: %d is not a power of two", capacity, realLen, got)
-				if got > minPaddedBlock {
+				if got > MinPaddedBlock {
 					require.Greater(t, realLen+4, got/2, "bucket is not the smallest that fits")
 				}
 			}
@@ -117,18 +127,20 @@ func TestBoundedPaddingRoundTrip(t *testing.T) {
 	}{
 		// capacity 14944; chunk 3072 B, shift 1.
 		{"200x200_3ch_1bpc", 200, 200, 1, 3},
-		// capacity 25256; chunk 9 × 1024 = 9216 B > the 4096-byte bucket, shift 7.
+		// capacity 25256; chunk 9 × 1024 = 9216 B, larger than the small buckets, shift 7.
 		{"150x150_3ch_3bpc", 150, 150, 3, 3},
-		// capacity 7850; chunk 5120 B > 4096, shift 0.
+		// capacity 7850; chunk 5120 B, shift 0.
 		{"110x115_1ch_5bpc", 110, 115, 5, 1},
-		// capacity 881: capacity + 4 < 4096, always full fill, one 3072-byte chunk.
+		// capacity 881: every block fits inside one 3072-byte chunk.
 		{"50x50_3ch_1bpc", 50, 50, 1, 3},
+		// capacity 7: capacity + 4 < MinPaddedBlock, always full fill.
+		{"13x13_3ch_1bpc", 13, 13, 1, 3},
 	} {
 		base := noisyRGBA(cfg.w, cfg.h, 99)
 		capacity := CapacityBytes(base, cfg.bitsPerChannel, cfg.channels)
 		require.Positive(t, capacity)
 
-		sizes := []int{0, 10, 4092, 4093, 8188, 8189, capacity}
+		sizes := []int{0, 7, 10, 60, 61, 508, 509, 4092, 4093, 8188, 8189, capacity}
 		for _, n := range sizes {
 			if n > capacity {
 				continue
@@ -184,7 +196,7 @@ func TestBoundedPaddingFootprint(t *testing.T) {
 				require.NoError(t, enc.fn(m, pass, bytes.NewReader(payload), cfg.bitsPerChannel, cfg.channels))
 
 				bucket := containerLength(t, m, pass, cfg.bitsPerChannel, cfg.channels)
-				require.Equal(t, minPaddedBlock, bucket)
+				require.Equal(t, 128, bucket) // 4 + 100 rounds up to 128
 
 				bpp := cfg.bitsPerChannel * cfg.channels
 				streamBits := (payloadStreamOffset + bucket + sha256.Size) * 8
@@ -225,7 +237,7 @@ func TestBoundedPaddingWrongPassword(t *testing.T) {
 	for _, enc := range encoders {
 		m := noisyRGBA(400, 400, 8)
 		require.NoError(t, enc.fn(m, []byte("right"), bytes.NewReader([]byte("short secret")), 1, 3))
-		require.Equal(t, minPaddedBlock, containerLength(t, m, []byte("right"), 1, 3))
+		require.Equal(t, MinPaddedBlock, containerLength(t, m, []byte("right"), 1, 3))
 		for _, dec := range decoders {
 			got, err := dec.fn(m, []byte("wrong"), 1, 3)
 			require.Error(t, err, "%s → %s", enc.name, dec.name)

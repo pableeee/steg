@@ -200,7 +200,7 @@ func TestPlanTool512(t *testing.T) {
 	const w, h = 512, 512
 	capacity := steg.CapacityForDims(w, h, 1, 1) // 32712
 	want := map[float64]int{                     // requested rate -> block
-		0.05: 4096, 0.1: 4096, 0.2: 8192, 0.4: 16384, 1.0: capacity + 4,
+		0.0035: 64, 0.0094: 256, 0.05: 2048, 0.1: 4096, 0.2: 8192, 0.4: 16384, 1.0: capacity + 4,
 	}
 	for rate, block := range want {
 		p, err := planTool(w, h, rate)

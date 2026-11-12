@@ -15,7 +15,7 @@ import (
 // Encode hides the contents of r in m, keyed by pass, using the lowest
 // bitsPerChannel bits (1..8) of the first channels channels (1 = R, 2 = R+G,
 // 3 = R+G+B) of the pixels it writes. The payload may be up to CapacityBytes long. It is
-// padded with random bytes to a power-of-two bucket of at least 4 KiB (see
+// padded with random bytes to a power-of-two bucket of at least MinPaddedBlock bytes (see
 // paddedSize), or to the whole capacity when the bucket does not fit; only
 // the pixels that stream prefix maps to are written, the rest of m is left
 // untouched.
