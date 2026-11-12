@@ -55,8 +55,9 @@ anyone can read the salt. Everything after them depends on Argon2id output:
 locating, decrypting or verifying any payload bit for a candidate password
 costs one Argon2id call.
 
-The padded block is `max(4096, nextPowerOfTwo(4 + payload))` bytes, or the
-whole capacity when that bucket does not fit (`paddedSize` in `steg/steg.go`).
+The padded block is `max(64, nextPowerOfTwo(4 + payload))` bytes
+(`MinPaddedBlock` = 64; it was 4096 before), or the whole capacity when that
+bucket does not fit (`paddedSize` in `steg/steg.go`).
 Only the stream up to the end of the tag is written, so a small payload
 touches a keyed pseudorandom subset of the pixels and leaves the rest
 untouched; a payload that falls back to full fill touches every used LSB. At
@@ -143,17 +144,21 @@ Stego images encoded with `steg encode` defaults (3 channels, 1 bit/channel,
 `dude.png` (1024×1536, opaque RGB, capacity 589,768 bytes at 3 channels ×
 1 bit). Changed counts are against the original; "channel bytes" counts R, G
 and B values separately. The first two rows are the previous encoder on the
-same image, for comparison.
+same image, for comparison. The chi-square and RS values of the `current`
+31 B row, and the whole `-b 2` row, were measured with the earlier 4 KiB
+padding floor (31 B then changed 16,652 channel bytes, 9,724 pixels, 0.62%);
+with the 64-byte floor only the change counts of the `current` 31 B row were
+re-measured, and `steg detect` still reads CLEAN.
 
 | Encoder | Payload | Channel bytes changed | Pixels changed | Chi-square p (R/G/B) | RS asym (R/G/B) | Verdict |
 |---------|---------|----------------------|----------------|---------------------|-----------------|---------|
 | previous | 31 B text | 2,358,580 | 1,375,953 (87.5%) | 0.4973 / 0.2542 / 0.5285 | −0.0444 / −0.0445 / −0.0443 | LIKELY_STEGO |
 | previous | 589,768 B (full) | 2,359,650 | 1,376,309 (87.5%) | 0.6226 / 0.1330 / 0.9523 | −0.0432 / −0.0426 / −0.0431 | LIKELY_STEGO |
-| current | 31 B text | 16,652 | 9,724 (0.62%) | 0.0000 / 0.0000 / 0.0000 | −0.0047 / −0.0014 / −0.0057 | CLEAN |
+| current | 31 B text | 432 | 260 (0.0165%) | 0.0000 / 0.0000 / 0.0000 | −0.0047 / −0.0014 / −0.0057 | CLEAN |
 | current | 100,000 B | 524,152 | 305,756 (19.4%) | 0.0000 / 0.0000 / 0.0000 | −0.0041 / −0.0017 / −0.0053 | CLEAN |
 | current | 589,768 B (full) | 2,360,072 | 1,377,013 (87.6%) | 0.0000 / 0.0000 / 0.0000 | −0.0014 / +0.0014 / −0.0015 | CLEAN |
 | current, `-P` | 589,768 B (full) | — | — | 0.0000 / 0.0000 / 0.0000 | −0.0003 / +0.0041 / −0.0012 | CLEAN |
-| current, `-b 2` | 31 B text | 12,360 | 5,440 (0.35%) | 0.0000 / 0.0000 / 0.0000 | −0.0046 / −0.0020 / −0.0056 | CLEAN |
+| current, `-b 2` (4 KiB floor) | 31 B text | 12,360 | 5,440 (0.35%) | 0.0000 / 0.0000 / 0.0000 | −0.0046 / −0.0020 / −0.0056 | CLEAN |
 
 Clean original: chi-square p 0.0000 / 0.0000 / 0.0000, RS −0.0045 / −0.0017 /
 −0.0055. On a synthetic 512×512 photo-like carrier with every slot filled,
@@ -163,9 +168,12 @@ channel (LIKELY_STEGO); matching gave p 0.0000 and RS ≈ 0.00 (CLEAN).
 **Observations:**
 - At 1 bit/channel no channel value changed by more than ±1. With `-b 2` some
   did, as expected from replacing 2 bits; that row is CLEAN only because
-  bounded padding touched 0.35% of the pixels.
+  bounded padding touched 0.35% of the pixels (with the 4 KiB floor; fewer
+  now).
 - Bounded padding is what shrinks the footprint of small payloads (87.5% →
-  0.62% of pixels for 31 bytes). LSB matching is what keeps a full carrier
+  0.62% of pixels for 31 bytes with the 4 KiB floor, 0.0165% with the 64-byte
+  floor; a 1,000-byte payload went from 0.62% to 0.16%). LSB matching is
+  what keeps a full carrier
   CLEAN: the full-capacity row changes as many pixels as the previous encoder
   did, yet chi-square stays at p = 0.0000 and RS inside the clean range.
 - RS asymmetry at full fill moves from the clean ≈ −0.004 toward 0 (and
@@ -181,7 +189,10 @@ channel (LIKELY_STEGO); matching gave p 0.0000 and RS ≈ 0.00 (CLEAN).
   `TestEncoderOutputEvadesDetectors` guards the 1-bit result.
 - Payload size is no longer fully hidden: the number of changed pixels grows
   with the power-of-two bucket, so an estimate of the embedding rate reveals
-  the bucket roughly.
+  the bucket roughly. With the 64-byte floor the buckets below 4 KiB are 64,
+  128, 256, … bytes, so small sizes are distinguishable in finer steps than
+  when everything up to 4,092 bytes shared one block, although at these rates
+  the amount of change is hard to estimate.
 
 ### Trained detector (SPAM + FLD ensemble)
 
@@ -264,10 +275,10 @@ matching          0.01  0.0100  0.0050  0.3831 ± 0.0048 0.4089 0.3573  0.000/0.
 matching          0.02  0.0200  0.0100  0.3201 ± 0.0053 0.3500 0.2902  0.000/0.000   0.019/0.021
 ```
 
-**Cross-check with the real encoder.** On 500 images, `tool` against the
-matching simulation at the rates bounded padding can reach in a 512×512
-single-channel carrier (0.1266 bpp for the 4 KiB floor bucket, then 0.2516,
-0.5016 and 1.0):
+**Cross-check with the real encoder.** On 500 images, with the earlier 4 KiB
+floor, `tool` against the matching simulation at the rates bounded padding
+could then reach in a 512×512 single-channel carrier (0.1266 bpp for the
+4 KiB floor bucket, then 0.2516, 0.5016 and 1.0):
 
 | Rate (bpp) | P_E `tool` | P_E `matching` |
 |---|---|---|
@@ -277,6 +288,34 @@ single-channel carrier (0.1266 bpp for the 4 KiB floor bucket, then 0.2516,
 | 1.0 | 0.031 | 0.031 |
 
 Equal within split noise: the simulation is a faithful model of the encoder.
+With the 64-byte floor the reachable rates start at (52 + 64) · 8 / 262,144 =
+0.0035 bpp. On 2,000 images (`-methods matching,tool -rates
+0.00354,0.0094,0.1266`):
+
+| Block (bytes) | Rate (bpp) | P_E `tool` | P_E `matching` |
+|---|---|---|---|
+| 64 | 0.0035 | 0.4597 ± 0.0038 | 0.4603 ± 0.0016 |
+| 256 | 0.0094 | 0.3952 ± 0.0051 | 0.3989 ± 0.0037 |
+| 4096 | 0.1266 | 0.1488 ± 0.0079 | 0.1500 ± 0.0063 |
+
+The 4096 row is lower than in the 500-image run, most likely because the
+detector trains on four times as many images.
+
+**Choice of floor.** Matching simulation on all 10,000 images at the rate each
+candidate floor gives for a minimal message (52 bytes of framing plus the
+block):
+
+| Floor (bytes) | Rate (bpp) | P_E |
+|---|---|---|
+| 16 | 0.0021 | 0.4716 ± 0.0014 |
+| 32 | 0.0026 | 0.4643 ± 0.0012 |
+| 64 | 0.0035 | 0.4507 ± 0.0015 |
+| 128 | 0.0055 | 0.4278 ± 0.0031 |
+| 256 | 0.0094 | 0.3894 ± 0.0045 |
+| 512 | 0.0172 | 0.3333 ± 0.0035 |
+| 1024 | 0.0328 | 0.2680 ± 0.0040 |
+| 2048 | 0.0641 | 0.1997 ± 0.0052 |
+| 4096 | 0.1266 | ≈ 0.15 (2,000-image run above) |
 
 **Observations:**
 - Chi-square and RS are blind to LSB matching. Chi-square flags no matching
@@ -288,23 +327,28 @@ Equal within split noise: the simulation is a faithful model of the encoder.
   matching is against the simple detectors, not a modern one.
 - Detectability is dominated by the embedding rate: P_E 0.43 at 0.005 bpp,
   0.38 at 0.01, 0.32 at 0.02.
-- The bounded-padding floor matters. A 4 KiB minimum block is 0.127 bpp in a
-  512×512 single-channel carrier (P_E ≈ 0.15–0.2: caught most of the time).
-  In a 1024×1536 colour image with 3 channels the same floor is about 0.007
-  bits per channel value. Extrapolate from the grayscale results only
-  cautiously: a detector that exploits colour-channel correlation, a different
-  cover source and possible JPEG history in the carrier all change the
-  picture.
+- The bounded-padding floor mattered. The original 4 KiB minimum block was
+  0.127 bpp in a 512×512 single-channel carrier, where the detector was right
+  about 85% of the time (P_E ≈ 0.15). The floor is now 64 bytes: a short
+  message is 0.0035 bpp there and P_E ≈ 0.45–0.46, right about 54% of the
+  time. Below 64 the 52 bytes of framing dominate and a smaller floor buys
+  little (0.46 at 32, 0.47 at 16). The price is finer size buckets below
+  4 KiB. Medium and large payloads are still detected: P_E 0.27 at 1 KiB and
+  0.15 at 4 KiB in the same carrier. In a 1024×1536 colour image with 3
+  channels a short message is now about 0.0002 bits per channel value (about
+  0.007 with the 4 KiB floor). Extrapolate from the grayscale results
+  only cautiously: a detector that exploits colour-channel correlation, a
+  different cover source and possible JPEG history in the carrier all change
+  the picture.
 - Caveats: BOSSbase is never-compressed, the easiest setting for the
   detector; the detector is trained on the same cover source and rate it is
   tested on (an idealised attacker); SPAM dates from 2010 and stronger
   detectors (SRM, CNNs) exist. These P_E values are an upper bound on how hard
   the stego is to detect.
-- Next steps (README): lower the 4 KiB padding floor for small payloads
-  (cheap, and it lowers the rate where it matters most); adaptive embedding
-  with syndrome-trellis codes (fewer changes per bit, placed in noisy
-  regions) to improve P_E at medium rates. `stegbench` is the yardstick for
-  both.
+- Next steps (README): the padding floor has been lowered (above);
+  adaptive embedding with syndrome-trellis codes (fewer changes per bit,
+  placed in noisy regions) is next, to improve P_E at medium rates.
+  `stegbench` is the yardstick.
 
 ---
 
@@ -417,7 +461,7 @@ Carriers encoded with `steg encode -p hunter2` (defaults: 3 channels,
   correct candidate costs more because it decrypts and MACs the whole padded
   block, which for these images (encoded before bounded padding) was the
   whole carrier (~590 KB for `dude.png`). With bounded padding a 19-byte
-  payload has a 4 KiB block, so the correct candidate is barely more expensive
+  payload has a 64-byte block, so the correct candidate is barely more expensive
   than a wrong one; the cost of wrong candidates, which dominates, is
   unchanged.
 - At ~68 ms per candidate, a 1M-word dictionary takes about 19 hours on one
@@ -502,7 +546,7 @@ every region, including padding and the tag itself. No fix needed.
 | # | Attack | Requires password | Practical? | Status |
 |---|--------|------------------|-----------|--------|
 | 1 | Steganalysis: chi-square + RS | No | Only at 2–8 bits/ch with large payloads | Mitigated at 1 bit/ch: LSB matching + bounded padding read CLEAN (0/6) on `dude.png` from 31 B to full capacity (previously 6/6) |
-| 1 | Steganalysis: trained SPAM + FLD ensemble | No (needs covers from a similar source) | Yes, at the rates the tool writes | Open. On BOSSbase, P_E ≈ 0.22 at 0.05 bpp and ≈ 0.16 at 0.1 for matching and replacement alike; the 4 KiB padding floor is 0.127 bpp in a 512×512 single-channel carrier (real encoder P_E ≈ 0.22). Stronger detectors exist. Planned: lower the padding floor, adaptive embedding (STC) |
+| 1 | Steganalysis: trained SPAM + FLD ensemble | No (needs covers from a similar source) | Yes, at the rates the tool writes | Open. On BOSSbase, P_E ≈ 0.22 at 0.05 bpp and ≈ 0.16 at 0.1 for matching and replacement alike; a short message is 0.0035 bpp in a 512×512 single-channel carrier with the 64-byte padding floor (real encoder P_E ≈ 0.46; it was 0.127 bpp and P_E ≈ 0.15 with the earlier 4 KiB floor), but 1 KiB is P_E ≈ 0.27 and 4 KiB ≈ 0.15. Stronger detectors exist. Planned: adaptive embedding (STC) |
 | 2 | Two-time pad on bootstrap salt | Yes | — | Fixed in c69a626 (bootstrap removed); tool removed |
 | 3 | Bootstrap CPA salt recovery | Yes + grey-box encode | — | Fixed in c69a626; tool removed |
 | – | Cheap `math/rand` traversal order (~2^31 orders) | No | Would be, now that padding is bounded | Fixed in 4fd29ba: ChaCha8 keyed by Argon2id |
